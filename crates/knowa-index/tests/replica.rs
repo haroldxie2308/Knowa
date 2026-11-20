@@ -173,6 +173,57 @@ fn schema_mismatch_or_missing_file_rebuilds() {
 }
 
 #[test]
+fn rebuild_marker_forces_a_rebuild_and_is_removed() {
+    let dir = TempDir::new();
+    let mut w = Writer::new(2);
+    let r = w.replica(&dir);
+    let e = Id::new_entity().unwrap();
+    let c1 = w.say(1, &e, vocab::LABEL, Value::text("first"));
+    let c2 = w.say(1, &e, vocab::LABEL, Value::text("second"));
+    // a partial import: seq 2 without seq 1
+    {
+        let lock = r.lock().unwrap();
+        r.merge(&lock, std::slice::from_ref(&c2)).unwrap();
+    }
+    let idx = Index::open(&r).unwrap();
+    let epoch = idx.epoch().to_string();
+    assert!(idx.claims(std::slice::from_ref(&c1.id)).unwrap().is_empty());
+    drop(idx);
+
+    // a later merge fills the gap below the indexed head; catch-up cannot see it, so
+    // merge leaves the marker (simulated here: the store writes it)
+    {
+        let lock = r.lock().unwrap();
+        r.merge(&lock, std::slice::from_ref(&c1)).unwrap();
+    }
+    let marker = dir.path().join(knowa_store::INDEX_DIR).join(knowa_store::REBUILD_MARKER);
+    std::fs::write(&marker, b"").unwrap();
+    let idx = Index::open(&r).unwrap();
+    assert_ne!(idx.epoch(), epoch, "the marker forces a rebuild");
+    assert_eq!(idx.claims(std::slice::from_ref(&c1.id)).unwrap().len(), 1, "the gap-filling claim is indexed");
+    assert!(!marker.exists(), "the marker is removed once the rebuild succeeded");
+    let epoch = idx.epoch().to_string();
+    drop(idx);
+    assert_eq!(Index::open(&r).unwrap().epoch(), epoch, "without a marker, open catches up");
+}
+
+#[test]
+fn explicit_rebuild_also_clears_the_marker() {
+    let dir = TempDir::new();
+    let mut w = Writer::new(1);
+    let r = w.replica(&dir);
+    drop(Index::open(&r).unwrap());
+    let marker = dir.path().join(knowa_store::INDEX_DIR).join(knowa_store::REBUILD_MARKER);
+    std::fs::write(&marker, b"").unwrap();
+    // `knowa reindex` path
+    let idx = Index::rebuild(&r).unwrap();
+    assert!(!marker.exists(), "a complete rebuild satisfies the marker");
+    let epoch = idx.epoch().to_string();
+    drop(idx);
+    assert_eq!(Index::open(&r).unwrap().epoch(), epoch, "no second, pointless rebuild");
+}
+
+#[test]
 fn text_blobs_are_read_from_the_replica() {
     let dir = TempDir::new();
     let mut w = Writer::new(1);
@@ -230,7 +281,7 @@ fn export_and_extract_selection_consult_the_blob_store() {
 
     let (claims_out, blobs_out) = idx.export_set(Visibility::Private).unwrap();
     assert_eq!(claims_out.len(), 3, "private exports every claim");
-    assert_eq!(blobs_out, vec![done], "referenced and present; unreferenced and absent blobs are left out");
+    assert_eq!(blobs_out, all, "private: every present blob (DESIGN §7.3: everything); absent ones cannot ship");
     let (shared, shared_blobs) = idx.export_set(Visibility::Shared).unwrap();
     assert_eq!(shared.len(), 1, "only the genesis policy claim");
     assert!(shared_blobs.is_empty());

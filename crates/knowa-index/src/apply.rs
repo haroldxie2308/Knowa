@@ -7,12 +7,15 @@
 //!    state is recomputed from scratch (it is small); every actor whose owner /
 //!    member / autoAccept flags changed has all its claims, and the targets of its
 //!    reviews and retracts, queued for status.
-//! 3. Status worklist. A claim's status depends only on claims that reference it
-//!    (retracts, reviews, replacements), which are newer by construction: ids are
-//!    content hashes, so the dependency graph is acyclic and chaotic iteration
-//!    converges. When a status changes, everything that reads it is queued.
+//! 3. Status worklist. A claim's (base, status) pair depends only on claims that
+//!    reference it (retracts, reviews, replacements), which are newer by
+//!    construction: ids are content hashes, so the dependency graph is acyclic and
+//!    chaotic iteration converges. When either changes, everything that reads it is
+//!    queued.
 //! 4. Stale worklist over `src` edges, after statuses have settled.
-//! 5. Entity rows (summary, FTS, geo) of every subject whose claims changed.
+//! 5. Full-text documents of claims linking a blob whose text-ness may have changed
+//!    (other claims' documents never change after insert), then the stored
+//!    default-view summary and geo point of every subject whose claims changed.
 
 use std::collections::{BTreeSet, HashSet, VecDeque};
 
@@ -45,7 +48,9 @@ pub(crate) fn apply(conn: &Connection, space: &Id, genesis_owner: &Id, blobs: &d
         if !seen.insert(&c.id) || is_indexed(conn, &c.id)? {
             continue;
         }
-        insert(conn, c, next_n)?;
+        if let Some(blob) = insert(conn, c, next_n)? {
+            work.blobs.insert(blob);
+        }
         next_n += 1;
         policy_input |= POLICY_INPUTS.contains(&c.body.p.as_str());
         work.arrived(conn, c)?;
@@ -82,7 +87,9 @@ fn is_indexed(conn: &Connection, id: &Id) -> Result<bool> {
         .is_some())
 }
 
-fn insert(conn: &Connection, c: &Claim, n: i64) -> Result<()> {
+/// Inserts `c` with arrival number `n`. Returns the blob whose text `c`'s full-text
+/// document depends on: that document is written once statuses have settled.
+fn insert(conn: &Connection, c: &Claim, n: i64) -> Result<Option<String>> {
     let b = &c.body;
     let p = b.p.as_str();
     let policy = rules::is_policy(p);
@@ -92,9 +99,11 @@ fn insert(conn: &Connection, c: &Claim, n: i64) -> Result<()> {
         // DESIGN §6.1: a claim without `conf` counts as 1.
         None => "1".to_string(),
     };
+    // placeholder, replaced by the status worklist in this same transaction
+    let placeholder = Status::Proposed.as_str();
     conn.prepare_cached(
-        "INSERT INTO claims(n, id, actor, seq, at, s, p, policy, ent, o, o_ref_base, conf, equiv, worker, json, status, stale)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 0)",
+        "INSERT INTO claims(n, id, actor, seq, at, s, p, policy, ent, o, o_ref_base, conf, equiv, worker, json, base, status, stale)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16, 0)",
     )
     .map_err(db)?
     .execute(rusqlite::params![
@@ -113,8 +122,7 @@ fn insert(conn: &Connection, c: &Claim, n: i64) -> Result<()> {
         b.equiv_key()?,
         b.via.get("worker"),
         c.to_json().to_string(),
-        // placeholder, replaced by the status worklist in this same transaction
-        Status::Proposed.as_str(),
+        placeholder,
     ])
     .map_err(db)?;
 
@@ -132,7 +140,17 @@ fn insert(conn: &Connection, c: &Claim, n: i64) -> Result<()> {
     for r in refs.filter(|r| r.kind() == IdKind::Blob) {
         blob.execute([c.id.as_str(), r.base().as_str()]).map_err(db)?;
     }
-    Ok(())
+
+    if !ent {
+        return Ok(None);
+    }
+    match entity::linked_blob(&b.s, p, &b.o) {
+        Some(blob) => Ok(Some(blob.as_str().to_string())),
+        None => {
+            entity::insert_text(conn, n, p, &b.o)?;
+            Ok(None)
+        }
+    }
 }
 
 #[derive(Default)]
@@ -159,6 +177,8 @@ struct Work {
     status: Queue,
     stale: Queue,
     entities: BTreeSet<String>,
+    /// bare blobs whose linking claims need their full-text documents (re)written
+    blobs: BTreeSet<String>,
 }
 
 struct ClaimState {
@@ -166,19 +186,24 @@ struct ClaimState {
     p: String,
     s: String,
     ent: bool,
+    base: Status,
     status: Status,
 }
 
 fn claim_state(conn: &Connection, id: &str) -> Result<Option<ClaimState>> {
     let row = conn
-        .prepare_cached("SELECT actor, p, s, ent, status FROM claims WHERE id = ?1")
+        .prepare_cached("SELECT actor, p, s, ent, base, status FROM claims WHERE id = ?1")
         .map_err(db)?
-        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, bool>(3)?, r.get::<_, String>(4)?)))
+        .query_row([id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, bool>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?))
+        })
         .optional()
         .map_err(db)?;
     match row {
         None => Ok(None),
-        Some((actor, p, s, ent, status)) => Ok(Some(ClaimState { actor, p, s, ent, status: status_from(&status)? })),
+        Some((actor, p, s, ent, base, status)) => {
+            Ok(Some(ClaimState { actor, p, s, ent, base: status_from(&base)?, status: status_from(&status)? }))
+        }
     }
 }
 
@@ -247,25 +272,31 @@ impl Work {
         while let Some(id) = self.status.pop() {
             // Targets of replaces/reviews/retracts may not have arrived (yet).
             let Some(cur) = claim_state(conn, &id)? else { continue };
-            let new = status_of(conn, acc, &id, &cur.actor)?;
-            if new == cur.status {
+            let (base, status) = status_of(conn, acc, &id, &cur.actor)?;
+            if (base, status) == (cur.base, cur.status) {
                 continue;
             }
-            conn.prepare_cached("UPDATE claims SET status = ?1 WHERE id = ?2")
+            conn.prepare_cached("UPDATE claims SET base = ?1, status = ?2 WHERE id = ?3")
                 .map_err(db)?
-                .execute([new.as_str(), id.as_str()])
+                .execute([base.as_str(), status.as_str(), id.as_str()])
                 .map_err(db)?;
-            for t in ids(conn, "SELECT target FROM replaces WHERE claim = ?1", &id)? {
-                self.status.push(&t);
+            // the targets of a replacement read its base status (rule 2)
+            if base != cur.base {
+                for t in ids(conn, "SELECT target FROM replaces WHERE claim = ?1", &id)? {
+                    self.status.push(&t);
+                }
             }
-            if is_targeting(&cur.p) {
-                self.status.push(&cur.s);
-            }
-            for d in dependents(conn, &id)? {
-                self.stale.push(&d);
-            }
-            if cur.ent {
-                self.entities.insert(cur.s);
+            if status != cur.status {
+                // a review/retract's effect reads whether it is retracted
+                if is_targeting(&cur.p) {
+                    self.status.push(&cur.s);
+                }
+                for d in dependents(conn, &id)? {
+                    self.stale.push(&d);
+                }
+                if cur.ent {
+                    self.entities.insert(cur.s);
+                }
             }
         }
         Ok(())
@@ -296,24 +327,28 @@ impl Work {
     }
 
     fn refresh_entities(&self, conn: &Connection, blobs: &dyn BlobSource) -> Result<()> {
-        let mut all = self.entities.clone();
+        let mut text_blobs = self.blobs.clone();
         for e in &self.entities {
-            // A bare blob's media type decides whether entities pointing at it with
-            // knowa:content include its text.
+            // A bare blob's claims changed, so its media type may have: that decides
+            // whether the claims linking it carry its text.
             let id = id_from(e)?;
             if id.kind() == IdKind::Blob && id.fragment().is_none() {
-                all.extend(entity::content_referrers(conn, e)?);
+                text_blobs.insert(e.clone());
             }
         }
-        for e in &all {
-            entity::refresh(conn, blobs, e)?;
+        for b in &text_blobs {
+            entity::refresh_blob_text(conn, blobs, b)?;
+        }
+        for e in &self.entities {
+            entity::refresh(conn, e)?;
         }
         Ok(())
     }
 }
 
-/// Gathers the inputs of DESIGN §4.7 for claim `id` by `author` and decides.
-fn status_of(conn: &Connection, acc: &Acceptance, id: &str, author: &str) -> Result<Status> {
+/// Gathers the inputs of DESIGN §4.7 for claim `id` by `author` and decides its
+/// (base status, status).
+fn status_of(conn: &Connection, acc: &Acceptance, id: &str, author: &str) -> Result<(Status, Status)> {
     let mut retracted = false;
     let mut review: Option<(i64, String, rules::Verdict)> = None;
     let mut stmt = conn
@@ -336,15 +371,16 @@ fn status_of(conn: &Connection, acc: &Acceptance, id: &str, author: &str) -> Res
             review = Some((at, rid, v));
         }
     }
+    let base = rules::base_status(retracted, review.map(|(_, _, v)| v), acc.author_accepted(author));
     let mut superseded = false;
     let mut stmt = conn
-        .prepare_cached("SELECT c.status FROM replaces r JOIN claims c ON c.id = r.claim WHERE r.target = ?1")
+        .prepare_cached("SELECT c.base FROM replaces r JOIN claims c ON c.id = r.claim WHERE r.target = ?1")
         .map_err(db)?;
     let mut rows = stmt.query([id]).map_err(db)?;
     while let Some(row) = rows.next().map_err(db)? {
         superseded |= rules::supersedes(status_from(&row.get::<_, String>(0).map_err(db)?)?);
     }
-    Ok(rules::decide(retracted, superseded, review.map(|(_, _, v)| v), acc.author_accepted(author)))
+    Ok((base, rules::status(base, superseded)))
 }
 
 fn stale_of(conn: &Connection, id: &str) -> Result<bool> {

@@ -27,7 +27,7 @@ use crate::blobs::BlobSource;
 use crate::db::{INDEX_FILE, META_EPOCH, META_SCHEMA, META_SPACE, db};
 
 /// Bump whenever the SQLite schema changes; a mismatch triggers a rebuild.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Text blobs up to this size are full-text indexed (DESIGN §7.2).
 pub const MAX_FTS_BLOB_BYTES: u64 = 1024 * 1024;
@@ -55,13 +55,19 @@ pub struct Index {
 }
 
 impl Index {
-    /// Opens `<replica>/.index/index.sqlite`. Missing file or schema mismatch → full
-    /// rebuild (new epoch). Otherwise catches up: for each actor, applies log claims with
-    /// seq above the highest indexed seq for that actor (handles gaps from merges).
+    /// Opens `<replica>/.index/index.sqlite`. Missing file, schema mismatch or a
+    /// rebuild marker (`<replica>/.index/<knowa_store::REBUILD_MARKER>`, left by
+    /// `merge`) → full rebuild (new epoch). Otherwise catches up: for each actor,
+    /// applies log claims with seq above the highest indexed seq for that actor; claims
+    /// filling gaps below it are what the marker is for (DESIGN §5). Callers hold the
+    /// replica's write lock, as `merge` does, so no marker appears mid-rebuild.
     pub fn open(replica: &Replica) -> Result<Index> {
-        let path = replica.index_dir()?.join(INDEX_FILE);
+        let dir = replica.index_dir()?;
+        if dir.join(knowa_store::REBUILD_MARKER).try_exists()? {
+            return Index::rebuild(replica);
+        }
         let m = replica.manifest();
-        match Index::open_existing(&path, &m.space, &m.owner, replica.root())? {
+        match Index::open_existing(&dir.join(INDEX_FILE), &m.space, &m.owner, replica.root())? {
             Some(mut index) => {
                 index.catch_up(replica)?;
                 Ok(index)
@@ -70,13 +76,20 @@ impl Index {
         }
     }
 
-    /// Deletes and rebuilds from the logs. New epoch.
+    /// Deletes and rebuilds from the logs. New epoch. Once the rebuild is complete the
+    /// rebuild marker, if any, has served its purpose and is removed.
     pub fn rebuild(replica: &Replica) -> Result<Index> {
-        let path = replica.index_dir()?.join(INDEX_FILE);
+        let dir = replica.index_dir()?;
         let m = replica.manifest();
-        let mut index = Index::create(&path, &m.space, &m.owner, replica.root())?;
+        let mut index = Index::create(&dir.join(INDEX_FILE), &m.space, &m.owner, replica.root())?;
         index.catch_up(replica)?;
         index.mark_complete()?;
+        match std::fs::remove_file(dir.join(knowa_store::REBUILD_MARKER)) {
+            Ok(()) => {}
+            // the common case: nothing was merged since the last build
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         Ok(index)
     }
 
@@ -84,7 +97,7 @@ impl Index {
     /// assigns arrival numbers, recomputes status/stale for every affected claim
     /// (targets of review/retract/replaces, dependents via src, and — on policy
     /// changes — all claims of the affected actor), refreshes affected entity rows,
-    /// FTS docs (incl. text blobs read from `replica`), geo and edges.
+    /// per-claim FTS docs (incl. text blobs read from `replica`) and geo.
     pub fn apply(&mut self, replica: &Replica, claims: &[knowa_model::Claim]) -> Result<()> {
         self.apply_with(replica, claims)
     }
@@ -117,12 +130,15 @@ impl Index {
     }
 
     /// As `find_claims`, returning entities (see `Where` docs for matching semantics).
-    /// `score` set for text queries (higher = better); `distance_km` set when `near`.
+    /// Matching on text/type/when/near and every display field use only claims passing
+    /// `view` (DESIGN §4.7). `score` set for text queries (higher = better);
+    /// `distance_km` set when `near`.
     pub fn find_entities(&self, w: &Where, view: &View, order: Order, limit: u32, cursor: Option<&str>) -> Result<Page<EntityView>> {
         read::find_entities(&self.conn, &self.space, w, view, order, limit, cursor)
     }
 
-    /// Summary of one entity if any claim about it passes `view`; `spaces` = [this space].
+    /// Summary of one entity, computed from the claims about it that pass `view`, if
+    /// any does; `spaces` = [this space].
     pub fn entity(&self, id: &Id, view: &View) -> Result<Option<EntityView>> {
         read::entity(&self.conn, &self.space, id, view)
     }
@@ -155,10 +171,12 @@ impl Index {
         read::actors(&self.conn)
     }
 
-    /// Claims and blobs to export at `level` (DESIGN §7.3): claims whose effective
-    /// visibility ≥ level, plus ALL policy claims, plus every blob referenced (s, o.ref,
-    /// src, q refs) by an exported claim and present in the replica.
-    /// `Visibility::Private` ⇒ everything.
+    /// Claims and blobs to export at `level` (DESIGN §7.3). Shared/public: non-policy
+    /// claims whose effective visibility ≥ level, trust claims (owner, role,
+    /// autoAccept, actorKind, defaultVisibility), and review/retract claims whose
+    /// target is exported; never visibility claims. Blobs present in the replica whose
+    /// own effective visibility ≥ level. `Visibility::Private` ⇒ every claim and every
+    /// referenced (s, o.ref, src, q refs), present blob.
     pub fn export_set(&self, level: Visibility) -> Result<(Vec<Id>, Vec<Id>)> {
         let replica = self.replica()?;
         self.export_set_with(level, &replica)

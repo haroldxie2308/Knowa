@@ -2,14 +2,24 @@
 //! actor kinds. A pure function of the `knowa:role` / `knowa:autoAccept` /
 //! `knowa:actorKind` claims and the retract chains above them.
 //!
-//! Owners need care: a role grant counts only if its author is an owner and it is
-//! not retracted, and a retract counts only if its author is an owner (or the
-//! target's author) and it is not retracted. Owner-ship and retraction therefore
-//! depend on each other through negation. We take the well-founded model (Van
-//! Gelder's alternating fixpoint): in every replica where the rules have a single
-//! consistent answer this is that answer; where owners revoke each other in a
-//! cycle, the actors whose ownership is undecidable are not owners. It is a pure
-//! function of the claim set, so incremental indexing and rebuild agree.
+//! - A role or autoAccept claim is *effective* iff its author is an owner and it is
+//!   not retracted. Both are single-valued: the latest effective claim on an actor
+//!   (by `at`, then id) wins, so a later grant demotes and `false` revokes.
+//!   Retracting the latest falls back to the previous effective one.
+//! - Only an actor's first self-declared actorKind claim (lowest seq) counts. If it
+//!   is retracted or names no kind, the actor has no kind; a later declaration never
+//!   takes over, or an agent could retract its own kind and re-declare itself Human.
+//!
+//! Owners need care. X is an owner iff X is the genesis owner, or X's latest
+//! effective role is `knowa:Owner`, i.e. some effective Owner grant on X is not
+//! *demoted* by a later effective non-Owner role claim on X. A retract counts only
+//! if its author is an owner (or the target's author) and it is not retracted.
+//! Ownership therefore depends on itself through two negations (retracted,
+//! demoted). We take the well-founded model (Van Gelder's alternating fixpoint): in
+//! every replica where the rules have a single consistent answer this is that
+//! answer; where owners revoke or demote each other in a cycle, the actors whose
+//! ownership is undecidable are not owners. It is a pure function of the claim set,
+//! so incremental indexing and rebuild agree.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -131,11 +141,26 @@ pub(crate) fn store(conn: &Connection, state: &PolicyState) -> Result<()> {
 struct PClaim {
     id: String,
     author: String,
+    seq: i64,
     at: i64,
     s: String,
     s_is_actor: bool,
     p: String,
     o: Value,
+}
+
+impl PClaim {
+    /// Order of single-valued policy claims: latest `at`, then id (DESIGN §4.6).
+    fn key(&self) -> (i64, &str) {
+        (self.at, &self.id)
+    }
+}
+
+/// A `knowa:Owner` grant to an actor, with the role claims that would demote it: later
+/// (by `at`, then id) claims on the same actor naming another role.
+struct OwnerGrant {
+    claim: usize,
+    demoters: Vec<usize>,
 }
 
 /// Role/autoAccept/actorKind claims plus every retract chain above them.
@@ -147,29 +172,31 @@ struct Graph {
     retracts_on: HashMap<usize, Vec<usize>>,
     /// (retract, target)
     retracts: Vec<(usize, usize)>,
-    /// role grants of `knowa:Owner` to an actor id
-    owner_grants: Vec<usize>,
+    /// role claims on an actor id naming a role; other values are not role claims
+    roles: Vec<(usize, Role)>,
+    owner_grants: Vec<OwnerGrant>,
 }
 
 const BASE_PREDICATES: [&str; 3] = [vocab::ROLE, vocab::AUTO_ACCEPT, vocab::ACTOR_KIND];
 
 fn load_graph(conn: &Connection) -> Result<Graph> {
     fn read(row: &rusqlite::Row<'_>) -> Result<PClaim> {
-        let s: String = row.get(3).map_err(db)?;
-        let o: String = row.get(5).map_err(db)?;
+        let s: String = row.get(4).map_err(db)?;
+        let o: String = row.get(6).map_err(db)?;
         Ok(PClaim {
             id: row.get(0).map_err(db)?,
             author: row.get(1).map_err(db)?,
-            at: row.get(2).map_err(db)?,
+            seq: row.get(2).map_err(db)?,
+            at: row.get(3).map_err(db)?,
             s_is_actor: id_from(&s)?.kind() == IdKind::Actor,
             s,
-            p: row.get(4).map_err(db)?,
+            p: row.get(5).map_err(db)?,
             o: value_from(&o)?,
         })
     }
     let mut g = Graph::default();
     let mut base = conn
-        .prepare_cached("SELECT id, actor, at, s, p, o FROM claims WHERE p IN (?1, ?2, ?3) ORDER BY id")
+        .prepare_cached("SELECT id, actor, seq, at, s, p, o FROM claims WHERE p IN (?1, ?2, ?3) ORDER BY id")
         .map_err(db)?;
     let mut rows = base.query(BASE_PREDICATES).map_err(db)?;
     while let Some(row) = rows.next().map_err(db)? {
@@ -177,7 +204,7 @@ fn load_graph(conn: &Connection) -> Result<Graph> {
     }
     let mut frontier: Vec<usize> = (0..g.claims.len()).collect();
     let mut on = conn
-        .prepare_cached("SELECT id, actor, at, s, p, o FROM claims WHERE s = ?1 AND p = ?2 ORDER BY id")
+        .prepare_cached("SELECT id, actor, seq, at, s, p, o FROM claims WHERE s = ?1 AND p = ?2 ORDER BY id")
         .map_err(db)?;
     while !frontier.is_empty() {
         let mut next = Vec::new();
@@ -193,44 +220,78 @@ fn load_graph(conn: &Connection) -> Result<Graph> {
         }
         frontier = next;
     }
+
+    let mut by_actor: BTreeMap<&str, Vec<(usize, Role)>> = BTreeMap::new();
     for (i, c) in g.claims.iter().enumerate() {
-        if c.p == vocab::ROLE && c.s_is_actor && matches!(&c.o, Value::Term(t) if t.as_str() == vocab::ROLE_OWNER) {
-            g.owner_grants.push(i);
+        if c.p == vocab::ROLE
+            && c.s_is_actor
+            && let Value::Term(t) = &c.o
+            && let Some(role) = rules::role_of(t.as_str())
+        {
+            g.roles.push((i, role));
+            by_actor.entry(c.s.as_str()).or_default().push((i, role));
         }
     }
+    let mut owner_grants = Vec::new();
+    for mut claims in by_actor.into_values() {
+        claims.sort_by(|a, b| g.claims[a.0].key().cmp(&g.claims[b.0].key()));
+        for (k, &(i, role)) in claims.iter().enumerate() {
+            if role == Role::Owner {
+                let demoters = claims[k + 1..].iter().filter(|(_, r)| *r != Role::Owner).map(|(d, _)| *d).collect();
+                owner_grants.push(OwnerGrant { claim: i, demoters });
+            }
+        }
+    }
+    g.owner_grants = owner_grants;
     Ok(g)
 }
 
-/// Γ(neg): the least model of the policy rules where "x is not retracted" is read
-/// as `!neg[x]`. Returns (retracted, owners). Anti-monotone in `neg`.
-fn gamma(g: &Graph, genesis: &str, neg: &[bool]) -> (Vec<bool>, HashSet<String>) {
+/// The negated atoms of the policy rules: "claim i is retracted" and "owner grant k
+/// is demoted".
+#[derive(Clone, PartialEq, Eq)]
+struct Neg {
+    retracted: Vec<bool>,
+    demoted: Vec<bool>,
+}
+
+/// Γ(neg): the least model of the policy rules where every negated atom is read from
+/// `neg` ("not retracted" = `!neg.retracted[x]`, "not demoted" = `!neg.demoted[k]`).
+/// Returns that model's negatable atoms and owners. Anti-monotone in `neg`.
+fn gamma(g: &Graph, genesis: &str, neg: &Neg) -> (Neg, HashSet<String>) {
     let mut owners = HashSet::from([genesis.to_string()]);
     let mut ret = vec![false; g.claims.len()];
     loop {
         let mut changed = false;
-        for &i in &g.owner_grants {
-            let c = &g.claims[i];
-            if !neg[i] && owners.contains(&c.author) && owners.insert(c.s.clone()) {
+        for (k, og) in g.owner_grants.iter().enumerate() {
+            let c = &g.claims[og.claim];
+            if !neg.retracted[og.claim] && !neg.demoted[k] && owners.contains(&c.author) && owners.insert(c.s.clone()) {
                 changed = true;
             }
         }
         for &(r, t) in &g.retracts {
             let (rc, tc) = (&g.claims[r], &g.claims[t]);
-            if !ret[t] && rules::retract_effective(&rc.o, rc.author == tc.author, owners.contains(&rc.author), neg[r]) {
+            if !ret[t] && rules::retract_effective(&rc.o, rc.author == tc.author, owners.contains(&rc.author), neg.retracted[r]) {
                 ret[t] = true;
                 changed = true;
             }
         }
         if !changed {
-            return (ret, owners);
+            break;
         }
     }
+    // Nothing above reads `demoted` of this model, so it is derived once, at the end.
+    let demoted = g
+        .owner_grants
+        .iter()
+        .map(|og| og.demoters.iter().any(|&d| !neg.retracted[d] && owners.contains(&g.claims[d].author)))
+        .collect();
+    (Neg { retracted: ret, demoted }, owners)
 }
 
 /// Owners in the well-founded model. K grows monotonically (Γ² is monotone), so the
-/// loop ends after at most |claims| + 1 rounds.
+/// loop ends after at most |claims| + |owner grants| + 1 rounds.
 fn owners(g: &Graph, genesis: &str) -> HashSet<String> {
-    let mut k = vec![false; g.claims.len()];
+    let mut k = Neg { retracted: vec![false; g.claims.len()], demoted: vec![false; g.owner_grants.len()] };
     loop {
         let (u, _) = gamma(g, genesis, &k);
         let (k2, owners) = gamma(g, genesis, &u);
@@ -271,64 +332,73 @@ fn retracted(g: &Graph, owners: &HashSet<String>) -> Result<Vec<bool>> {
     memo.into_iter().map(|m| m.ok_or_else(|| Error::internal("retract evaluation left a claim undecided"))).collect()
 }
 
+/// Keeps, per actor, the value of the claim with the greatest `key`.
+fn keep_latest<'a, T>(m: &mut BTreeMap<&'a str, ((i64, &'a str), T)>, c: &'a PClaim, v: T) {
+    if m.get(c.s.as_str()).is_none_or(|(k, _)| c.key() > *k) {
+        m.insert(c.s.as_str(), (c.key(), v));
+    }
+}
+
 /// Computes the policy state from the claims currently in the index.
 pub(crate) fn compute(conn: &Connection, genesis_owner: &str) -> Result<PolicyState> {
     let g = load_graph(conn)?;
     let owners = owners(&g, genesis_owner);
     let ret = retracted(&g, &owners)?;
+    let effective = |i: usize| !ret[i] && owners.contains(&g.claims[i].author);
 
-    let mut roles: BTreeMap<String, BTreeSet<u8>> = BTreeMap::new();
-    let mut auto: BTreeSet<String> = BTreeSet::new();
-    // latest (at, id) self-declared kind per actor
-    let mut kinds: BTreeMap<String, (i64, String, ActorKind)> = BTreeMap::new();
-    for (i, c) in g.claims.iter().enumerate() {
-        if ret[i] {
-            continue;
+    let mut roles: BTreeMap<&str, ((i64, &str), Role)> = BTreeMap::new();
+    for &(i, role) in &g.roles {
+        if effective(i) {
+            keep_latest(&mut roles, &g.claims[i], role);
         }
-        let by_owner = owners.contains(&c.author);
+    }
+    let mut auto: BTreeMap<&str, ((i64, &str), bool)> = BTreeMap::new();
+    // first self-declared actorKind per actor: (seq, id) ascending, index
+    let mut first_kind: BTreeMap<&str, ((i64, &str), usize)> = BTreeMap::new();
+    for (i, c) in g.claims.iter().enumerate() {
         match c.p.as_str() {
-            vocab::ROLE if by_owner && c.s_is_actor => {
-                if let Value::Term(t) = &c.o
-                    && let Some(role) = rules::role_of(t.as_str())
-                {
-                    roles.entry(c.s.clone()).or_default().insert(rules::role_rank(role));
+            vocab::AUTO_ACCEPT if c.s_is_actor && effective(i) => {
+                if let Value::Bool(on) = c.o {
+                    keep_latest(&mut auto, c, on);
                 }
             }
-            vocab::AUTO_ACCEPT if by_owner && c.s_is_actor && c.o == Value::Bool(true) => {
-                auto.insert(c.s.clone());
-            }
             vocab::ACTOR_KIND if c.s == c.author => {
-                if let Value::Term(t) = &c.o
-                    && let Some(kind) = rules::kind_of(t.as_str())
-                {
-                    let newer = kinds.get(&c.s).is_none_or(|(at, id, _)| (c.at, &c.id) > (*at, id));
-                    if newer {
-                        kinds.insert(c.s.clone(), (c.at, c.id.clone(), kind));
-                    }
+                let k = (c.seq, c.id.as_str());
+                if first_kind.get(c.s.as_str()).is_none_or(|(f, _)| k < *f) {
+                    first_kind.insert(c.s.as_str(), (k, i));
                 }
             }
             _ => {}
         }
     }
+    let kinds: BTreeMap<&str, ActorKind> = first_kind
+        .into_iter()
+        .filter(|(_, (_, i))| !ret[*i])
+        .filter_map(|(a, (_, i))| match &g.claims[i].o {
+            Value::Term(t) => rules::kind_of(t.as_str()).map(|k| (a, k)),
+            _ => None,
+        })
+        .collect();
 
-    const BY_RANK: [Role; 5] = [Role::Owner, Role::Member, Role::Agent, Role::Worker, Role::Viewer];
-    let member_rank = rules::role_rank(Role::Member);
-    let actors: BTreeSet<&String> = owners.iter().chain(roles.keys()).chain(auto.iter()).chain(kinds.keys()).collect();
+    let actors: BTreeSet<&str> =
+        owners.iter().map(String::as_str).chain(roles.keys().copied()).chain(auto.keys().copied()).chain(kinds.keys().copied()).collect();
     let mut state = PolicyState::new();
     for a in actors {
         let owner = owners.contains(a);
-        let held = roles.get(a);
-        let member = held.is_some_and(|r| r.contains(&member_rank));
-        // Ownership comes from the fixpoint above, never from a lone grant.
-        let role = if owner {
-            Some(Role::Owner)
-        } else {
-            held.and_then(|r| r.iter().find(|&&rank| rank != rules::role_rank(Role::Owner)).map(|&rank| BY_RANK[usize::from(rank)]))
+        let latest = roles.get(a).map(|(_, r)| *r);
+        // Ownership comes from the fixpoint above, never from a lone grant. A latest
+        // role of Owner without ownership (an undecidable cycle) shows no role.
+        let role = if owner { Some(Role::Owner) } else { latest.filter(|r| *r != Role::Owner) };
+        let p = ActorPolicy {
+            owner,
+            member: latest == Some(Role::Member),
+            auto: auto.get(a).is_some_and(|(_, on)| *on),
+            role,
+            kind: kinds.get(a).copied(),
         };
-        state.insert(
-            a.clone(),
-            ActorPolicy { owner, member, auto: auto.contains(a), role, kind: kinds.get(a).map(|(_, _, k)| *k) },
-        );
+        if p != ActorPolicy::default() {
+            state.insert(a.to_string(), p);
+        }
     }
     Ok(state)
 }

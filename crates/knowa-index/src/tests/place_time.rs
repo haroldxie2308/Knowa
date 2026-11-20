@@ -104,6 +104,20 @@ fn when_filter_is_half_open_overlap_from_lo_to_hi() {
 }
 
 #[test]
+fn reversed_when_range_is_invalid() {
+    let (_w, _d, idx, _) = placed(&[]);
+    for (from, to) in [("2025", "2024"), ("2024-06-02", "2024-06-01"), ("2030/..", "../2029")] {
+        let err = idx.find_entities(&when_filter(Some(from), Some(to)), &View::default(), Order::When, 10, None).err();
+        assert_eq!(err.map(|e| e.code), Some(ErrorCode::Invalid), "entities: {from} > {to}");
+        let err = idx.find_claims(&when_filter(Some(from), Some(to)), &View::default(), Order::When, 10, None).err();
+        assert_eq!(err.map(|e| e.code), Some(ErrorCode::Invalid), "claims: {from} > {to}");
+    }
+    for (from, to) in [("2024", "2024"), ("2024-06", "2024"), ("2024-12-31", "2024-12-31")] {
+        assert!(idx.find_entities(&when_filter(Some(from), Some(to)), &View::default(), Order::When, 10, None).is_ok(), "{from}..{to}");
+    }
+}
+
+#[test]
 fn recorded_fallback_when_and_ordering() {
     let mut w = World::new(1);
     let dir = TempDir::new();

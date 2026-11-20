@@ -1,4 +1,5 @@
 mod equivalence;
+mod evidence;
 mod kit;
 mod place_time;
 mod reads;

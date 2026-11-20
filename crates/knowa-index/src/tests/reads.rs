@@ -94,7 +94,9 @@ fn entity_matches_when_one_claim_passes_view_and_claim_filters_together() {
     assert!(idx.entity(&e, &rejected_only).unwrap().is_none());
     let view = idx.entity(&e, &View::default()).unwrap().unwrap();
     assert_eq!(view.spaces, vec![w.space.clone()]);
-    assert_eq!(view.types, vec![Term::parse(vocab::T_PERSON).unwrap()], "summary independent of the query view");
+    assert_eq!(view.types, vec![Term::parse(vocab::T_PERSON).unwrap()], "the proposed type passes the default view");
+    let accepted = View { status: vec![Status::Accepted], ..View::default() };
+    assert!(idx.entity(&e, &accepted).unwrap().unwrap().types.is_empty(), "display fields follow the view");
 }
 
 #[test]
@@ -232,6 +234,84 @@ fn equivalent_ignores_retracted_and_other_actors() {
 }
 
 #[test]
+fn equivalent_only_matches_active_fresh_claims() {
+    let (mut w, _d, mut idx) = setup();
+    let e = ent();
+    // a revert: Foo, then Bar replacing Foo, then Foo again
+    let foo = w.label(H, &e, "Foo");
+    let bar = w.with(H, &e, vocab::LABEL, text("Bar"), |d| d.replaces = vec![foo.id.clone()]);
+    apply(&mut idx, &[&foo, &bar]);
+    assert_eq!(crate::tests::kit::status(&idx, &foo), Status::Superseded);
+    let key = |c: &knowa_model::Claim| c.body.equiv_key().unwrap();
+    assert!(idx.equivalent(&w.actor(H), &key(&foo)).unwrap().is_none(), "a superseded equivalent does not block the revert");
+    assert_eq!(idx.equivalent(&w.actor(H), &key(&bar)).unwrap().unwrap().claim.id, bar.id);
+
+    let rejected = w.label(A, &e, "nope");
+    let no = w.review(G, &rejected, false);
+    let input = w.label(G, &e, "input");
+    let derived = w.with(H, &e, vocab::SUMMARY, text("derived"), |d| d.src = vec![input.id.clone()]);
+    let gone = w.retract(G, &input);
+    apply(&mut idx, &[&rejected, &no, &input, &derived, &gone]);
+    assert!(idx.equivalent(&w.actor(A), &key(&rejected)).unwrap().is_none(), "rejected");
+    assert!(crate::tests::kit::stale(&idx, &derived));
+    assert!(idx.equivalent(&w.actor(H), &key(&derived)).unwrap().is_none(), "stale: re-deriving from new inputs creates a new claim");
+}
+
+#[test]
+fn export_never_ships_private_blobs_notes_or_visibility_settings() {
+    let (mut w, _d, mut idx) = setup();
+    let mut blobs = MemBlobs::default();
+    let private_blob = blobs.put(b"private bytes");
+    let public_blob = blobs.put(b"public bytes");
+    let unreferenced = blobs.put(b"public, but nothing refers to it");
+    let e = ent();
+    let space = w.space.clone();
+    let default_public = w.say(G, &space, vocab::DEFAULT_VISIBILITY, term(vocab::VIS_PUBLIC));
+    let hide_blob = w.say(G, &private_blob, vocab::VISIBILITY, term(vocab::VIS_PRIVATE));
+    // public claims that refer to the private blob in every position
+    let mentions = w.say(G, &e, vocab::MENTIONS, Value::Ref(private_blob.clone()));
+    let derived = w.with(G, &e, vocab::SUMMARY, text("derived"), |d| d.src = vec![private_blob.clone(), public_blob.clone()]);
+    let review = w.with(A, &mentions.id, vocab::REVIEW, term(vocab::REVIEW_ACCEPT), |d| d.src = vec![private_blob.clone()]);
+    // a private claim and notes about it
+    let secret = w.label(G, &e, "secret");
+    let hide_secret = w.say(G, &secret.id, vocab::VISIBILITY, term(vocab::VIS_PRIVATE));
+    let retract_secret = w.with(G, &secret.id, vocab::RETRACT, Value::Bool(true), |d| d.note = Some("the secret was X".into()));
+    let review_secret = w.review(H, &secret, true);
+    let unretract = w.retract(G, &retract_secret);
+    // a review chain on an exported claim: exported with its target, transitively
+    let unreview = w.retract(A, &review);
+    let retract_derived = w.retract(G, &derived);
+    apply_blobs(
+        &mut idx,
+        &blobs,
+        &[
+            &default_public, &hide_blob, &mentions, &derived, &review, &secret, &hide_secret, &retract_secret, &review_secret,
+            &unretract, &unreview, &retract_derived,
+        ],
+    );
+
+    for level in [Visibility::Shared, Visibility::Public] {
+        let (claims, b) = idx.export_set_with(level, &blobs).unwrap();
+        let has = |c: &knowa_model::Claim| claims.contains(&c.id);
+        assert!(!b.contains(&private_blob), "{level:?}: referenced by exported claims, but private itself");
+        assert!(has(&mentions) && has(&derived), "{level:?}: public by the space default");
+        assert!(has(&review) && has(&unreview) && has(&retract_derived), "{level:?}: review/retract travel with their exported target");
+        assert!(has(&default_public), "{level:?}: trust claims are always exported");
+        assert!(!has(&secret), "{level:?}: private claim");
+        assert!(!has(&retract_secret) && !has(&review_secret) && !has(&unretract), "{level:?}: notes about a private claim stay private");
+        assert!(!has(&hide_blob) && !has(&hide_secret), "{level:?}: visibility claims are never exported");
+        assert_eq!(b, sorted(vec![public_blob.clone(), unreferenced.clone()]), "{level:?}: blobs by their own visibility only");
+    }
+    let (all, all_blobs) = idx.export_set_with(Visibility::Private, &blobs).unwrap();
+    assert!(all.contains(&secret.id) && all.contains(&hide_blob.id) && all.contains(&retract_secret.id));
+    assert_eq!(
+        all_blobs,
+        sorted(vec![private_blob.clone(), public_blob.clone(), unreferenced.clone()]),
+        "private: everything, including blobs no claim references (DESIGN §7.3)"
+    );
+}
+
+#[test]
 fn export_set_follows_effective_visibility() {
     let (mut w, _d, mut idx) = setup();
     let mut blobs = MemBlobs::default();
@@ -258,37 +338,44 @@ fn export_set_follows_effective_visibility() {
         &blobs,
         &[&private, &shared_subject, &claim_private, &claim_public, &about_blob, &vis_e2, &vis_cp, &vis_pub, &vis_blob, &by_member, &undone, &undo],
     );
-    let policy: Vec<Id> = idx
-        .find_claims(&Where::default(), &all_statuses(), Order::Recorded, 1000, None)
-        .unwrap()
-        .items
-        .into_iter()
-        .filter(|c| vocab::POLICY_PREDICATES.contains(&c.claim.body.p.as_str()))
-        .map(|c| c.claim.id)
-        .collect();
-    // (non-policy claims, blobs); asserts every policy claim is exported
+    let policy = |idx: &crate::Index, preds: &[&str]| -> Vec<Id> {
+        idx.find_claims(&Where::default(), &all_statuses(), Order::Recorded, 1000, None)
+            .unwrap()
+            .items
+            .into_iter()
+            .filter(|c| preds.contains(&c.claim.body.p.as_str()))
+            .map(|c| c.claim.id)
+            .collect()
+    };
+    let trust_preds = [vocab::OWNER, vocab::ROLE, vocab::AUTO_ACCEPT, vocab::ACTOR_KIND, vocab::DEFAULT_VISIBILITY];
+    // (non-policy claims, blobs) at a shared/public level; asserts trust claims are
+    // exported and visibility claims (and retracts of them) are not
     let export = |idx: &crate::Index, level| {
         let (claims, b) = idx.export_set_with(level, &blobs).unwrap();
-        assert!(policy.iter().all(|p| claims.contains(p)), "every policy claim is exported");
-        let content: Vec<Id> = claims.into_iter().filter(|c| !policy.contains(c)).collect();
+        let trust = policy(idx, &trust_preds);
+        assert!(trust.iter().all(|p| claims.contains(p)), "{level:?}: trust claims are always exported");
+        assert!(policy(idx, &[vocab::VISIBILITY]).iter().all(|p| !claims.contains(p)), "{level:?}: visibility claims never are");
+        assert!(!claims.contains(&undo.id), "{level:?}: a retract travels only with an exported target");
+        let content: Vec<Id> = claims.into_iter().filter(|c| !trust.contains(c)).collect();
         (sorted(content), b)
     };
 
     let (shared, shared_blobs) = export(&idx, Visibility::Shared);
     assert_eq!(shared, sorted(vec![shared_subject.id.clone(), claim_public.id.clone(), about_blob.id.clone()]));
-    assert_eq!(shared_blobs, sorted(vec![present.clone(), region_of.clone()]), "base ids, present blobs only");
+    assert_eq!(shared_blobs, vec![present.clone()], "by the blob's own visibility; region_of is private by default");
     let (public, _) = export(&idx, Visibility::Public);
     assert_eq!(public, sorted(vec![claim_public.id.clone(), about_blob.id.clone()]));
-    let (everything, _) = export(&idx, Visibility::Private);
-    assert_eq!(everything.len(), 5);
+    let (everything, everything_blobs) = idx.export_set_with(Visibility::Private, &blobs).unwrap();
+    assert_eq!(everything.len(), 5 + policy(&idx, vocab::POLICY_PREDICATES).len(), "private exports every claim");
+    assert_eq!(everything_blobs, sorted(vec![present.clone(), region_of.clone()]), "base ids, present blobs only");
 
     let space = w.space.clone();
     let default_shared = w.say(G, &space, vocab::DEFAULT_VISIBILITY, term(vocab::VIS_SHARED));
     apply_blobs(&mut idx, &blobs, &[&default_shared]);
-    let (shared, _) = export(&idx, Visibility::Shared);
+    let (shared, shared_blobs) = export(&idx, Visibility::Shared);
     assert!(shared.contains(&private.id), "space default applies when nothing more specific is set");
     assert!(!shared.contains(&claim_private.id), "claim-level setting wins over the default");
-    assert!(shared.contains(&default_shared.id), "policy claims are always exported");
+    assert_eq!(shared_blobs, sorted(vec![present.clone(), region_of.clone()]), "the space default applies to blobs too");
 }
 
 #[test]

@@ -46,10 +46,11 @@ pub(crate) fn document(text: &str) -> String {
     out
 }
 
-/// FTS5 MATCH expression for free text: every word must match (AND), the last one
-/// as a prefix; CJK runs are phrases of single characters. `invalid` when the text
-/// has no word characters at all.
-pub(crate) fn match_expr(text: &str) -> Result<String> {
+/// The tokens of free text, each an FTS5 MATCH expression: a word, or a CJK run as a
+/// phrase of single characters; the last one is a prefix. A query matches when every
+/// token matches (DESIGN §4.7: each in some claim passing the view). `invalid` when
+/// the text has no word characters at all.
+pub(crate) fn match_terms(text: &str) -> Result<Vec<String>> {
     let mut terms: Vec<String> = Vec::new();
     for word in text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()) {
         let mut run = String::new();
@@ -69,7 +70,7 @@ pub(crate) fn match_expr(text: &str) -> Result<String> {
         return Err(Error::invalid(format!("text {text:?} contains no searchable words")));
     };
     last.push('*');
-    Ok(terms.join(" AND "))
+    Ok(terms)
 }
 
 /// A word as an FTS5 string; a CJK run as a phrase of its characters. Words only

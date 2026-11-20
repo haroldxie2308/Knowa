@@ -147,7 +147,7 @@ fn retract_of_retract_restores_the_target() {
 }
 
 #[test]
-fn replacement_supersedes_only_when_accepted_or_superseded() {
+fn replacement_supersedes_only_when_its_base_status_is_accepted() {
     let (mut w, _d, mut idx) = setup();
     let e = ent();
     let member = w.grant(G, H, vocab::ROLE_MEMBER);
@@ -161,7 +161,8 @@ fn replacement_supersedes_only_when_accepted_or_superseded() {
     assert_eq!(status(&idx, &c2), Status::Accepted);
     assert_eq!(status(&idx, &c), Status::Superseded);
 
-    // c2 itself superseded by an accepted c3: c stays superseded
+    // c2 itself superseded by an accepted c3: c stays superseded, because c2's base
+    // status (its review) is still accepted
     let c3 = w.with(G, &e, vocab::LABEL, text("newest"), |d| d.replaces = vec![c2.id.clone()]);
     apply(&mut idx, &[&c3]);
     assert_eq!(status(&idx, &c2), Status::Superseded);
@@ -266,4 +267,103 @@ fn actor_kind_is_self_declared_only() {
     apply(&mut idx, &[&own, &forged]);
     let info = idx.actors().unwrap().into_iter().find(|a| a.id == a_id).unwrap();
     assert_eq!(info.kind, Some(knowa_model::ActorKind::Agent));
+}
+
+#[test]
+fn supersession_requires_the_replacers_base_status_to_be_accepted() {
+    let (mut w, _d, mut idx) = setup();
+    let e = ent();
+    let c1 = w.label(G, &e, "one");
+    let c2 = w.label(G, &e, "two");
+    let r1 = w.with(A, &e, vocab::LABEL, text("merged"), |d| d.replaces = vec![c1.id.clone(), c2.id.clone()]);
+    let r2 = w.with(A, &e, vocab::LABEL, text("merged again"), |d| d.replaces = vec![r1.id.clone()]);
+    apply(&mut idx, &[&c1, &c2, &r1, &r2]);
+    let ok = w.review(G, &r2, true);
+    apply(&mut idx, &[&ok]);
+    assert_eq!(status(&idx, &r2), Status::Accepted);
+    assert_eq!(status(&idx, &r1), Status::Superseded);
+    assert_eq!(status(&idx, &c1), Status::Accepted, "r1 is merely superseded; its base status is proposed");
+    assert_eq!(status(&idx, &c2), Status::Accepted);
+
+    // accepting r1 gives it an accepted base status, so it supersedes while superseded
+    let ok1 = w.review(G, &r1, true);
+    apply(&mut idx, &[&ok1]);
+    assert_eq!(status(&idx, &r1), Status::Superseded);
+    assert_eq!(status(&idx, &c1), Status::Superseded);
+    assert_eq!(status(&idx, &c2), Status::Superseded);
+
+    // a retracted replacement supersedes nothing, whatever its review says
+    let undo = w.retract(G, &r1);
+    apply(&mut idx, &[&undo]);
+    assert_eq!(status(&idx, &c1), Status::Accepted);
+}
+
+#[test]
+fn only_the_first_actor_kind_counts() {
+    let (mut w, _d, mut idx) = setup();
+    let first = w.kind(A, vocab::KIND_AGENT);
+    let relabel = w.kind(A, vocab::KIND_HUMAN);
+    let e = ent();
+    let said = w.label(A, &e, "agent says");
+    // the later declaration arrives first
+    apply(&mut idx, &[&relabel, &said, &first]);
+    let a_id = w.actor(A);
+    let kind = |idx: &crate::Index| idx.actors().unwrap().into_iter().find(|a| a.id == a_id).unwrap().kind;
+    assert_eq!(kind(&idx), Some(knowa_model::ActorKind::Agent));
+    let humans = knowa_model::query::View { actor_kinds: vec![knowa_model::ActorKind::Human], ..Default::default() };
+    let about = knowa_model::query::Where { s: vec![e.clone()], ..Default::default() };
+    let got = idx.find_claims(&about, &humans, knowa_model::query::Order::Recorded, 10, None).unwrap().items;
+    assert!(got.is_empty(), "a re-declared Human kind does not make the agent's claims human");
+
+    // retracting the first declaration leaves no kind; a later one never takes over
+    let undo = w.retract(A, &first);
+    apply(&mut idx, &[&undo]);
+    assert_eq!(kind(&idx), None);
+}
+
+#[test]
+fn role_and_auto_accept_are_latest_wins() {
+    let (mut w, _d, mut idx) = setup();
+    let e = ent();
+    let ids: Vec<Id> = (0..5).map(|i| w.actor(i)).collect();
+    let info = |idx: &crate::Index, who: usize| idx.actors().unwrap().into_iter().find(|a| a.id == ids[who]);
+    let role = |idx: &crate::Index, who: usize| info(idx, who).and_then(|a| a.role);
+
+    let member = w.grant(G, X, vocab::ROLE_MEMBER);
+    let viewer = w.grant(G, X, vocab::ROLE_VIEWER);
+    let by_x = w.label(X, &e, "x");
+    apply(&mut idx, &[&viewer, &by_x, &member]);
+    assert_eq!(role(&idx, X), Some(Role::Viewer), "a later grant demotes");
+    assert_eq!(status(&idx, &by_x), Status::Proposed);
+
+    let undo = w.retract(G, &viewer);
+    apply(&mut idx, &[&undo]);
+    assert_eq!(role(&idx, X), Some(Role::Member), "retracting the latest falls back to the previous one");
+    assert_eq!(status(&idx, &by_x), Status::Accepted);
+
+    let by_agent = w.grant(A, X, vocab::ROLE_VIEWER);
+    apply(&mut idx, &[&by_agent]);
+    assert_eq!(role(&idx, X), Some(Role::Member), "a grant by a non-owner is not effective, so it is not the latest");
+
+    let on = w.auto_accept(G, W, true);
+    let off = w.auto_accept(G, W, false);
+    let by_w = w.label(W, &e, "w");
+    apply(&mut idx, &[&off, &by_w, &on]);
+    assert_eq!(status(&idx, &by_w), Status::Proposed, "autoAccept false revokes");
+    assert!(!info(&idx, W).unwrap().auto_accept);
+
+    // demoting an owner removes ownership and everything that depended on it
+    let owner = w.grant(G, H, vocab::ROLE_OWNER);
+    let by_h = w.label(H, &e, "h");
+    let h_grants = w.grant(H, A, vocab::ROLE_MEMBER);
+    let by_a = w.label(A, &e, "a");
+    apply(&mut idx, &[&owner, &by_h, &h_grants, &by_a]);
+    assert_eq!(role(&idx, H), Some(Role::Owner));
+    assert_eq!(status(&idx, &by_a), Status::Accepted);
+    let demote = w.grant(G, H, vocab::ROLE_MEMBER);
+    apply(&mut idx, &[&demote]);
+    assert_eq!(role(&idx, H), Some(Role::Member));
+    assert_eq!(status(&idx, &by_h), Status::Accepted, "still a member");
+    assert_eq!(role(&idx, A), None, "H's grant needs H to be an owner");
+    assert_eq!(status(&idx, &by_a), Status::Proposed);
 }

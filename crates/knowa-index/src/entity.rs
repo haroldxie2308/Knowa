@@ -1,19 +1,23 @@
-//! Entity rows: summary fields (DESIGN §4.7 display value, §4.8 when), the FTS
-//! document and the geo point, recomputed from the entity's claims.
+//! Entity summaries (DESIGN §4.7 display value, §4.8 when) and per-claim full-text
+//! documents.
+//!
+//! A summary is a function of a set of claims about one entity (`summarize`). The
+//! `entities` table stores it for the default view's claim set (accepted|proposed);
+//! reads under any other view compute it from the claims passing that view. Both go
+//! through `summarize` and `Summary::view`, so they cannot drift apart.
 
 use std::collections::BTreeSet;
 
 use knowa_model::view::{EntityWhen, EntityWhere, WhenSource};
-use knowa_model::{EntityView, Id, IdKind, Result, Timestamp, Value, vocab};
+use knowa_model::{EntityView, Id, IdKind, Result, Status, Timestamp, Value, vocab};
 use rusqlite::Connection;
 
 use crate::blobs::{self, BlobSource};
 use crate::db::{corrupt, db, id_from, status_from, term_from, value_from};
 use crate::fts;
-use crate::rules;
 
-/// An accepted|proposed claim, for display ordering.
-struct Active {
+/// A claim about an entity, as display ordering and summaries need it.
+pub(crate) struct Evidence {
     id: String,
     at: i64,
     accepted: bool,
@@ -21,106 +25,78 @@ struct Active {
     o: Value,
 }
 
+/// Columns read by `evidence_at`, for a claims table aliased `c`.
+pub(crate) const EVIDENCE_COLS: &str = "c.id, c.p, c.o, c.at, c.status";
+
+/// Builds `Evidence` from `EVIDENCE_COLS` at columns `at..at+5`.
+pub(crate) fn evidence_at(row: &rusqlite::Row<'_>, at: usize) -> Result<Evidence> {
+    let o: String = row.get(at + 2).map_err(db)?;
+    let status = status_from(&row.get::<_, String>(at + 4).map_err(db)?)?;
+    Ok(Evidence {
+        id: row.get(at).map_err(db)?,
+        p: row.get(at + 1).map_err(db)?,
+        o: value_from(&o)?,
+        at: row.get(at + 3).map_err(db)?,
+        accepted: status == Status::Accepted,
+    })
+}
+
 /// Display order (DESIGN §4.7): accepted before proposed, then latest `at`; the id
 /// breaks ties so the choice is deterministic.
-fn display_sort(v: &mut [Active]) {
+fn display_sort(v: &mut [Evidence]) {
     v.sort_by(|a, b| b.accepted.cmp(&a.accepted).then(b.at.cmp(&a.at)).then(b.id.cmp(&a.id)));
 }
 
-/// Accepted|proposed claims with subject `s` (and predicate `p` if given), in display order.
-fn active_claims(conn: &Connection, s: &str, p: Option<&str>) -> Result<(Vec<Active>, Option<i64>)> {
-    let mut stmt = match p {
-        Some(_) => conn.prepare_cached("SELECT id, p, o, at, status FROM claims WHERE s = ?1 AND p = ?2 AND ent = 1"),
-        None => conn.prepare_cached("SELECT id, p, o, at, status FROM claims WHERE s = ?1 AND ent = 1"),
-    }
-    .map_err(db)?;
-    let mut rows = match p {
-        Some(p) => stmt.query(rusqlite::params![s, p]),
-        None => stmt.query(rusqlite::params![s]),
-    }
-    .map_err(db)?;
-    let mut active = Vec::new();
-    let mut first_at: Option<i64> = None;
-    while let Some(row) = rows.next().map_err(db)? {
-        let at: i64 = row.get(3).map_err(db)?;
-        first_at = Some(first_at.map_or(at, |f| f.min(at)));
-        let status = status_from(&row.get::<_, String>(4).map_err(db)?)?;
-        if !rules::is_active(status) {
-            continue;
-        }
-        let o: String = row.get(2).map_err(db)?;
-        active.push(Active {
-            id: row.get(0).map_err(db)?,
-            at,
-            accepted: status == knowa_model::Status::Accepted,
-            p: row.get(1).map_err(db)?,
-            o: value_from(&o)?,
-        });
-    }
-    display_sort(&mut active);
-    Ok((active, first_at))
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct WhenSummary {
+    pub value: String,
+    pub lo: Option<i64>,
+    pub hi: Option<i64>,
+    pub source: WhenSource,
+    /// ordering key for `when` / `-when`
+    pub key: Option<i64>,
 }
 
-/// Display-chosen accepted|proposed `knowa:mediaType` of `blob` (base id).
-pub(crate) fn media_type(conn: &Connection, blob: &str) -> Result<Option<String>> {
-    let (active, _) = active_claims(conn, blob, Some(vocab::MEDIA_TYPE))?;
-    Ok(active.into_iter().find_map(|a| match a.o {
-        Value::Text { text, .. } => Some(text),
-        _ => None,
-    }))
+/// An entity's display fields, computed from one set of claims about it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Summary {
+    /// earliest record time among the claims; `None` iff there are none
+    pub first_at: Option<i64>,
+    pub label: Option<String>,
+    pub types: Vec<String>,
+    pub when: Option<WhenSummary>,
+    /// (lat, lon, r)
+    pub point: Option<(f64, f64, Option<f64>)>,
+    /// supporting claim ids, deduplicated, in field order
+    pub claims: Vec<String>,
 }
 
-fn is_text_blob(conn: &Connection, blob: &str) -> Result<bool> {
-    Ok(media_type(conn, blob)?.is_some_and(|m| m.to_ascii_lowercase().starts_with("text/")))
-}
-
-/// Entities whose FTS document includes `blob`'s text through `knowa:content`.
-pub(crate) fn content_referrers(conn: &Connection, blob: &str) -> Result<Vec<String>> {
-    let mut stmt = conn
-        .prepare_cached("SELECT DISTINCT s FROM claims WHERE o_ref_base = ?1 AND p = ?2 AND ent = 1")
-        .map_err(db)?;
-    let mut rows = stmt.query(rusqlite::params![blob, vocab::CONTENT]).map_err(db)?;
-    let mut out = Vec::new();
-    while let Some(row) = rows.next().map_err(db)? {
-        out.push(row.get(0).map_err(db)?);
-    }
-    Ok(out)
-}
-
-/// Recomputes the row, FTS document and geo point of `entity`, which must be the
-/// subject of at least one entity-materializing claim.
-pub(crate) fn refresh(conn: &Connection, blobs: &dyn BlobSource, entity: &str) -> Result<()> {
-    let (active, first_at) = active_claims(conn, entity, None)?;
-    let first_at = first_at.ok_or_else(|| corrupt(format_args!("entity {entity} has no claims")))?;
-
+/// The summary of `evidence`, all claims about one entity (DESIGN §4.7 display value,
+/// §4.8 when).
+pub(crate) fn summarize(mut evidence: Vec<Evidence>) -> Summary {
+    display_sort(&mut evidence);
     let mut supporting: Vec<&str> = Vec::new();
-    let label = active.iter().find_map(|a| match &a.o {
-        Value::Text { text, .. } if a.p == vocab::LABEL => Some((text.as_str(), a.id.as_str())),
+    let label = evidence.iter().find_map(|a| match &a.o {
+        Value::Text { text, .. } if a.p == vocab::LABEL => Some((text.clone(), a.id.as_str())),
         _ => None,
     });
-    if let Some((_, id)) = label {
+    if let Some((_, id)) = &label {
         supporting.push(id);
     }
-    let mut types: Vec<&str> = Vec::new();
-    for a in &active {
+    let mut types: Vec<String> = Vec::new();
+    for a in &evidence {
         if let Value::Term(t) = &a.o
             && a.p == vocab::TYPE
-            && !types.contains(&t.as_str())
+            && !types.iter().any(|x| x == t.as_str())
         {
-            types.push(t.as_str());
+            types.push(t.as_str().to_string());
             supporting.push(&a.id);
         }
     }
 
     // when: the display-chosen knowa:when, else the earliest record time (§4.8)
-    struct WhenRow {
-        value: String,
-        lo: Option<i64>,
-        hi: Option<i64>,
-        source: &'static str,
-        key: Option<i64>,
-    }
-    let claimed = active.iter().find_map(|a| match &a.o {
+    let earliest = evidence.iter().min_by(|a, b| a.at.cmp(&b.at).then(a.id.cmp(&b.id)));
+    let claimed = evidence.iter().find_map(|a| match &a.o {
         Value::When(w) if a.p == vocab::WHEN => Some((w, a.id.as_str())),
         _ => None,
     });
@@ -128,16 +104,15 @@ pub(crate) fn refresh(conn: &Connection, blobs: &dyn BlobSource, entity: &str) -
         supporting.push(id);
         // Open-ended ranges have no midpoint; they sort by their finite end.
         let key = w.center().or(w.lo).or(w.hi);
-        Some(WhenRow { value: w.raw.clone(), lo: w.lo, hi: w.hi, source: "claim", key })
-    } else if let Some(earliest) = active.iter().min_by(|a, b| a.at.cmp(&b.at).then(a.id.cmp(&b.id))) {
-        supporting.push(&earliest.id);
-        let at = earliest.at;
-        Some(WhenRow { value: Timestamp(at).format(), lo: Some(at), hi: Some(at + 1), source: "recorded", key: Some(at) })
+        Some(WhenSummary { value: w.raw.clone(), lo: w.lo, hi: w.hi, source: WhenSource::Claim, key })
+    } else if let Some(e) = earliest {
+        supporting.push(&e.id);
+        Some(WhenSummary { value: Timestamp(e.at).format(), lo: Some(e.at), hi: Some(e.at + 1), source: WhenSource::Recorded, key: Some(e.at) })
     } else {
         None
     };
 
-    let place = active.iter().find_map(|a| match &a.o {
+    let place = evidence.iter().find_map(|a| match &a.o {
         Value::Geo(g) if a.p == vocab::WHERE => Some((g, a.id.as_str())),
         _ => None,
     });
@@ -148,7 +123,169 @@ pub(crate) fn refresh(conn: &Connection, blobs: &dyn BlobSource, entity: &str) -
 
     let mut seen = BTreeSet::new();
     supporting.retain(|id| seen.insert(*id));
+    Summary {
+        first_at: earliest.map(|e| e.at),
+        label: label.map(|(l, _)| l),
+        types,
+        when,
+        point,
+        claims: supporting.into_iter().map(String::from).collect(),
+    }
+}
 
+impl Summary {
+    /// The when-filter of DESIGN §6.1: half-open overlap of the entity's `when` with
+    /// [lo, hi), open ends unbounded. An entity without `when` never matches.
+    pub fn when_overlaps(&self, lo: Option<i64>, hi: Option<i64>) -> bool {
+        let Some(w) = &self.when else { return false };
+        hi.is_none_or(|hi| w.lo.is_none_or(|elo| elo < hi)) && lo.is_none_or(|lo| w.hi.is_none_or(|ehi| ehi > lo))
+    }
+
+    pub fn view(&self, id: &str, space: &Id) -> Result<EntityView> {
+        Ok(EntityView {
+            id: id_from(id)?,
+            spaces: vec![space.clone()],
+            label: self.label.clone(),
+            types: self.types.iter().map(|t| term_from(t)).collect::<Result<_>>()?,
+            when: self.when.as_ref().map(|w| EntityWhen {
+                value: w.value.clone(),
+                from: w.lo.map(|t| Timestamp(t).format()),
+                to: w.hi.map(|t| Timestamp(t).format()),
+                source: w.source,
+            }),
+            where_: self.point.map(|(lat, lon, r)| EntityWhere { lat, lon, r }),
+            score: None,
+            distance_km: None,
+            claims: self.claims.iter().map(|c| id_from(c)).collect::<Result<_>>()?,
+        })
+    }
+}
+
+/// Accepted|proposed claims with subject `s` (and predicate `p` if given): the
+/// default view's evidence.
+fn active_evidence(conn: &Connection, s: &str, p: Option<&str>) -> Result<Vec<Evidence>> {
+    const BASE: &str = "SELECT c.id, c.p, c.o, c.at, c.status FROM claims c WHERE c.s = ?1 AND c.ent = 1 AND c.status IN (?2, ?3)";
+    let (accepted, proposed) = (Status::Accepted.as_str(), Status::Proposed.as_str());
+    let mut stmt = match p {
+        Some(_) => conn.prepare_cached(&format!("{BASE} AND c.p = ?4")),
+        None => conn.prepare_cached(BASE),
+    }
+    .map_err(db)?;
+    let mut rows = match p {
+        Some(p) => stmt.query(rusqlite::params![s, accepted, proposed, p]),
+        None => stmt.query(rusqlite::params![s, accepted, proposed]),
+    }
+    .map_err(db)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(db)? {
+        out.push(evidence_at(row, 0)?);
+    }
+    Ok(out)
+}
+
+/// Display-chosen accepted|proposed `knowa:mediaType` of `blob` (base id).
+pub(crate) fn media_type(conn: &Connection, blob: &str) -> Result<Option<String>> {
+    let mut active = active_evidence(conn, blob, Some(vocab::MEDIA_TYPE))?;
+    display_sort(&mut active);
+    Ok(active.into_iter().find_map(|a| match a.o {
+        Value::Text { text, .. } => Some(text),
+        _ => None,
+    }))
+}
+
+fn is_text_type(media_type: &str) -> bool {
+    media_type.to_ascii_lowercase().starts_with("text/")
+}
+
+/// Whether a blob is text is a property of the blob, decided by its display media
+/// type under the default rules (as `Index::media_type` reports it), not by the
+/// query view. The view decides which claims' text counts.
+fn is_text_blob(conn: &Connection, blob: &str) -> Result<bool> {
+    Ok(media_type(conn, blob)?.is_some_and(|m| is_text_type(&m)))
+}
+
+/// The bare blob whose text a claim with (s, p, o) carries if that blob is a text blob
+/// (DESIGN §7.2, §4.7): the blob a `knowa:content` claim links, or the blob a
+/// `knowa:mediaType` claim declares to be `text/*`.
+pub(crate) fn linked_blob(s: &Id, p: &str, o: &Value) -> Option<Id> {
+    match o {
+        Value::Ref(r) if p == vocab::CONTENT && r.kind() == IdKind::Blob => Some(r.base()),
+        Value::Text { text, .. } if p == vocab::MEDIA_TYPE && s.kind() == IdKind::Blob && s.fragment().is_none() && is_text_type(text) => {
+            Some(s.clone())
+        }
+        _ => None,
+    }
+}
+
+/// The text a claim contributes on its own: a text value, or a `knowa:type` name.
+pub(crate) fn own_text(p: &str, o: &Value) -> Option<String> {
+    match o {
+        Value::Text { text, .. } => Some(text.clone()),
+        Value::Term(t) if p == vocab::TYPE => Some(t.name().to_string()),
+        _ => None,
+    }
+}
+
+/// Replaces claim `n`'s full-text document with `parts` (none → no document).
+fn write_text(conn: &Connection, n: i64, parts: &[&str], replace: bool) -> Result<()> {
+    if replace {
+        conn.prepare_cached("DELETE FROM claim_fts WHERE rowid = ?1").map_err(db)?.execute([n]).map_err(db)?;
+    }
+    if !parts.is_empty() {
+        conn.prepare_cached("INSERT INTO claim_fts(rowid, body) VALUES (?1, ?2)")
+            .map_err(db)?
+            .execute(rusqlite::params![n, fts::document(&parts.join("\n"))])
+            .map_err(db)?;
+    }
+    Ok(())
+}
+
+/// Indexes a newly inserted entity-materializing claim that links no blob.
+pub(crate) fn insert_text(conn: &Connection, n: i64, p: &str, o: &Value) -> Result<()> {
+    match own_text(p, o) {
+        Some(t) => write_text(conn, n, &[&t], false),
+        None => Ok(()),
+    }
+}
+
+/// Rewrites the documents of every claim that links `blob` (its text/* mediaType
+/// claims and the content claims pointing at it), whose text depends on whether
+/// `blob` is a text blob and present.
+pub(crate) fn refresh_blob_text(conn: &Connection, blobs: &dyn BlobSource, blob: &str) -> Result<()> {
+    let id = id_from(blob)?;
+    let text = if is_text_blob(conn, blob)? { blobs::fts_text(blobs, &id)? } else { None };
+    let mut linking = Vec::new();
+    for (sql, p) in [
+        ("SELECT n, s, p, o FROM claims WHERE s = ?1 AND p = ?2 AND ent = 1", vocab::MEDIA_TYPE),
+        ("SELECT n, s, p, o FROM claims WHERE o_ref_base = ?1 AND p = ?2 AND ent = 1", vocab::CONTENT),
+    ] {
+        let mut stmt = conn.prepare_cached(sql).map_err(db)?;
+        let mut rows = stmt.query(rusqlite::params![blob, p]).map_err(db)?;
+        while let Some(row) = rows.next().map_err(db)? {
+            let n: i64 = row.get(0).map_err(db)?;
+            let s = id_from(&row.get::<_, String>(1).map_err(db)?)?;
+            let p: String = row.get(2).map_err(db)?;
+            let o = value_from(&row.get::<_, String>(3).map_err(db)?)?;
+            if linked_blob(&s, &p, &o).as_ref() == Some(&id) {
+                linking.push((n, own_text(&p, &o)));
+            }
+        }
+    }
+    for (n, own) in linking {
+        let parts: Vec<&str> = own.as_deref().into_iter().chain(text.as_deref()).collect();
+        write_text(conn, n, &parts, true)?;
+    }
+    Ok(())
+}
+
+/// Columns read by `stored_at`, for an `entities` table aliased `e`.
+pub(crate) const COLS: &str =
+    "e.id, e.first_at, e.label, e.types, e.when_value, e.when_lo, e.when_hi, e.when_source, e.when_key, e.lat, e.lon, e.r, e.claims";
+
+/// Recomputes the stored (default-view) summary and geo point of `entity`.
+pub(crate) fn refresh(conn: &Connection, entity: &str) -> Result<()> {
+    let s = summarize(active_evidence(conn, entity, None)?);
+    let when = s.when.as_ref();
     let n: i64 = conn
         .prepare_cached(
             "INSERT INTO entities(id, first_at, label, types, when_value, when_lo, when_hi, when_source, when_key, lat, lon, r, claims)
@@ -163,123 +300,73 @@ pub(crate) fn refresh(conn: &Connection, blobs: &dyn BlobSource, entity: &str) -
         .query_row(
             rusqlite::params![
                 entity,
-                first_at,
-                label.map(|(l, _)| l),
-                serde_json::json!(types).to_string(),
-                when.as_ref().map(|w| w.value.as_str()),
-                when.as_ref().and_then(|w| w.lo),
-                when.as_ref().and_then(|w| w.hi),
-                when.as_ref().map(|w| w.source),
-                when.as_ref().and_then(|w| w.key),
-                point.map(|p| p.0),
-                point.map(|p| p.1),
-                point.and_then(|p| p.2),
-                serde_json::json!(supporting).to_string(),
+                s.first_at,
+                s.label,
+                serde_json::json!(s.types).to_string(),
+                when.map(|w| w.value.as_str()),
+                when.and_then(|w| w.lo),
+                when.and_then(|w| w.hi),
+                when.map(|w| source_str(w.source)),
+                when.and_then(|w| w.key),
+                s.point.map(|p| p.0),
+                s.point.map(|p| p.1),
+                s.point.and_then(|p| p.2),
+                serde_json::json!(s.claims).to_string(),
             ],
             |r| r.get(0),
         )
         .map_err(db)?;
 
-    conn.prepare_cached("DELETE FROM entity_types WHERE entity = ?1").map_err(db)?.execute([n]).map_err(db)?;
-    let mut ins = conn.prepare_cached("INSERT INTO entity_types(type, entity) VALUES (?1, ?2)").map_err(db)?;
-    for t in &types {
-        ins.execute(rusqlite::params![t, n]).map_err(db)?;
-    }
-
     conn.prepare_cached("DELETE FROM geo WHERE n = ?1").map_err(db)?.execute([n]).map_err(db)?;
-    if let Some((lat, lon, _)) = point {
+    if let Some((lat, lon, _)) = s.point {
         conn.prepare_cached("INSERT INTO geo(n, min_lat, max_lat, min_lon, max_lon) VALUES (?1, ?2, ?2, ?3, ?3)")
             .map_err(db)?
             .execute(rusqlite::params![n, lat, lon])
             .map_err(db)?;
     }
-
-    let body = fts::document(&fts_body(conn, blobs, entity, &active)?);
-    conn.prepare_cached("DELETE FROM fts WHERE rowid = ?1").map_err(db)?.execute([n]).map_err(db)?;
-    conn.prepare_cached("INSERT INTO fts(rowid, body) VALUES (?1, ?2)")
-        .map_err(db)?
-        .execute(rusqlite::params![n, body])
-        .map_err(db)?;
     Ok(())
 }
 
-/// Text-valued objects, type names and text-blob content (the entity itself if it
-/// is a bare text blob, and blobs reached via `knowa:content`).
-fn fts_body(conn: &Connection, blobs: &dyn BlobSource, entity: &str, active: &[Active]) -> Result<String> {
-    let mut parts: Vec<String> = Vec::new();
-    let mut text_blobs: BTreeSet<Id> = BTreeSet::new();
-    let me = id_from(entity)?;
-    if me.kind() == IdKind::Blob && me.fragment().is_none() && is_text_blob(conn, entity)? {
-        text_blobs.insert(me);
+fn source_str(s: WhenSource) -> &'static str {
+    match s {
+        WhenSource::Claim => "claim",
+        WhenSource::Recorded => "recorded",
     }
-    for a in active {
-        match &a.o {
-            Value::Text { text, .. } => parts.push(text.clone()),
-            Value::Term(t) if a.p == vocab::TYPE => parts.push(t.name().to_string()),
-            Value::Ref(r) if a.p == vocab::CONTENT && r.kind() == IdKind::Blob => {
-                let base = r.base();
-                if is_text_blob(conn, base.as_str())? {
-                    text_blobs.insert(base);
-                }
-            }
-            _ => {}
-        }
-    }
-    for b in &text_blobs {
-        if let Some(text) = blobs::fts_text(blobs, b)? {
-            parts.push(text);
-        }
-    }
-    Ok(parts.join("\n"))
 }
 
-/// Columns read by `view_at`, for an `entities` table aliased `e`.
-pub(crate) const COLS: &str = "e.id, e.label, e.types, e.when_value, e.when_lo, e.when_hi, e.when_source, e.lat, e.lon, e.r, e.claims";
-pub(crate) const NCOLS: usize = 11;
-
-/// Builds an `EntityView` from `COLS` at columns `at..at+NCOLS`.
-pub(crate) fn view_at(row: &rusqlite::Row<'_>, at: usize, space: &Id) -> Result<EntityView> {
+/// Reads (id, stored summary) from `COLS` at columns `at..at+NCOLS`.
+pub(crate) fn stored_at(row: &rusqlite::Row<'_>, at: usize) -> Result<(String, Summary)> {
     let id: String = row.get(at).map_err(db)?;
-    let types: String = row.get(at + 2).map_err(db)?;
+    let types: String = row.get(at + 3).map_err(db)?;
     let types: Vec<String> = serde_json::from_str(&types).map_err(|e| corrupt(format_args!("entity types: {e}")))?;
-    let when_value: Option<String> = row.get(at + 3).map_err(db)?;
+    let when_value: Option<String> = row.get(at + 4).map_err(db)?;
     let when = match when_value {
         Some(value) => {
-            let lo: Option<i64> = row.get(at + 4).map_err(db)?;
-            let hi: Option<i64> = row.get(at + 5).map_err(db)?;
-            let source: String = row.get(at + 6).map_err(db)?;
+            let source: String = row.get(at + 7).map_err(db)?;
             let source = match source.as_str() {
                 "claim" => WhenSource::Claim,
                 "recorded" => WhenSource::Recorded,
                 other => return Err(corrupt(format_args!("when source {other:?}"))),
             };
-            Some(EntityWhen {
+            Some(WhenSummary {
                 value,
-                from: lo.map(|t| Timestamp(t).format()),
-                to: hi.map(|t| Timestamp(t).format()),
+                lo: row.get(at + 5).map_err(db)?,
+                hi: row.get(at + 6).map_err(db)?,
                 source,
+                key: row.get(at + 8).map_err(db)?,
             })
         }
         None => None,
     };
-    let lat: Option<f64> = row.get(at + 7).map_err(db)?;
-    let lon: Option<f64> = row.get(at + 8).map_err(db)?;
-    let where_ = match (lat, lon) {
-        (Some(lat), Some(lon)) => Some(EntityWhere { lat, lon, r: row.get(at + 9).map_err(db)? }),
+    let lat: Option<f64> = row.get(at + 9).map_err(db)?;
+    let lon: Option<f64> = row.get(at + 10).map_err(db)?;
+    let point = match (lat, lon) {
+        (Some(lat), Some(lon)) => Some((lat, lon, row.get(at + 11).map_err(db)?)),
         (None, None) => None,
         _ => return Err(corrupt(format_args!("entity {id} has half a geo point"))),
     };
-    let claims: String = row.get(at + 10).map_err(db)?;
+    let claims: String = row.get(at + 12).map_err(db)?;
     let claims: Vec<String> = serde_json::from_str(&claims).map_err(|e| corrupt(format_args!("entity claims: {e}")))?;
-    Ok(EntityView {
-        id: id_from(&id)?,
-        spaces: vec![space.clone()],
-        label: row.get(at + 1).map_err(db)?,
-        types: types.iter().map(|t| term_from(t)).collect::<Result<_>>()?,
-        when,
-        where_,
-        score: None,
-        distance_km: None,
-        claims: claims.iter().map(|c| id_from(c)).collect::<Result<_>>()?,
-    })
+    let summary = Summary { first_at: row.get(at + 1).map_err(db)?, label: row.get(at + 2).map_err(db)?, types, when, point, claims };
+    Ok((id, summary))
 }

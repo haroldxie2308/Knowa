@@ -31,17 +31,18 @@ pub(crate) fn review_effective(by_reviewer: bool, review_retracted: bool) -> boo
     by_reviewer && !review_retracted
 }
 
-/// A claim r that lists c in `replaces` supersedes c iff r is accepted or superseded.
-pub(crate) fn supersedes(replacer: Status) -> bool {
-    matches!(replacer, Status::Accepted | Status::Superseded)
+/// A claim r that lists c in `replaces` supersedes c iff r's *base* status is accepted
+/// (DESIGN §4.7 rule 2): a proposed replacement, or one that is only superseded
+/// itself, supersedes nothing.
+pub(crate) fn supersedes(replacer_base: Status) -> bool {
+    replacer_base == Status::Accepted
 }
 
-/// DESIGN §4.7: the first matching rule wins. `review` is the latest effective review.
-pub(crate) fn decide(retracted: bool, superseded: bool, review: Option<Verdict>, author_accepted: bool) -> Status {
+/// The base status: DESIGN §4.7 with rule 2 skipped (rules 1, 3, 4, 5, first match
+/// wins). `review` is the latest effective review.
+pub(crate) fn base_status(retracted: bool, review: Option<Verdict>, author_accepted: bool) -> Status {
     if retracted {
         Status::Retracted
-    } else if superseded {
-        Status::Superseded
     } else if let Some(v) = review {
         match v {
             Verdict::Accept => Status::Accepted,
@@ -54,15 +55,16 @@ pub(crate) fn decide(retracted: bool, superseded: bool, review: Option<Verdict>,
     }
 }
 
+/// The status: rule 2 inserted into the base status's rule order. Only rule 1
+/// (retracted) precedes it.
+pub(crate) fn status(base: Status, superseded: bool) -> Status {
+    if superseded && base != Status::Retracted { Status::Superseded } else { base }
+}
+
 /// A `src` input makes its dependent stale iff it is rejected/retracted/superseded
 /// or itself stale.
 pub(crate) fn makes_stale(input: Status, input_stale: bool) -> bool {
     input.invalidates_dependents() || input_stale
-}
-
-/// Statuses that feed entity summaries and FTS (DESIGN §4.7 display value).
-pub(crate) fn is_active(s: Status) -> bool {
-    matches!(s, Status::Accepted | Status::Proposed)
 }
 
 pub(crate) fn role_of(term: &str) -> Option<Role> {
@@ -76,18 +78,6 @@ pub(crate) fn role_of(term: &str) -> Option<Role> {
     }
 }
 
-
-/// Display precedence when an actor holds several roles (lower wins).
-pub(crate) fn role_rank(r: Role) -> u8 {
-    match r {
-        Role::Owner => 0,
-        Role::Member => 1,
-        Role::Agent => 2,
-        Role::Worker => 3,
-        Role::Viewer => 4,
-    }
-}
-
 pub(crate) fn kind_of(term: &str) -> Option<ActorKind> {
     match term {
         vocab::KIND_HUMAN => Some(ActorKind::Human),
@@ -96,7 +86,6 @@ pub(crate) fn kind_of(term: &str) -> Option<ActorKind> {
         _ => None,
     }
 }
-
 
 pub(crate) fn visibility_of(o: &Value) -> Option<Visibility> {
     match o {

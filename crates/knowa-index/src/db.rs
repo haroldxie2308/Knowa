@@ -13,8 +13,12 @@ pub(crate) const META_SCHEMA: &str = "schema_version";
 pub(crate) const META_EPOCH: &str = "epoch";
 pub(crate) const META_SPACE: &str = "space";
 
-/// Schema v1. `claims.n` is the local arrival number (DESIGN §6 feed); `entities.n`
-/// is shared as the rowid of `fts` and `geo`.
+/// Schema v2. `claims.n` is the local arrival number (DESIGN §6 feed) and the rowid
+/// of the claim's `claim_fts` row; `entities.n` is the rowid of `geo`.
+///
+/// `entities` holds each entity's summary under the DEFAULT view (accepted|proposed,
+/// no other filter), the fast path for default-view reads. Any other view derives
+/// summaries from the claims that pass it (DESIGN §4.7 "views apply to evidence").
 pub(crate) const SCHEMA: &str = r#"
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
 
@@ -34,6 +38,7 @@ CREATE TABLE claims(
   equiv      TEXT NOT NULL,
   worker     TEXT,              -- via.worker
   json       TEXT NOT NULL,     -- the full claim
+  base       TEXT NOT NULL,     -- status with rule 2 (supersession) skipped
   status     TEXT NOT NULL,
   stale      INTEGER NOT NULL
 );
@@ -44,6 +49,8 @@ CREATE INDEX claims_oref ON claims(o_ref_base) WHERE o_ref_base IS NOT NULL;
 CREATE INDEX claims_at ON claims(at, id);
 CREATE INDEX claims_equiv ON claims(equiv);
 CREATE INDEX claims_worker ON claims(worker) WHERE worker IS NOT NULL;
+-- `where.type`; queries must spell out this partial index's condition literally
+CREATE INDEX claims_type ON claims(o, s) WHERE p = 'knowa:type' AND ent = 1;
 
 -- c_ ids listed in a claim's src (stale propagation)
 CREATE TABLE src(claim TEXT NOT NULL, target TEXT NOT NULL, PRIMARY KEY(claim, target)) WITHOUT ROWID;
@@ -67,7 +74,7 @@ CREATE TABLE actors(
 CREATE TABLE entities(
   n           INTEGER PRIMARY KEY,
   id          TEXT NOT NULL UNIQUE,
-  first_at    INTEGER NOT NULL,  -- earliest record time of any claim about it
+  first_at    INTEGER,           -- earliest record time of a passing claim; NULL if none passes
   label       TEXT,
   types       TEXT NOT NULL,     -- JSON array of terms
   when_value  TEXT,
@@ -80,10 +87,11 @@ CREATE TABLE entities(
   r           REAL,
   claims      TEXT NOT NULL      -- JSON array of supporting claim ids
 );
-CREATE TABLE entity_types(type TEXT NOT NULL, entity INTEGER NOT NULL, PRIMARY KEY(type, entity)) WITHOUT ROWID;
-CREATE INDEX entity_types_entity ON entity_types(entity);
 
-CREATE VIRTUAL TABLE fts USING fts5(body, content='', contentless_delete=1, tokenize='unicode61');
+-- one document per entity-materializing claim with text (entity::own_text, plus the
+-- text of the blob it links, entity::linked_blob), of any status: the view picks the
+-- rows that count at query time
+CREATE VIRTUAL TABLE claim_fts USING fts5(body, content='', contentless_delete=1, tokenize='unicode61');
 CREATE VIRTUAL TABLE geo USING rtree(n, min_lat, max_lat, min_lon, max_lon);
 "#;
 
