@@ -196,7 +196,7 @@ A **space** is identified by `s_…`. A **directory is one replica** of a space.
 <dir>/
   knowa.json                       {"format":1,"space":"s_…","owner":"a_…","genesis":"c_…"}
   log/<actor-id>/<000000000001>.jsonl   per-actor append-only segments; file name = first seq (12 digits); rotate at 10000 lines
-  blobs/<id[2:4]>/<blob-id>        raw bytes
+  blobs/<id[6:8]>/<blob-id>        raw bytes (id[2:5] is always "ciq", the multihash header)
   .index/                          derived (SQLite etc.); never exported; deletable
   .lock                            advisory write lock
 ```
@@ -343,7 +343,7 @@ Text blobs (`text/*`, ≤ 1 MiB) are indexed for full-text search directly from 
 | Crate | Owns | Third-party deps |
 |---|---|---|
 | `knowa-model` | ids, values, claims, JCS, EDTF, signing, validation, kernel vocab, the query/result contract types, the shared `Error` | serde, serde_json, ed25519-dalek, sha2, data-encoding, getrandom |
-| `knowa-store` | the replica directory: manifest, lock, logs, blobs, verify, bundles | tar |
+| `knowa-store` | the replica directory: manifest, lock, logs, blobs, verify, bundles | tar, sha2 |
 | `knowa-index` | the derived SQLite index of one replica: apply, status/stale, FTS5, geo, edges, arrival feed, single-replica reads | rusqlite (bundled) |
 | `knowa-extract` | media sniffing, EXIF, the extractor registry | infer, kamadak-exif |
 | `knowa-config` | home: actor keys, space registry | — |
