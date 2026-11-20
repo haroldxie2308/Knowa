@@ -212,7 +212,7 @@ Five primitives. Everything else is sugar.
 | Primitive | In | Out |
 |---|---|---|
 | **write** | `{space, drafts[]}` with the actor from the environment | `{items:[{id, created, status}], placeholders:{"_:x":"e_…"}}` |
-| **blob.put** | bytes | `{id, created, size, mediaType}` |
+| **blob.put** | bytes | `{id, created, size}`. The media type is not part of the bytes: it arrives as a `knowa:mediaType` claim from the `media` extractor |
 | **blob.get** | `{id}` (in any selected space) | bytes |
 | **query** | a query document (6.1) | the op's result (6.2) |
 | **feed** | `{space, cursor?, limit}` | `{claims:[ClaimView], cursor}` in local arrival order. The cursor is `<epoch>:<n>`. If the epoch no longer matches, the call fails with `cursor_expired` |
@@ -255,7 +255,7 @@ Admin ops are `init, verify, reindex, export, import`. They are part of the CLI 
 
 ### 6.2 Results
 
-- **EntityView** `{id, spaces[], label?, types[], when?:{value, lo, hi, source:"claim"|"recorded"}, where?:{lat,lon,r?}, score?, distanceKm?, claims?: [ids supporting the fields above]}`
+- **EntityView** `{id, spaces[], label?, types[], when?:{value, from?, to?, source:"claim"|"recorded"}, where?:{lat,lon,r?}, score?, distanceKm?, claims: [ids supporting the fields above]}`. `from`/`to` are canonical timestamps; absent means open.
 - **ClaimView** = the full claim + `{status, stale, space}`
 - `find`: `{items: EntityView[] | ClaimView[], cursor?}`
 - `get`: `{items: (EntityView+claims | ClaimView | BlobView)[]}`

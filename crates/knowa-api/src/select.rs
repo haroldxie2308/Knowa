@@ -1,0 +1,175 @@
+//! Space selection (DESIGN §6.1 `spaces`) and opening replicas/indexes.
+
+use std::collections::HashSet;
+
+use knowa_config::{Home, SpaceRef};
+use knowa_index::Index;
+use knowa_model::{Error, Id, Result};
+use knowa_store::Replica;
+
+use crate::Sel;
+
+/// One opened replica plus how it was selected.
+pub(crate) struct Space {
+    pub sref: SpaceRef,
+    pub replica: Replica,
+}
+
+impl Space {
+    pub fn open(sref: SpaceRef) -> Result<Space> {
+        let replica = Replica::open(&sref.path).map_err(|e| in_space(e, &sref))?;
+        Ok(Space { sref, replica })
+    }
+
+    pub fn id(&self) -> &Id {
+        &self.replica.manifest().space
+    }
+
+    /// Alias when registered, else the replica path; for messages.
+    pub fn name(&self) -> String {
+        describe(&self.sref)
+    }
+
+    /// Opens (and catches up) the index. Catch-up writes to the index and must not
+    /// interleave with a writer's append → apply, so it runs under the replica lock,
+    /// which is released before returning.
+    pub fn index(&self) -> Result<Index> {
+        let _lock = self.replica.lock()?;
+        Index::open(&self.replica)
+    }
+
+    /// Readonly replicas refuse local writes (DESIGN §7.3).
+    pub fn ensure_writable(&self) -> Result<()> {
+        if self.sref.readonly {
+            return Err(Error::usage(format!(
+                "space {} is registered readonly; write in your own space and refer to its ids",
+                self.name()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// A selected space with its index open.
+pub(crate) struct Opened {
+    pub space: Space,
+    pub index: Index,
+}
+
+/// How a query's `spaces` field selects replicas.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Selection<'a> {
+    /// `[]`: the caller's space (`--space` / `KNOWA_SPACE` / current)
+    Current,
+    /// `["*"]`: every registered space
+    All,
+    /// aliases or paths
+    Named(&'a [String]),
+}
+
+pub(crate) fn classify(spaces: &[String]) -> Result<Selection<'_>> {
+    if spaces.is_empty() {
+        return Ok(Selection::Current);
+    }
+    if spaces.iter().any(|s| s == "*") {
+        if spaces.len() != 1 {
+            return Err(Error::invalid("spaces: \"*\" selects every registered space and cannot be combined with other entries"));
+        }
+        return Ok(Selection::All);
+    }
+    if let Some(blank) = spaces.iter().find(|s| s.trim().is_empty()) {
+        return Err(Error::invalid(format!("spaces: empty entry {blank:?}")));
+    }
+    Ok(Selection::Named(spaces))
+}
+
+/// The caller's single space (writes, feed, admin ops).
+pub(crate) fn current(home: &Home, sel: &Sel) -> Result<Space> {
+    Space::open(home.resolve_space(sel.space.as_deref())?)
+}
+
+/// Resolves a `spaces` selection in order. Several replicas of the same space id
+/// (e.g. an own replica and an imported copy) count once: the first one wins.
+pub(crate) fn select(home: &Home, sel: &Sel, spaces: &[String]) -> Result<Vec<Space>> {
+    let refs = match classify(spaces)? {
+        Selection::Current => vec![home.resolve_space(sel.space.as_deref())?],
+        Selection::All => {
+            let all = home.all_spaces()?;
+            if all.is_empty() {
+                return Err(Error::usage(
+                    "spaces: [\"*\"] but no spaces are registered (knowa init / knowa space add)",
+                ));
+            }
+            all
+        }
+        Selection::Named(names) => names.iter().map(|n| home.resolve_space(Some(n))).collect::<Result<Vec<_>>>()?,
+    };
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(refs.len());
+    for r in refs {
+        let space = Space::open(r)?;
+        if seen.insert(space.id().clone()) {
+            out.push(space);
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn open_all(spaces: Vec<Space>) -> Result<Vec<Opened>> {
+    spaces
+        .into_iter()
+        .map(|space| {
+            let index = space.index().map_err(|e| in_space(e, &space.sref))?;
+            Ok(Opened { space, index })
+        })
+        .collect()
+}
+
+fn describe(sref: &SpaceRef) -> String {
+    match &sref.alias {
+        Some(a) => format!("'{a}'"),
+        None => sref.path.display().to_string(),
+    }
+}
+
+/// Prefixes an error with the space it came from; code and detail are kept.
+fn in_space(mut e: Error, sref: &SpaceRef) -> Error {
+    e.message = format!("space {}: {}", describe(sref), e.message);
+    e
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use knowa_model::ErrorCode;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn empty_selects_current_space() {
+        assert_eq!(classify(&[]).unwrap(), Selection::Current);
+    }
+
+    #[test]
+    fn star_alone_selects_all() {
+        assert_eq!(classify(&s(&["*"])).unwrap(), Selection::All);
+    }
+
+    #[test]
+    fn star_mixed_with_names_is_invalid() {
+        assert_eq!(classify(&s(&["*", "notes"])).unwrap_err().code, ErrorCode::Invalid);
+    }
+
+    #[test]
+    fn blank_entry_is_invalid() {
+        assert_eq!(classify(&s(&["notes", " "])).unwrap_err().code, ErrorCode::Invalid);
+    }
+
+    #[test]
+    fn names_pass_through_in_order() {
+        let v = s(&["b", "a"]);
+        assert_eq!(classify(&v).unwrap(), Selection::Named(&v));
+    }
+}

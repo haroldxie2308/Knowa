@@ -7,8 +7,22 @@ use std::path::{Path, PathBuf};
 
 use knowa_config::Home;
 use knowa_model::query::{BlobPutResult, FeedResult, QueryDoc, QueryResult, WriteResult};
-use knowa_model::{Draft, Id, Result, Visibility};
+use knowa_model::{Draft, Error, Id, IdKind, Result, Visibility};
 use serde::Serialize;
+
+mod admin;
+mod context;
+mod feed;
+mod ingest;
+mod merge;
+mod path;
+mod query;
+mod schema;
+mod select;
+#[cfg(test)]
+mod test_graph;
+mod worker;
+mod write;
 
 /// Space/actor selectors as given by the caller (flag or env), unresolved.
 #[derive(Debug, Clone, Default)]
@@ -18,6 +32,7 @@ pub struct Sel {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InitResult {
     pub space: Id,
     pub path: PathBuf,
@@ -29,6 +44,7 @@ pub struct InitResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PutItem {
     pub path: PathBuf,
     pub blob: Id,
@@ -41,11 +57,13 @@ pub struct PutItem {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PutResult {
     pub items: Vec<PutItem>,
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ExtractResult {
     pub blobs: u64,
     pub claims: u64,
@@ -53,6 +71,7 @@ pub struct ExtractResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkerRunResult {
     pub batches: u64,
     pub claims_in: u64,
@@ -61,6 +80,7 @@ pub struct WorkerRunResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ExportResult {
     pub path: PathBuf,
     pub level: Visibility,
@@ -70,6 +90,7 @@ pub struct ExportResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ImportResult {
     pub space: Id,
     pub path: PathBuf,
@@ -78,6 +99,15 @@ pub struct ImportResult {
     pub skipped_existing: u64,
     pub blobs_added: u64,
     pub gaps: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpaceAddResult {
+    pub alias: String,
+    pub space: Id,
+    pub path: PathBuf,
+    pub readonly: bool,
 }
 
 pub struct Knowa {
@@ -101,20 +131,31 @@ impl Knowa {
     /// actor, not retracted → `created:false`, nothing appended); seal; append; apply
     /// to the index. All-or-nothing per call.
     pub fn write(&self, sel: &Sel, drafts: Vec<Draft>) -> Result<WriteResult> {
-        let _ = (sel, drafts);
-        todo!()
+        let space = select::current(&self.home, sel)?;
+        let actor = self.home.resolve_actor(sel.actor.as_deref())?;
+        Ok(write::Txn::begin(&space)?.write(&actor, drafts)?.result)
     }
 
     pub fn blob_put(&self, sel: &Sel, r: &mut dyn Read) -> Result<BlobPutResult> {
-        let _ = (sel, r);
-        todo!()
+        let space = select::current(&self.home, sel)?;
+        space.ensure_writable()?;
+        let (id, created, size) = space.replica.put_blob(r)?;
+        Ok(BlobPutResult { id, created, size })
     }
 
     /// Finds the blob in the selected spaces (`spaces` as in a query doc; empty =
     /// current space). Absent everywhere → `not_found`.
     pub fn blob_path(&self, sel: &Sel, spaces: &[String], id: &Id) -> Result<PathBuf> {
-        let _ = (sel, spaces, id);
-        todo!()
+        if id.kind() != IdKind::Blob {
+            return Err(Error::invalid(format!("blob.get: {id} is not a blob id")));
+        }
+        let base = id.base();
+        for space in select::select(&self.home, sel, spaces)? {
+            if space.replica.has_blob(&base) {
+                return space.replica.blob_path(&base);
+            }
+        }
+        Err(Error::not_found(format!("blob.get: no selected space stores {base}")))
     }
 
     /// Validates the doc (limits, reserved `asOf` → `unsupported`, multi-space cursor →
@@ -124,14 +165,12 @@ impl Knowa {
     ///   the first space in selection order), then ordered by the requested order.
     /// - get / context / path / log as documented in DESIGN §6.2.
     pub fn query(&self, sel: &Sel, doc: QueryDoc) -> Result<QueryResult> {
-        let _ = (sel, doc);
-        todo!()
+        query::query(&self.home, sel, doc)
     }
 
     /// `cursor` = `<epoch>:<n>`; epoch mismatch → `cursor_expired`. None = from start.
     pub fn feed(&self, sel: &Sel, cursor: Option<&str>, limit: u32) -> Result<FeedResult> {
-        let _ = (sel, cursor, limit);
-        todo!()
+        feed::feed(&select::current(&self.home, sel)?, cursor, limit)
     }
 
     // ---------- admin & composite ops ----------
@@ -141,8 +180,7 @@ impl Knowa {
     /// `knowa:autoAccept true`, registers `alias` (default: dir basename) and makes it
     /// current if no current space is set.
     pub fn init(&self, sel: &Sel, dir: &Path, name: &str, alias: Option<&str>) -> Result<InitResult> {
-        let _ = (sel, dir, name, alias);
-        todo!()
+        admin::init(&self.home, sel, dir, name, alias)
     }
 
     /// Ingests files/directories (recursive; hidden files skipped and NOT silently:
@@ -150,49 +188,50 @@ impl Knowa {
     /// `knowa:name` + `knowa:source` (absolute path) by the actor, then (unless
     /// `no_extract`) extractors written as the extract actor. Nonexistent path → `not_found`.
     pub fn put(&self, sel: &Sel, paths: &[PathBuf], no_extract: bool) -> Result<PutResult> {
-        let _ = (sel, paths, no_extract);
-        todo!()
+        ingest::put(&self.home, sel, paths, no_extract)
     }
 
     /// Runs built-in extractors on blobs that lack their output (`all` = re-run every
     /// extractor on every blob; idempotent writes make this safe).
     pub fn extract(&self, sel: &Sel, all: bool) -> Result<ExtractResult> {
-        let _ = (sel, all);
-        todo!()
+        ingest::extract(&self.home, sel, all)
     }
 
     /// DESIGN §7.1. `actor_name` must exist with kind Agent or Worker (else `usage`).
     /// `follow` polls every 2s until interrupted.
     pub fn worker_run(&self, sel: &Sel, actor_name: &str, cmd: &[String], batch: u32, follow: bool) -> Result<WorkerRunResult> {
-        let _ = (sel, actor_name, cmd, batch, follow);
-        todo!()
+        worker::worker_run(&self.home, sel, actor_name, cmd, batch, follow)
     }
 
     pub fn export(&self, sel: &Sel, out: &Path, level: Visibility) -> Result<ExportResult> {
-        let _ = (sel, out, level);
-        todo!()
+        admin::export(&self.home, sel, out, level)
     }
 
     /// Imports into `dir` (default `<home>/replicas/<space-id>`), registers it readonly
     /// under `alias` (default: the space's label slugified, else the space id).
     pub fn import(&self, bundle: &Path, dir: Option<&Path>, alias: Option<&str>) -> Result<ImportResult> {
-        let _ = (bundle, dir, alias);
-        todo!()
+        admin::import(&self.home, bundle, dir, alias)
     }
 
     pub fn verify(&self, sel: &Sel) -> Result<knowa_store::VerifyReport> {
-        let _ = sel;
-        todo!()
+        admin::verify(&self.home, sel)
     }
 
+    /// Rebuilds the current space's index; returns the new epoch (feed cursors from the
+    /// old epoch now fail with `cursor_expired`).
     pub fn reindex(&self, sel: &Sel) -> Result<String> {
-        let _ = sel;
-        todo!()
+        admin::reindex(&self.home, sel)
+    }
+
+    /// Registers an existing replica directory under `alias` (default: the space's label
+    /// slugified, else the directory name). Local config only; writes no claims.
+    pub fn space_add(&self, dir: &Path, alias: Option<&str>, readonly: bool) -> Result<SpaceAddResult> {
+        admin::space_add(&self.home, dir, alias, readonly)
     }
 }
 
 /// Machine-readable contract for agents (`knowa schema --json`): ops, document shapes
 /// (as JSON-Schema-like descriptions), kernel vocabulary, error codes, value syntax.
 pub fn schema() -> serde_json::Value {
-    todo!()
+    schema::schema()
 }
