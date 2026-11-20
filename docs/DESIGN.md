@@ -114,7 +114,7 @@ A JSON object with **exactly one** discriminator key, plus the allowed modifier:
 
 **Drafts** are what writers submit: `s, p, o, q?, valid?, conf?, src?, replaces?, via?, note?`. The system assigns `v, space, actor, seq, prev, at, id, sig`. Within one write batch, a draft may use placeholders `_:name` wherever an id is expected (`s`, `o.ref`, `q` refs, `src`). Each distinct placeholder becomes one fresh `e_` id, and the write result returns the mapping.
 
-**Idempotent writes.** Before appending, the system computes the draft's *equivalence key* = mh(JCS of `{s,p,o,q,valid}`). If **the same actor** already has a claim in the space with the same key that is not retracted, the write is a no-op and returns the existing id with `created:false`.
+**Idempotent writes.** Before appending, the system computes the draft's *equivalence key* = mh(JCS of `{s,p,o,q,valid}`). If **the same actor** already has a claim in the space with the same key that is **active (accepted or proposed) and not stale**, the write is a no-op and returns the existing id with `created:false`. A superseded, rejected, retracted or stale equivalent does not block a new claim, so re-asserting a reverted value or re-deriving from new inputs creates a new claim.
 
 ### 4.5 Time (EDTF subset)
 
@@ -134,15 +134,15 @@ Each form indexes as a half-open range `[lo, hi)` in Unix milliseconds. The qual
 | Predicate | s | o | Effective only if |
 |---|---|---|---|
 | `knowa:owner` | space id | ref actor | genesis claim: seq 1 of the owner, recorded in `knowa.json` |
-| `knowa:role` | actor id | term `knowa:Owner\|Member\|Agent\|Worker\|Viewer` | author is an owner |
-| `knowa:autoAccept` | actor id | bool | author is an owner |
-| `knowa:actorKind` | actor id (= author) | term `knowa:Human\|Agent\|Worker` | self-declared. Written automatically as an actor's first claim in a space |
+| `knowa:role` | actor id | term `knowa:Owner\|Member\|Agent\|Worker\|Viewer` | author is an owner. **Single-valued:** the latest effective role claim (by `at`, then id) is the actor's role, so a later grant demotes. Retract it to remove the role |
+| `knowa:autoAccept` | actor id | bool | author is an owner. The latest effective value wins, so `false` revokes |
+| `knowa:actorKind` | actor id (= author) | term `knowa:Human\|Agent\|Worker` | self-declared, and only the actor's **first** actorKind claim in the space (lowest seq) is effective. It is written automatically, and `write` rejects explicit actorKind drafts |
 | `knowa:review` | claim id | term `knowa:Accept\|Reject` | author is an owner or member |
 | `knowa:retract` | claim id | `{"bool":true}` | author is the target's author or an owner |
 | `knowa:visibility` | any id | term `knowa:Private\|Shared\|Public` | author is an owner |
 | `knowa:defaultVisibility` | space id | term (as above) | author is an owner. Absent means `knowa:Private` |
 
-The **owner set** is the genesis owner plus every actor given `knowa:role knowa:Owner` by a member of the owner set, computed as a fixpoint. A role claim that has been retracted is ignored.
+The **owner set** is the genesis owner plus every actor whose effective role, set by a member of the owner set, is `knowa:Owner`. It is computed as the well-founded fixpoint, so owners who revoke each other in a cycle are both not owners. A role claim that has been retracted is ignored. `visibility` and `defaultVisibility` are also latest-wins.
 
 **Descriptive predicates.**
 
@@ -171,7 +171,7 @@ Extractor-specific vocabulary lives in its own namespace, for example `exif:make
 Each claim `c` gets exactly one status, decided by the first rule that matches:
 
 1. **retracted** if there is an effective `knowa:retract` on c.
-2. **superseded** if some claim r lists c in `replaces` and r's own status is `accepted` or `superseded`. Cycles cannot occur, because ids are content hashes.
+2. **superseded** if some claim r lists c in `replaces` and r's **base status** is `accepted`. The base status is the status r would get if rule 2 were skipped, using rules 1, 3, 4 and 5. A replacement that is merely proposed, or only superseded itself, supersedes nothing. Cycles cannot occur, because ids are content hashes.
 3. **rejected / accepted** if there is an effective review. The latest one wins, ordered by `at` and then by id.
 4. **accepted** if c's author is an owner or member, or has an effective `autoAccept true`.
 5. **proposed** otherwise.
@@ -181,6 +181,12 @@ Policy claims (`role`, `autoAccept`, `visibility`, `defaultVisibility`, `actorKi
 **stale** is a separate boolean. It is true iff some `c_` id in `c.src` is retracted, rejected, superseded, or itself stale.
 
 **Default read view:** status ∈ {accepted, proposed}, stale included. Every result is annotated with `status` and `stale`.
+
+**Views apply to evidence.** A view filters claims, and everything about an entity is derived from the claims that pass it:
+- whether the entity matches `text`, `type`, `when` or `near`;
+- its display fields (label, types, when, where).
+
+So output from a kind of actor (or a status) the view excludes can never make an entity match, or change how it looks. For `text`, an entity matches when every query token is found in the text of at least one claim that passes the view. The tokens may come from different claims.
 
 **Display value.** When a single value is shown (for example an entity's label), the order is accepted before proposed, then the latest `at`. This is a display policy only: all values remain in the data.
 
@@ -202,7 +208,9 @@ A **space** is identified by `s_…`. A **directory is one replica** of a space.
 ```
 
 - **Write path:** take the lock, read the actor's head (last seq and id) from the log tail, build claims, validate, sign, append and fsync, apply them to the index, release the lock.
-- **On open:** if the index lags the logs (crash, or files copied in), it catches up from each actor's last indexed seq. If the index is missing or has the wrong schema version, it rebuilds and gets a new epoch.
+- **On open:** if the index lags the logs (crash, or files copied in), it catches up from each actor's last indexed seq. If the index is missing or has the wrong schema version, it rebuilds and gets a new epoch. Catch-up can't see segments that fill gaps below an indexed head, so `merge` writes `.index/needs-rebuild` **before** writing any segment. Open then rebuilds whenever that marker is present, and removes it afterwards.
+- **Logs are never trusted.** Every claim read from a log (catch-up, rebuild, export) is verified, both id and signature, before use. A forged or corrupted line is an `integrity` error.
+- **Torn tail recovery:** `append` fsyncs whole lines before returning. An unterminated final line in an actor's newest segment is therefore an unacknowledged write left by a crash, and taking the write lock truncates it.
 - **Replicas** may have *gaps* in an actor's seq when imported from a partial bundle. Chain verification covers contiguous runs only, and gaps are reported.
 
 ## 6. The interface (stable contract) *(v0)*
@@ -330,7 +338,14 @@ Text blobs (`text/*`, ≤ 1 MiB) are indexed for full-text search directly from 
 
 ### 7.3 Sharing *(v0)*
 
-- `export --level shared` includes the claims whose effective visibility is ≥ `shared`. Effective visibility is the claim's own visibility setting, else its subject's, else the space default. The bundle also includes every policy claim and the referenced blobs, and is marked `"partial":true` unless the level is `private`, which exports everything.
+- `export --level L` (shared or public) exports these **claims**:
+  - (a) non-policy claims whose effective visibility is ≥ L. Effective visibility is the claim's own visibility setting, else its subject's, else the space default, else Private;
+  - (b) **trust claims**: `owner`, `role`, `autoAccept`, `actorKind`, `defaultVisibility`. These are always exported, so the receiver can compute statuses, which means their `note`s are effectively public;
+  - (c) `review` / `retract` claims whose target is exported.
+  `visibility` claims are not exported.
+- A **blob's bytes** are exported iff the blob's own effective visibility (a visibility claim on its `b_` id, else the space default) is ≥ L. Being referenced by an exported claim is not enough, and a reference to an unexported blob stays dangling.
+- The bundle is marked `"partial":true` unless the level is `private`, which exports everything.
+- A space is identified by its space id **and** genesis id. `import`, and registering a second replica of a known space id, refuse with `conflict` when the owner or genesis differ. Every query that selects spaces requires replicas sharing a space id to have identical manifests.
 - A bundle is a tar archive containing `bundle.json` (`{format, space, owner, genesis, level, partial, exportedBy, at}`), the `log/…` segments and `blobs/…`.
 - `import` verifies every signature, blob hash and chain run, then merges into a replica directory (creating it if needed), registers it read-only, and reindexes.
 - Readonly replicas refuse local writes. To annotate someone else's content, write in **your** space and refer to their ids.

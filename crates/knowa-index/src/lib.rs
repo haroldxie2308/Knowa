@@ -99,7 +99,8 @@ impl Index {
         read::actor_heads(&self.conn)
     }
 
-    /// Non-retracted claim by `actor` with this equivalence key (DESIGN §4.4).
+    /// An active (accepted|proposed), non-stale claim by `actor` with this equivalence
+    /// key (DESIGN §4.4); superseded/rejected/retracted/stale equivalents don't count.
     pub fn equivalent(&self, actor: &Id, equiv_key: &str) -> Result<Option<ClaimView>> {
         read::equivalent(&self.conn, actor, equiv_key)
     }

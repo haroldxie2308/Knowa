@@ -22,6 +22,10 @@ pub const BLOB_DIR: &str = "blobs";
 pub const INDEX_DIR: &str = ".index";
 pub const LOCK_FILE: &str = ".lock";
 pub const SEGMENT_LINES: u64 = 10_000;
+/// `<root>/.index/needs-rebuild`: written (and fsynced) by `merge` before any segment,
+/// because index catch-up cannot see segments that fill gaps below an indexed head
+/// (DESIGN §5). `Index::open` rebuilds while it exists and removes it afterwards.
+pub const REBUILD_MARKER: &str = "needs-rebuild";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -195,7 +199,9 @@ impl Replica {
         &self.manifest
     }
 
-    /// Blocks until the exclusive lock is held.
+    /// Blocks until the exclusive lock is held, then repairs torn tails: an unterminated
+    /// final line in an actor's newest segment is an unacknowledged crashed append
+    /// (DESIGN §5) and is truncated.
     pub fn lock(&self) -> Result<WriteLock> {
         let path = self.root.join(LOCK_FILE);
         let file = OpenOptions::new()
@@ -245,7 +251,9 @@ impl Replica {
         Ok(actors)
     }
 
-    /// Claims of `actor` with seq ≥ `from_seq`, ascending by seq.
+    /// Claims of `actor` with seq ≥ `from_seq`, ascending by seq. Every claim is
+    /// verified (id + signature, `Claim::verify`) before it is yielded: logs are never
+    /// trusted (DESIGN §5). Failure → `integrity`.
     pub fn read_log(&self, actor: &Id, from_seq: u64) -> Result<Box<dyn Iterator<Item = Result<Claim>> + '_>> {
         Ok(Box::new(log::LogIter::new(&self.root, &self.manifest.space, actor, from_seq)?))
     }

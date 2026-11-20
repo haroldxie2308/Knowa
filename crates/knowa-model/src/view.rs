@@ -135,9 +135,8 @@ pub struct EntityWhere {
     pub r: Option<f64>,
 }
 
-/// Summary of an entity. Display fields follow DESIGN §4.7 "display value".
-/// v0: summary fields are computed from claims with status accepted|proposed,
-/// independent of the query view; the view decides which entities match.
+/// Summary of an entity. Display fields follow DESIGN §4.7 "display value" and are
+/// computed only from claims that pass the query's view ("views apply to evidence").
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EntityView {
     pub id: Id,
