@@ -188,7 +188,7 @@ fn temporal(opened: &[Opened], anchor: &EntityView, view: &View, window_ms: i64,
         lists.push(list);
     }
     let mut keyed = Vec::new();
-    for e in merge_entities(lists) {
+    for e in merge_entities(lists)? {
         if e.id == anchor.id {
             continue;
         }
@@ -225,7 +225,7 @@ fn spatial(opened: &[Opened], anchor: &EntityView, view: &View, km: &str, limit:
         }
         lists.push(items);
     }
-    let mut items: Vec<EntityView> = merge_entities(lists).into_iter().filter(|e| e.id != anchor.id).collect();
+    let mut items: Vec<EntityView> = merge_entities(lists)?.into_iter().filter(|e| e.id != anchor.id).collect();
     items.sort_by(|a, b| match (a.distance_km, b.distance_km) {
         (Some(x), Some(y)) => x.total_cmp(&y),
         (Some(_), None) => std::cmp::Ordering::Less,

@@ -13,7 +13,7 @@ use knowa_model::{Claim, Error, ErrorCode, Id, IdKind, Result, Timestamp};
 
 use crate::fsutil::{TempFile, io_err};
 use crate::log::{self, Chain, SEGMENT_LIMIT};
-use crate::{BundleMeta, ImportReport, MANIFEST_FILE, Manifest, Replica, blob};
+use crate::{BundleMeta, ImportReport, MANIFEST_FILE, Manifest, Replica, blob, genesis_problem, mark_rebuild};
 
 const META_ENTRY: &str = "bundle.json";
 const LEVELS: &[&str] = &["private", "shared", "public"];
@@ -226,17 +226,20 @@ pub(crate) fn import(bundle: &Path, dest: &Path) -> Result<(Replica, BundleMeta,
     for c in &parsed.claims {
         log::check_claim(c, &space, ErrorCode::Integrity)?;
     }
-    let has_genesis = parsed
-        .claims
-        .iter()
-        .any(|c| c.id == parsed.meta.genesis && c.body.actor == parsed.meta.owner && c.body.seq == 1);
-    if !has_genesis {
+    // The manifest's owner and genesis are only as good as this claim: a genesis
+    // that is not a `knowa:owner` claim by that owner would let a bundle name anyone
+    // as the owner of the space (DESIGN §7.3, as `Replica::create` checks).
+    let genesis = parsed.claims.iter().find(|c| c.id == parsed.meta.genesis && c.body.actor == parsed.meta.owner);
+    let Some(genesis) = genesis else {
         return Err(Error::integrity(format!(
             "bundle {} lacks its genesis claim {} (seq 1 of owner {})",
             bundle.display(),
             parsed.meta.genesis,
             parsed.meta.owner
         )));
+    };
+    if let Some(p) = genesis_problem(genesis) {
+        return Err(Error::integrity(format!("bundle {}: {p}", bundle.display())));
     }
     let manifest = manifest_of(&parsed.meta);
     let manifest_path = dest.join(MANIFEST_FILE);
@@ -260,11 +263,17 @@ pub(crate) fn import(bundle: &Path, dest: &Path) -> Result<(Replica, BundleMeta,
 
     let lock = replica.lock()?;
     let plan = log::plan_merge(&parsed.claims, |actor| log::chain(replica.root(), &space, actor))?;
+    // The marker covers blobs too: a text blob arriving for claims that are already
+    // indexed changes their full-text documents, which catch-up never revisits.
+    let adds_blobs = parsed.blobs.iter().any(|id| !replica.has_blob(id));
+    if plan.writes_segments() || adds_blobs {
+        mark_rebuild(replica.root())?;
+    }
 
     // Blobs before claims: a failure part-way leaves no claim referring to a blob
     // that did not make it.
     let mut blobs_added = 0;
-    if !parsed.blobs.is_empty() {
+    if adds_blobs {
         let mut archive = open_archive(bundle)?;
         for entry in archive.entries().map_err(|e| malformed(bundle, e))? {
             let mut entry = entry.map_err(|e| malformed(bundle, e))?;

@@ -8,7 +8,7 @@ use knowa_config::{Home, SpaceRef, validate_name};
 use knowa_index::Index;
 use knowa_model::query::View;
 use knowa_model::{ClaimBody, Draft, Error, Id, Result, Timestamp, Value, Visibility, vocab};
-use knowa_store::{BundleMeta, ImportReport, Replica, VerifyReport, import_bundle, read_bundle_meta, write_bundle};
+use knowa_store::{BundleMeta, Manifest, Replica, VerifyReport, import_bundle, read_bundle_meta, write_bundle};
 
 use crate::select::{Space, current};
 use crate::write::{Txn, term};
@@ -142,19 +142,36 @@ pub(crate) fn import(home: &Home, bundle: &Path, dir: Option<&Path>, alias: Opti
     if let Some(a) = alias {
         validate_name(a)?;
     }
-    let (replica, meta, report) = match dir {
-        Some(d) => {
-            refuse_writable(home, d)?;
-            import_bundle(bundle, d)?
-        }
-        None => import_default(home, bundle)?,
+    let meta = read_bundle_meta(bundle)?;
+    let claimed = Manifest {
+        format: meta.format,
+        space: meta.space.clone(),
+        owner: meta.owner.clone(),
+        genesis: meta.genesis.clone(),
     };
+    // Before anything is written. `import_bundle` checks that the genesis claim backs
+    // these fields, so a bundle cannot pass this check under someone else's identity.
+    check_identity(home, &claimed, "import")?;
+    let dest = match dir {
+        Some(d) => d.to_path_buf(),
+        None => home.root().join("replicas").join(meta.space.as_str()),
+    };
+    refuse_writable(home, &dest)?;
+    let (replica, imported, report) = import_bundle(bundle, &dest)?;
+    if imported != meta {
+        return Err(Error::integrity(format!(
+            "import: bundle {} changed while it was being imported into {}; nothing was registered",
+            bundle.display(),
+            dest.display()
+        )));
+    }
     let path = fs::canonicalize(replica.root())?;
-    // Merged claims can fill seq gaps below an actor's indexed head, which catch-up
-    // (claims above the head) would miss, so the index is rebuilt (DESIGN §7.3).
+    // If the merge added anything it left the rebuild marker, and `Index::open` rebuilds
+    // (claims that fill gaps below an indexed head are invisible to catch-up) and then
+    // removes it; if it added nothing, catching up is all there is to do (DESIGN §5).
     let index = {
         let _lock = replica.lock()?;
-        Index::rebuild(&replica)?
+        Index::open(&replica)?
     };
     let alias = match alias {
         Some(a) => a.to_string(),
@@ -175,12 +192,29 @@ pub(crate) fn import(home: &Home, bundle: &Path, dir: Option<&Path>, alias: Opti
     })
 }
 
-/// Default destination `<home>/replicas/<space-id>`, chosen from the bundle's meta.
-fn import_default(home: &Home, bundle: &Path) -> Result<(Replica, BundleMeta, ImportReport)> {
-    let meta = read_bundle_meta(bundle)?;
-    let dest = home.root().join("replicas").join(meta.space.as_str());
-    refuse_writable(home, &dest)?;
-    import_bundle(bundle, &dest)
+/// DESIGN §7.3: a space is identified by its id *and* genesis. Refuses (`conflict`)
+/// when a registered replica of `m.space` has a different owner or genesis: that is
+/// another space reusing the id (e.g. a bundle signed by someone else for a known
+/// space id), and registering it would let it stand in for the real one.
+fn check_identity(home: &Home, m: &Manifest, op: &str) -> Result<()> {
+    for (alias, entry) in home.load_config()?.spaces {
+        if entry.space != m.space {
+            continue;
+        }
+        let other = Replica::open(&entry.path).map_err(|mut e| {
+            e.message = format!("{op}: registered space '{alias}' (same space id): {}", e.message);
+            e
+        })?;
+        let known = other.manifest();
+        if known != m {
+            return Err(Error::conflict(format!(
+                "{op}: space {} is registered as '{alias}' with owner {} and genesis {}, but this replica has owner {} and genesis {}; a space is its id and genesis, so this is a different space reusing the id",
+                m.space, known.owner, known.genesis, m.owner, m.genesis
+            ))
+            .with_detail(serde_json::json!({ "alias": alias, "registered": known, "incoming": m })));
+        }
+    }
+    Ok(())
 }
 
 /// Import registers its destination readonly; refuse a destination registered as a
@@ -237,6 +271,7 @@ pub(crate) fn slugify(label: &str) -> Option<String> {
 /// space's label slugified, else the directory name (as `init`).
 pub(crate) fn space_add(home: &Home, dir: &Path, alias: Option<&str>, readonly: bool) -> Result<SpaceAddResult> {
     let replica = Replica::open(dir)?;
+    check_identity(home, replica.manifest(), "space add")?;
     let path = fs::canonicalize(replica.root())?;
     let space = replica.manifest().space.clone();
     let alias = match alias {
@@ -260,8 +295,13 @@ pub(crate) fn space_add(home: &Home, dir: &Path, alias: Option<&str>, readonly: 
     Ok(SpaceAddResult { alias, space, path, readonly })
 }
 
+/// Under the write lock: a concurrent append's half-written line would otherwise be
+/// reported as a torn line. Taking the lock first repairs a real torn tail (DESIGN §5),
+/// so verify reports the replica as every later reader will see it.
 pub(crate) fn verify(home: &Home, sel: &Sel) -> Result<VerifyReport> {
-    current(home, sel)?.replica.verify()
+    let space = current(home, sel)?;
+    let _lock = space.replica.lock()?;
+    space.replica.verify()
 }
 
 /// Returns the new index epoch.

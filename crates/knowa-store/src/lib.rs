@@ -24,7 +24,9 @@ pub const LOCK_FILE: &str = ".lock";
 pub const SEGMENT_LINES: u64 = 10_000;
 /// `<root>/.index/needs-rebuild`: written (and fsynced) by `merge` before any segment,
 /// because index catch-up cannot see segments that fill gaps below an indexed head
-/// (DESIGN §5). `Index::open` rebuilds while it exists and removes it afterwards.
+/// (DESIGN §5); `import_bundle` also writes it before any blob it adds, because catch-up
+/// cannot see a newly arrived blob either. `Index::open` rebuilds while it exists and
+/// removes it afterwards.
 pub const REBUILD_MARKER: &str = "needs-rebuild";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -94,14 +96,10 @@ impl Replica {
     /// `genesis` must verify; `manifest.genesis == genesis.id`.
     pub fn create(dir: &Path, genesis: &Claim) -> Result<Replica> {
         genesis.verify()?;
-        let b = &genesis.body;
-        let owner_ref = Value::Ref(b.actor.clone());
-        if b.seq != 1 || b.p.as_str() != OWNER || b.s != b.space || b.o != owner_ref {
-            return Err(Error::invalid(format!(
-                "genesis {} must be seq 1 `{} {OWNER} {{\"ref\":\"{}\"}}` by its owner",
-                genesis.id, b.space, b.actor
-            )));
+        if let Some(p) = genesis_problem(genesis) {
+            return Err(Error::invalid(p));
         }
+        let b = &genesis.body;
         let manifest = Manifest {
             format: FORMAT_VERSION,
             space: b.space.clone(),
@@ -212,7 +210,10 @@ impl Replica {
             .open(&path)
             .map_err(|e| fsutil::io_err(&path, e))?;
         file.lock().map_err(|e| fsutil::io_err(&path, e))?;
-        Ok(WriteLock { _file: file, root: self.root.clone() })
+        let lock = WriteLock { _file: file, root: self.root.clone() };
+        // Only now: the repair is safe only while no append can be in flight.
+        log::repair_torn_tails(&self.root)?;
+        Ok(lock)
     }
 
     /// Last claim of `actor` in this replica (highest seq), if any.
@@ -224,7 +225,8 @@ impl Replica {
     /// Appends locally-authored claims. For each actor, claims must continue that
     /// actor's chain exactly (seq = head+1, prev = head id), in order; each must verify.
     /// Writes JCS lines, rotates segments at SEGMENT_LINES, fsyncs before returning.
-    /// Violations → `conflict` (chain) / `integrity` (verify); nothing is written on error.
+    /// Violations → `conflict` (chain) / `integrity` (verify); nothing is written on error,
+    /// and a write that fails part-way is truncated back to the pre-append state.
     pub fn append(&self, lock: &WriteLock, claims: &[Claim]) -> Result<()> {
         self.check_lock(lock)?;
         log::append(&self.root, &self.manifest.space, claims)
@@ -234,6 +236,8 @@ impl Replica {
     /// Already-present (actor, seq) with the same id → skipped; same (actor, seq) with a
     /// different id → `integrity` (equivocation). Gaps are allowed and reported.
     /// Where seq n-1 is present, `prev` must equal its id → else `integrity`.
+    /// If anything is new, `<root>/.index/<REBUILD_MARKER>` is written and fsynced
+    /// before the first segment (DESIGN §5).
     pub fn merge(&self, lock: &WriteLock, claims: &[Claim]) -> Result<ImportReport> {
         self.check_lock(lock)?;
         let space = &self.manifest.space;
@@ -241,6 +245,9 @@ impl Replica {
             log::check_claim(c, space, ErrorCode::Integrity)?;
         }
         let plan = log::plan_merge(claims, |actor| log::chain(&self.root, space, actor))?;
+        if plan.writes_segments() {
+            mark_rebuild(&self.root)?;
+        }
         plan.apply(&self.root)
     }
 
@@ -299,6 +306,27 @@ impl Replica {
     }
 }
 
+/// A genesis is seq 1 `<space> knowa:owner {"ref":"<author>"}` by its author (DESIGN §4.6).
+pub(crate) fn genesis_problem(genesis: &Claim) -> Option<String> {
+    let b = &genesis.body;
+    let owner_ref = Value::Ref(b.actor.clone());
+    (b.seq != 1 || b.p.as_str() != OWNER || b.s != b.space || b.o != owner_ref).then(|| {
+        format!("genesis {} must be seq 1 `{} {OWNER} {{\"ref\":\"{}\"}}` by its owner", genesis.id, b.space, b.actor)
+    })
+}
+
+/// `<root>/.index/<REBUILD_MARKER>`.
+pub(crate) fn rebuild_marker(root: &Path) -> PathBuf {
+    root.join(INDEX_DIR).join(REBUILD_MARKER)
+}
+
+/// Creates and fsyncs the rebuild marker (and `.index/` if needed) so it is durable
+/// before anything it covers is written.
+pub(crate) fn mark_rebuild(root: &Path) -> Result<()> {
+    fsutil::ensure_dir(&root.join(INDEX_DIR))?;
+    fsutil::atomic_write(&rebuild_marker(root), b"")
+}
+
 fn manifest_kind_problem(m: &Manifest) -> Option<String> {
     [("space", &m.space, IdKind::Space), ("owner", &m.owner, IdKind::Actor), ("genesis", &m.genesis, IdKind::Claim)]
         .into_iter()
@@ -320,8 +348,9 @@ pub fn read_bundle_meta(bundle: &Path) -> Result<BundleMeta> {
 }
 
 /// Imports a bundle into `dest` (created via `create_replica` if absent; if present its
-/// manifest must match the bundle's space). Verifies all claim signatures and blob hashes
-/// before writing anything.
+/// manifest must match the bundle's space). Verifies all claim signatures and blob hashes,
+/// and that the bundle's genesis is a genesis claim, before writing anything. Writes the
+/// rebuild marker before the first blob or segment it adds (as `Replica::merge`).
 pub fn import_bundle(bundle: &Path, dest: &Path) -> Result<(Replica, BundleMeta, ImportReport)> {
     bundle::import(bundle, dest)
 }

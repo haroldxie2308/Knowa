@@ -1,6 +1,6 @@
 //! Space selection (DESIGN §6.1 `spaces`) and opening replicas/indexes.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use knowa_config::{Home, SpaceRef};
 use knowa_index::Index;
@@ -88,8 +88,11 @@ pub(crate) fn current(home: &Home, sel: &Sel) -> Result<Space> {
     Space::open(home.resolve_space(sel.space.as_deref())?)
 }
 
-/// Resolves a `spaces` selection in order. Several replicas of the same space id
-/// (e.g. an own replica and an imported copy) count once: the first one wins.
+/// Resolves a `spaces` selection in order. Several replicas of the same space (e.g. an
+/// own replica and an imported copy) count once: the first one wins. A space is its id
+/// *and* genesis (DESIGN §7.3), so selected replicas that share an id but not their
+/// manifest are different spaces claiming one id → `conflict`; letting the first win
+/// would let one shadow the other.
 pub(crate) fn select(home: &Home, sel: &Sel, spaces: &[String]) -> Result<Vec<Space>> {
     let refs = match classify(spaces)? {
         Selection::Current => vec![home.resolve_space(sel.space.as_deref())?],
@@ -104,12 +107,30 @@ pub(crate) fn select(home: &Home, sel: &Sel, spaces: &[String]) -> Result<Vec<Sp
         }
         Selection::Named(names) => names.iter().map(|n| home.resolve_space(Some(n))).collect::<Result<Vec<_>>>()?,
     };
-    let mut seen = HashSet::new();
-    let mut out = Vec::with_capacity(refs.len());
+    let mut first: HashMap<Id, usize> = HashMap::new();
+    let mut out: Vec<Space> = Vec::with_capacity(refs.len());
     for r in refs {
         let space = Space::open(r)?;
-        if seen.insert(space.id().clone()) {
-            out.push(space);
+        match first.get(space.id()) {
+            None => {
+                first.insert(space.id().clone(), out.len());
+                out.push(space);
+            }
+            Some(&i) if out[i].replica.manifest() == space.replica.manifest() => {}
+            Some(&i) => {
+                let (a, b) = (out[i].replica.manifest(), space.replica.manifest());
+                return Err(Error::conflict(format!(
+                    "spaces: {} and {} both claim space {} but differ (owner {} / {}, genesis {} / {}); a space is its id and genesis, so one of them is not that space — unregister it (knowa space rm)",
+                    out[i].name(),
+                    space.name(),
+                    a.space,
+                    a.owner,
+                    b.owner,
+                    a.genesis,
+                    b.genesis
+                ))
+                .with_detail(serde_json::json!({ "space": a.space, "manifests": [a, b] })));
+            }
         }
     }
     Ok(out)

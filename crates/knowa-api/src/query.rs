@@ -80,7 +80,7 @@ fn find(home: &Home, sel: &Sel, d: FindDoc) -> Result<FindResult> {
     let opened = open_all(spaces)?;
     let mut w = d.where_.clone();
     if let Some(nid) = w.near_id.take() {
-        w.near = Some(resolve_near_id(&opened, &nid)?);
+        w.near = Some(resolve_near_id(&opened, &nid, &d.view)?);
     }
     let has_text = w.text.is_some();
     let cursor = d.cursor.as_deref();
@@ -94,7 +94,7 @@ fn find(home: &Home, sel: &Sel, d: FindDoc) -> Result<FindResult> {
                 .iter()
                 .map(|o| o.index.find_entities(&w, &d.view, order, limit, None).map(|p| p.items))
                 .collect::<Result<Vec<_>>>()?;
-            let mut items = sort_entities(merge_entities(lists), entity_sort(order, has_text)?)?;
+            let mut items = sort_entities(merge_entities(lists)?, entity_sort(order, has_text)?)?;
             items.truncate(limit as usize);
             Ok(FindResult { items: FindItems::Entities(items), cursor: None })
         }
@@ -115,12 +115,11 @@ fn find(home: &Home, sel: &Sel, d: FindDoc) -> Result<FindResult> {
 }
 
 /// `nearId` → `near` at the anchor's display `where` (first selected space that has
-/// one). The anchor is looked up with the default view: display fields are computed
-/// independently of the query view (EntityView docs), so a strict view must not make
-/// a located anchor look unlocated.
-fn resolve_near_id(opened: &[Opened], nid: &NearId) -> Result<Near> {
+/// one), under the query's own view: views apply to evidence (DESIGN §4.7), so a
+/// location only an excluded actor asserted must not place the anchor.
+fn resolve_near_id(opened: &[Opened], nid: &NearId, view: &View) -> Result<Near> {
     for o in opened {
-        if let Some(e) = o.index.entity(&nid.id, &View::default())?
+        if let Some(e) = o.index.entity(&nid.id, view)?
             && let Some(w) = e.where_
         {
             return Ok(Near { lat: w.lat.to_string(), lon: w.lon.to_string(), km: nid.km.clone() });
@@ -186,7 +185,7 @@ pub(crate) fn merged_entity(opened: &[Opened], id: &Id, view: &View) -> Result<O
             lists.push(vec![e]);
         }
     }
-    Ok(merge_entities(lists).into_iter().next())
+    Ok(merge_entities(lists)?.into_iter().next())
 }
 
 /// `get` has no limit, so an entity's claims are returned in full up to MAX_LIMIT;

@@ -189,7 +189,7 @@ fn expired(e: Error, cursor_file: &Path) -> Error {
         return e;
     }
     Error::cursor_expired(format!(
-        "worker cursor is from an earlier index epoch (the index was rebuilt); delete {} to restart the worker from the beginning (idempotent writes make the replay safe)",
+        "worker cursor is from an earlier index epoch (the index was rebuilt); delete {} to restart the worker from the beginning. The whole feed is then replayed through the command: a draft equal to an active, non-stale claim the worker already wrote is a no-op, but a draft using placeholders (_:x) mints new entities and is written again, duplicating its earlier output",
         cursor_file.display()
     ))
     .with_detail(serde_json::json!({ "cursorFile": cursor_file }))
@@ -252,5 +252,14 @@ mod tests {
         assert!(e.message.contains("/r/.index/cursors/w.json"));
         let other = expired(Error::invalid("y"), Path::new("/f"));
         assert_eq!(other.message, "y");
+    }
+
+    /// A replay re-mints placeholder entities, so it duplicates that output; the
+    /// message must not promise it is safe.
+    #[test]
+    fn expired_cursor_message_warns_that_placeholder_output_is_duplicated() {
+        let m = expired(Error::cursor_expired("x"), Path::new("/c.json")).message;
+        assert!(!m.contains("safe"), "{m}");
+        assert!(m.contains("placeholders (_:x)") && m.contains("duplicating"), "{m}");
     }
 }

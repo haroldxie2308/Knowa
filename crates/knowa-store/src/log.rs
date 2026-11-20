@@ -11,8 +11,8 @@
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use knowa_model::{Claim, Error, ErrorCode, Id, IdKind, Result};
@@ -146,6 +146,13 @@ pub(crate) fn parse_line(line: &[u8], loc: &dyn Fn() -> String) -> Result<Claim>
     })
 }
 
+/// `Claim::verify` for a claim read from a log. Whatever the model calls the failure,
+/// a logged claim that does not verify was not written by an honest append: it is
+/// forged or corrupted, so `integrity`.
+fn verify_logged(c: &Claim, loc: &dyn Fn() -> String) -> Result<()> {
+    c.verify().map_err(|e| Error::integrity(format!("{}: {}", loc(), e.message)))
+}
+
 fn ownership_problem(c: &Claim, space: &Id, actor: &Id) -> Option<String> {
     if c.body.actor != *actor {
         return Some(format!("claim {} is by {}, found in the log of {}", c.id, c.body.actor, actor));
@@ -197,43 +204,91 @@ pub(crate) fn tail(root: &Path, space: &Id, actor: &Id) -> Result<Option<Tail>> 
             segment.first
         )));
     }
-    claim.verify()?;
+    verify_logged(&claim, &|| format!("{}: last line", segment.path.display()))?;
     let lines = claim.body.seq - segment.first + 1;
     Ok(Some(Tail { head: Head { seq: claim.body.seq, id: claim.id }, segment, lines }))
 }
 
 fn read_last_line(path: &Path) -> Result<Vec<u8>> {
-    const CHUNK: u64 = 8 * 1024;
     let mut f = File::open(path).map_err(|e| io_err(path, e))?;
     let len = f.metadata().map_err(|e| io_err(path, e))?.len();
     if len == 0 {
         return Err(Error::integrity(format!("{}: empty segment", path.display())));
     }
-    // `buf` always holds the file's bytes from `start` to EOF.
-    let mut buf: Vec<u8> = Vec::new();
-    let mut start = len;
-    loop {
-        let from = start.saturating_sub(CHUNK);
-        let mut chunk = vec![0u8; (start - from) as usize];
-        f.seek(SeekFrom::Start(from)).map_err(|e| io_err(path, e))?;
+    if read_byte(&mut f, len - 1, path)? != b'\n' {
+        return Err(Error::integrity(format!("{}: torn last line (no trailing newline)", path.display())));
+    }
+    let start = last_newline_before(&mut f, len - 1, path)?.map_or(0, |nl| nl + 1);
+    let mut line = vec![0u8; (len - start) as usize];
+    f.seek(SeekFrom::Start(start)).map_err(|e| io_err(path, e))?;
+    f.read_exact(&mut line).map_err(|e| io_err(path, e))?;
+    Ok(line)
+}
+
+fn read_byte(f: &mut File, at: u64, path: &Path) -> Result<u8> {
+    let mut b = [0u8; 1];
+    f.seek(SeekFrom::Start(at)).map_err(|e| io_err(path, e))?;
+    f.read_exact(&mut b).map_err(|e| io_err(path, e))?;
+    Ok(b[0])
+}
+
+/// Offset of the last `\n` among the first `end` bytes of `f`, scanning backwards.
+fn last_newline_before(f: &mut File, end: u64, path: &Path) -> Result<Option<u64>> {
+    const CHUNK: u64 = 8 * 1024;
+    let mut hi = end;
+    while hi > 0 {
+        let lo = hi.saturating_sub(CHUNK);
+        let mut chunk = vec![0u8; (hi - lo) as usize];
+        f.seek(SeekFrom::Start(lo)).map_err(|e| io_err(path, e))?;
         f.read_exact(&mut chunk).map_err(|e| io_err(path, e))?;
-        chunk.extend_from_slice(&buf);
-        buf = chunk;
-        start = from;
-        if buf.last() != Some(&b'\n') {
-            return Err(Error::integrity(format!("{}: torn last line (no trailing newline)", path.display())));
+        if let Some(i) = chunk.iter().rposition(|&b| b == b'\n') {
+            return Ok(Some(lo + i as u64));
         }
-        if let Some(pos) = buf[..buf.len() - 1].iter().rposition(|&b| b == b'\n') {
-            return Ok(buf.split_off(pos + 1));
-        }
-        if start == 0 {
-            return Ok(buf);
+        hi = lo;
+    }
+    Ok(None)
+}
+
+/// Torn tail recovery (DESIGN §5). The caller holds the write lock.
+///
+/// Why truncating is safe: `append` is the only writer that extends an existing
+/// segment, it always extends the actor's newest one, and it writes whole lines and
+/// fsyncs them before returning, all under the write lock. With the lock held here no
+/// append is in flight, so an unterminated final line in a newest segment is what is
+/// left of an append that never returned success: no caller was given its id, the
+/// index never applied it (that happens after append returns), and no bundle holds it
+/// (reading a torn line fails). Removing it loses nothing that was acknowledged.
+///
+/// Everything else is left for readers and `verify` to report rather than repaired:
+/// stray or misnamed entries (the scans' problem lists), and segments with no complete
+/// line, which no crash can produce because new segments are published whole by rename.
+pub(crate) fn repair_torn_tails(root: &Path) -> Result<()> {
+    let (actors, _) = scan_actors(root)?;
+    for actor in &actors {
+        let (segments, _) = scan_segments(root, actor)?;
+        if let Some(newest) = segments.last() {
+            truncate_torn_tail(&newest.path)?;
         }
     }
+    Ok(())
+}
+
+fn truncate_torn_tail(path: &Path) -> Result<()> {
+    let mut f = OpenOptions::new().read(true).write(true).open(path).map_err(|e| io_err(path, e))?;
+    let len = f.metadata().map_err(|e| io_err(path, e))?.len();
+    if len == 0 || read_byte(&mut f, len - 1, path)? == b'\n' {
+        return Ok(());
+    }
+    let Some(last_complete) = last_newline_before(&mut f, len, path)? else {
+        return Ok(());
+    };
+    f.set_len(last_complete + 1).map_err(|e| io_err(path, e))?;
+    f.sync_all().map_err(|e| io_err(path, e))
 }
 
 /// Streams one actor's claims with seq ≥ `from_seq`, ascending. Checks structure,
-/// ownership and ordering; not signatures (that is `verify`).
+/// ownership and ordering, and verifies (id + signature) every claim it yields: logs
+/// are never trusted (DESIGN §5). Lines below `from_seq` are only parsed for ordering.
 pub(crate) struct LogIter {
     space: Id,
     actor: Id,
@@ -299,6 +354,9 @@ impl LogIter {
                     open.path.display(),
                     claim.body.seq
                 )));
+            }
+            if claim.body.seq >= self.from_seq {
+                verify_logged(&claim, &|| format!("{}: seq {expected}", open.path.display()))?;
             }
             open.next_seq += 1;
             self.current = Some(open);
@@ -396,42 +454,119 @@ pub(crate) fn append(root: &Path, space: &Id, claims: &[Claim]) -> Result<()> {
         pending.next_seq += 1;
         pending.prev = Some(c.id.clone());
     }
+    // Several actors, or a rotation, mean several files: a failure after the first has
+    // been written is undone, so the append still writes nothing on error.
+    let mut changes = Vec::new();
     for (actor, p) in &per_actor {
         let tail = p.tail.as_ref().map(|t| (&t.segment, t.lines));
-        write_run(&actor_dir(root, actor), tail, p.first_new, &p.lines, SEGMENT_LIMIT)?;
+        if let Err(e) = write_run(&actor_dir(root, actor), tail, p.first_new, &p.lines, SEGMENT_LIMIT, &mut changes) {
+            return Err(undo(changes, e));
+        }
     }
     Ok(())
 }
 
+/// One change `write_run` makes to the log, recorded *before* it is attempted, so a
+/// write that fails part-way is still covered.
+pub(crate) enum Change {
+    /// lines are appended to `path`, which was `len` bytes long
+    Extended { path: PathBuf, len: u64 },
+    /// a new segment is published at `path`
+    Created(PathBuf),
+    /// a new actor directory
+    CreatedDir(PathBuf),
+}
+
+/// Reverts `changes` (newest first) after `err` and returns `err`, extended with any
+/// step of the undo that failed. The caller holds the write lock, so nothing else has
+/// touched these files since. Each step is independent, so one failing does not stop
+/// the others.
+fn undo(changes: Vec<Change>, mut err: Error) -> Error {
+    let failed: Vec<String> = changes.into_iter().rev().filter_map(|c| revert(c).err()).map(|e| e.message).collect();
+    if !failed.is_empty() {
+        err.message = format!(
+            "{}; undoing the partial append also failed, so the log may keep part of it: {}",
+            err.message,
+            failed.join("; ")
+        );
+    }
+    err
+}
+
+fn revert(change: Change) -> Result<()> {
+    match change {
+        Change::Extended { path, len } => {
+            let f = OpenOptions::new().write(true).open(&path).map_err(|e| io_err(&path, e))?;
+            f.set_len(len).map_err(|e| io_err(&path, e))?;
+            f.sync_all().map_err(|e| io_err(&path, e))
+        }
+        Change::Created(path) => match fs::remove_file(&path) {
+            Ok(()) => sync_parent(&path),
+            // The publish failed before its rename: there is nothing to remove.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(io_err(&path, e)),
+        },
+        Change::CreatedDir(dir) => match fs::remove_dir(&dir) {
+            Ok(()) => sync_parent(&dir),
+            // Creating it is what failed: there is nothing to remove.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(io_err(&dir, e)),
+        },
+    }
+}
+
+fn sync_parent(path: &Path) -> Result<()> {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => fsutil::sync_dir(parent),
+        _ => fsutil::sync_dir(Path::new(".")),
+    }
+}
+
 /// Writes `lines` (consecutive seqs from `first_seq`): first into the open `tail`
 /// segment while it has room under `limit`, then into new segments of ≤ `limit`
-/// lines, each named by its first seq.
-pub(crate) fn write_run(dir: &Path, tail: Option<(&Segment, u64)>, first_seq: u64, lines: &[Vec<u8>], limit: usize) -> Result<()> {
+/// lines, each named by its first seq. Every change is recorded in `changes`.
+pub(crate) fn write_run(
+    dir: &Path,
+    tail: Option<(&Segment, u64)>,
+    first_seq: u64,
+    lines: &[Vec<u8>],
+    limit: usize,
+    changes: &mut Vec<Change>,
+) -> Result<()> {
     let mut rest = lines;
     let mut seq = first_seq;
     if let Some((segment, count)) = tail {
         // ≤ rest.len(), so the cast back to usize is lossless.
         let room = (limit as u64).saturating_sub(count).min(rest.len() as u64) as usize;
         if room > 0 {
-            append_to_segment(&segment.path, &rest[..room])?;
+            append_to_segment(&segment.path, &rest[..room], changes)?;
             rest = &rest[room..];
             seq += room as u64;
         }
     }
     for part in rest.chunks(limit.max(1)) {
-        write_new_segment(dir, seq, part)?;
+        write_new_segment(dir, seq, part, changes)?;
         seq += part.len() as u64;
     }
     Ok(())
 }
 
-fn append_to_segment(path: &Path, lines: &[Vec<u8>]) -> Result<()> {
+fn append_to_segment(path: &Path, lines: &[Vec<u8>], changes: &mut Vec<Change>) -> Result<()> {
     let mut f = OpenOptions::new().append(true).open(path).map_err(|e| io_err(path, e))?;
+    let len = f.metadata().map_err(|e| io_err(path, e))?.len();
+    changes.push(Change::Extended { path: path.to_path_buf(), len });
     f.write_all(&lines.concat()).map_err(|e| io_err(path, e))?;
     f.sync_all().map_err(|e| io_err(path, e))
 }
 
-fn write_new_segment(dir: &Path, first: u64, lines: &[Vec<u8>]) -> Result<()> {
+fn write_new_segment(dir: &Path, first: u64, lines: &[Vec<u8>], changes: &mut Vec<Change>) -> Result<()> {
+    // `symlink_metadata`: whatever occupies the name (even a dangling link) is not ours
+    // to remove on undo.
+    match fs::symlink_metadata(dir) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => changes.push(Change::CreatedDir(dir.to_path_buf())),
+        Err(e) => return Err(io_err(dir, e)),
+    }
     fsutil::ensure_dir(dir)?;
     let dest = dir.join(segment_name(first));
     // Callers hold the write lock, so no other Knowa writer can race this check.
@@ -444,6 +579,7 @@ fn write_new_segment(dir: &Path, first: u64, lines: &[Vec<u8>]) -> Result<()> {
     let mut tmp = TempFile::create_in(dir)?;
     let tmp_path = tmp.path().to_path_buf();
     tmp.file().write_all(&lines.concat()).map_err(|e| io_err(&tmp_path, e))?;
+    changes.push(Change::Created(dest.clone()));
     tmp.commit(&dest)
 }
 
@@ -524,10 +660,23 @@ pub(crate) fn plan_merge(claims: &[Claim], mut existing: impl FnMut(&Id) -> Resu
 }
 
 impl MergePlan {
-    /// Writes every planned run as new segments.
+    /// True when `apply` will write at least one segment.
+    pub(crate) fn writes_segments(&self) -> bool {
+        !self.runs.is_empty()
+    }
+
+    /// Writes every planned run as new segments. The caller must already have written
+    /// the rebuild marker (`crate::mark_rebuild`): index catch-up cannot see a run that
+    /// fills a gap below an indexed head (DESIGN §5).
     pub(crate) fn apply(self, root: &Path) -> Result<ImportReport> {
+        if self.writes_segments() && !crate::rebuild_marker(root).is_file() {
+            return Err(Error::internal("merge: segments would be written before the index rebuild marker"));
+        }
+        // A merge that fails part-way keeps the runs already written: each is a
+        // verified, chain-checked run, and the marker makes the index rebuild over it.
+        let mut changes = Vec::new();
         for (actor, first, lines) in &self.runs {
-            write_run(&actor_dir(root, actor), None, *first, lines, SEGMENT_LIMIT)?;
+            write_run(&actor_dir(root, actor), None, *first, lines, SEGMENT_LIMIT, &mut changes)?;
         }
         Ok(self.report)
     }
@@ -573,7 +722,7 @@ mod tests {
     fn write_run_fills_the_tail_then_rotates() {
         let dir = std::env::temp_dir().join(format!("knowa-store-rotate-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        write_run(&dir, None, 1, &lines(1..=7), 3).unwrap();
+        write_run(&dir, None, 1, &lines(1..=7), 3, &mut Vec::new()).unwrap();
         assert_eq!(
             layout(&dir),
             [
@@ -583,7 +732,7 @@ mod tests {
             ]
         );
         let tail = Segment { first: 7, path: dir.join(segment_name(7)) };
-        write_run(&dir, Some((&tail, 1)), 8, &lines(8..=11), 3).unwrap();
+        write_run(&dir, Some((&tail, 1)), 8, &lines(8..=11), 3, &mut Vec::new()).unwrap();
         let after = layout(&dir);
         assert_eq!(after.len(), 4);
         assert_eq!(after[2], (segment_name(7), "7\n8\n9\n".to_string()));

@@ -494,6 +494,100 @@ fn verify_passes_and_reindex_reproduces_search_results() {
     assert_eq!(alice.ok(&["search", "lantern"]), before);
 }
 
+// ---------- audit regressions (DESIGN §5) ----------
+
+/// The newest segment of `actor`'s log in the replica at `space_dir`.
+fn newest_segment(space_dir: &Path, actor: &str) -> PathBuf {
+    let dir = space_dir.join("log").join(actor);
+    let mut names: Vec<PathBuf> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+    names.sort();
+    names.pop().unwrap()
+}
+
+fn append_bytes(path: &Path, bytes: &[u8]) {
+    fs::OpenOptions::new().append(true).open(path).unwrap().write_all(bytes).unwrap();
+}
+
+#[test]
+fn a_forged_log_line_is_an_integrity_error_not_a_grant() {
+    use knowa_model::{Claim, ClaimBody, Draft, Id, Term, Timestamp, Value};
+
+    let sb = Sandbox::new("forged");
+    let alice = setup(&sb);
+    alice.ok(&["actor", "new", "bot", "--kind", "agent"]);
+    let e = note(&alice, &["something for the bot"]);
+    let bot = alice.as_actor("bot");
+    let proposal = last_id(&bot.ok(&["assert", &e, "knowa:summary", "text:a bot summary"]));
+    assert_eq!(show_claim(&alice, &proposal)["status"], "proposed");
+
+    // A line appended to alice's log: `bot knowa:role knowa:Owner` with a zero signature.
+    let segment = newest_segment(&sb.path("home-space"), &actor_id(&alice, "alice"));
+    let text = fs::read_to_string(&segment).unwrap();
+    let last = Claim::from_json(&serde_json::from_str(text.lines().last().unwrap()).unwrap()).unwrap();
+    let grant = Draft::new(
+        Id::parse(&actor_id(&alice, "bot")).unwrap(),
+        Term::parse("knowa:role").unwrap(),
+        Value::Term(Term::parse("knowa:Owner").unwrap()),
+    );
+    let b = last.body;
+    let body = ClaimBody::from_draft(grant, b.space, b.actor, b.seq + 1, Some(last.id), Timestamp::now());
+    let id = Id::claim_of(&body.canonical_bytes().unwrap());
+    append_bytes(&segment, &Claim { body, id, sig: "A".repeat(86) }.to_line().unwrap());
+
+    // Before the fix the index caught up on the forged grant and the proposal showed
+    // as accepted (bot an Owner).
+    let (code, err) = alice.fail(&["show", &proposal]);
+    assert_eq!((code, &err["error"]["code"]), (7, &json!("integrity")), "{err}");
+}
+
+#[test]
+fn a_torn_tail_left_by_a_crashed_append_is_repaired_by_the_next_writer() {
+    let sb = Sandbox::new("torn");
+    let alice = setup(&sb);
+    note(&alice, &["written before the crash"]);
+    let segment = newest_segment(&sb.path("home-space"), &actor_id(&alice, "alice"));
+    let intact = fs::read(&segment).unwrap();
+    // What a crash in the middle of an append leaves: half a line, no newline.
+    let last_line = intact[..intact.len() - 1].rsplit(|&b| b == b'\n').next().unwrap().to_vec();
+    append_bytes(&segment, &last_line[..last_line.len() / 2]);
+
+    let after = note(&alice, &["written after the crash"]);
+    assert!(ids(&alice.ok(&["search", "after the crash"])["items"]).contains(&after));
+    assert!(alice.ok(&["verify"])["problems"].as_array().unwrap().is_empty());
+}
+
+/// Depends on the knowa-index side of DESIGN §5 (`Index::open` rebuilds while the
+/// rebuild marker exists, then removes it): import now leaves the rebuild to it.
+#[test]
+fn an_import_that_fills_a_gap_is_searchable_and_leaves_no_rebuild_marker() {
+    let sb = Sandbox::new("gapfill");
+    let alice = setup_home(&sb, "home-a", "alice", "alice-space");
+    let first = note(&alice, &["first public walk"]);
+    let hidden = note(&alice, &["hidden harbour diary"]);
+    let last = note(&alice, &["last public walk"]);
+    alice.ok(&["share", &first, "shared"]);
+    alice.ok(&["share", &last, "shared"]);
+    let bundle = sb.path("alice-1.knowa");
+    alice.ok(&["export", s(&bundle), "--level", "shared"]);
+
+    let bob = setup_home(&sb, "home-b", "bob", "bob-space");
+    let im = bob.ok(&["import", s(&bundle)]);
+    assert!(im["gaps"].as_u64().unwrap() > 0, "{im}");
+    let replica = im["path"].as_str().unwrap().to_string();
+    assert!(ids(&bob.ok(&["search", "walk", "--spaces", &replica])["items"]).contains(&last));
+
+    // The hidden note's claims sit below alice's head in bob's replica: catch-up alone
+    // would never index them.
+    alice.ok(&["share", &hidden, "shared"]);
+    let bundle = sb.path("alice-2.knowa");
+    alice.ok(&["export", s(&bundle), "--level", "shared"]);
+    let im = bob.ok(&["import", s(&bundle)]);
+    assert!(im["added"].as_u64().unwrap() > 0, "{im}");
+    let hits = bob.ok(&["search", "harbour", "--spaces", &replica]);
+    assert_eq!(ids(&hits["items"]), [hidden], "{hits}");
+    assert!(!Path::new(&replica).join(".index").join("needs-rebuild").exists());
+}
+
 #[test]
 fn no_current_space_is_a_usage_error() {
     let sb = Sandbox::new("nospace");

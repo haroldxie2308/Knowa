@@ -109,6 +109,29 @@ fn meta_for(r: &Replica, level: &str, by: &Id) -> BundleMeta {
     }
 }
 
+fn segment_path(r: &Replica, actor: &Id, first: u64) -> PathBuf {
+    r.root().join("log").join(actor.as_str()).join(format!("{first:012}.jsonl"))
+}
+
+fn append_bytes(path: &Path, bytes: &[u8]) {
+    use std::io::Write;
+    fs::OpenOptions::new().append(true).open(path).unwrap().write_all(bytes).unwrap();
+}
+
+/// An author different from `than` whose id sorts after it.
+fn author_after(space: &Id, than: &Id) -> Author {
+    loop {
+        let a = Author::new(space);
+        if a.id > *than {
+            return a;
+        }
+    }
+}
+
+fn marker(dir: &Path) -> PathBuf {
+    dir.join(".index").join(knowa_store::REBUILD_MARKER)
+}
+
 fn replace_once(haystack: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
     assert_eq!(needle.len(), with.len());
     let at = haystack.windows(needle.len()).position(|w| w == needle).expect("needle present");
@@ -451,4 +474,187 @@ fn blob_fanout_spreads_by_digest_and_lock_is_bound_to_its_replica() {
     let lock_a = a.lock().unwrap();
     let err = b.head(&lock_a, &b.manifest().owner).unwrap_err();
     assert_eq!(err.code, knowa_model::ErrorCode::Internal);
+}
+
+// ---------- audit regressions (DESIGN §5, §7.3) ----------
+
+/// Index catch-up and rebuild read through `read_log`, which used to check only
+/// structure: an unsigned line (here alice "granting" bot Owner) was believed.
+#[test]
+fn read_log_rejects_forged_and_edited_lines() {
+    let s = Scratch::new("forged");
+    let (r, mut owner, _) = new_space(&s.0);
+    let lock = r.lock().unwrap();
+    let c2 = owner.note("genuine text");
+    r.append(&lock, std::slice::from_ref(&c2)).unwrap();
+    drop(lock);
+    let segment = segment_path(&r, &owner.id, 1);
+    let pristine = fs::read(&segment).unwrap();
+
+    // Well-formed, chained, with the right id; only the signature is missing.
+    let bot = Author::new(&owner.space);
+    let grant =
+        Draft::new(bot.id.clone(), Term::parse("knowa:role").unwrap(), Value::Term(Term::parse("knowa:Owner").unwrap()));
+    let body = ClaimBody::from_draft(grant, owner.space.clone(), owner.id.clone(), 3, Some(c2.id.clone()), Timestamp::now());
+    let id = Id::claim_of(&body.canonical_bytes().unwrap());
+    let forged = Claim { body, id, sig: "A".repeat(86) };
+    append_bytes(&segment, &forged.to_line().unwrap());
+    for from in [1, 3] {
+        let err = r.read_log(&owner.id, from).unwrap().collect::<Result<Vec<_>, _>>().unwrap_err();
+        assert_eq!(err.code, ErrorCode::Integrity, "from seq {from}: {err:?}");
+    }
+    // Claims below `from_seq` are not yielded, so they are not checked either.
+    assert_eq!(r.read_log(&owner.id, 4).unwrap().count(), 0);
+
+    // An edited genuine line: its id no longer matches its content.
+    fs::write(&segment, replace_once(&pristine, b"genuine text", b"genuine t3xt")).unwrap();
+    let err = r.read_log(&owner.id, 1).unwrap().collect::<Result<Vec<_>, _>>().unwrap_err();
+    assert_eq!(err.code, ErrorCode::Integrity);
+}
+
+/// A crash part-way through an append left an unterminated last line, and every later
+/// read and write failed with `integrity` forever.
+#[test]
+fn taking_the_lock_truncates_a_torn_tail() {
+    let s = Scratch::new("torn");
+    let (r, mut owner, _) = new_space(&s.0);
+    let c2 = owner.note("two");
+    r.append(&r.lock().unwrap(), std::slice::from_ref(&c2)).unwrap();
+    let segment = segment_path(&r, &owner.id, 1);
+    let intact = fs::read(&segment).unwrap();
+
+    // What a crash leaves while appending c3: part of its line and no newline.
+    let c3 = owner.note("three");
+    let line = c3.to_line().unwrap();
+    append_bytes(&segment, &line[..line.len() / 2]);
+    assert_eq!(r.read_log(&owner.id, 1).unwrap().last().unwrap().unwrap_err().code, ErrorCode::Integrity);
+
+    let lock = r.lock().unwrap();
+    assert_eq!(fs::read(&segment).unwrap(), intact);
+    assert_eq!(r.head(&lock, &owner.id).unwrap(), Some(Head { seq: 2, id: c2.id.clone() }));
+    r.append(&lock, std::slice::from_ref(&c3)).unwrap();
+    assert_eq!(seqs(&log_of(&r, &owner.id, 1)), [1, 2, 3]);
+    r.verify().unwrap();
+
+    // A segment with no complete line is no crashed append (new segments are published
+    // whole), so it is left for readers to report.
+    let mut other = Author::new(&owner.space);
+    let o1 = other.note("hello");
+    let dir = r.root().join("log").join(other.id.as_str());
+    fs::create_dir_all(&dir).unwrap();
+    let partial = &o1.to_line().unwrap()[..10];
+    fs::write(dir.join("000000000001.jsonl"), partial).unwrap();
+    drop(lock);
+    let _lock = r.lock().unwrap();
+    assert_eq!(fs::read(dir.join("000000000001.jsonl")).unwrap(), partial);
+    assert_eq!(r.verify().unwrap_err().code, ErrorCode::Integrity);
+}
+
+/// `append` writes one file per actor (and per rotation); a failure after the first
+/// was written used to leave those lines behind although the append reported failure.
+#[cfg(unix)]
+#[test]
+fn an_append_that_fails_part_way_is_undone() {
+    let s = Scratch::new("undo");
+    let (r, mut owner, _) = new_space(&s.0);
+    // Actors are written in id order: the owner's segment is extended before the new
+    // actor's directory is attempted.
+    let mut other = author_after(&owner.space, &owner.id);
+    let segment = segment_path(&r, &owner.id, 1);
+    let before = fs::read(&segment).unwrap();
+    // A dangling symlink where the new actor's log directory goes makes creating it
+    // fail, whatever the permissions (also as root).
+    let blocker = r.root().join("log").join(other.id.as_str());
+    std::os::unix::fs::symlink(s.path("nowhere"), &blocker).unwrap();
+
+    let lock = r.lock().unwrap();
+    let c2 = owner.note("two");
+    let o1 = other.note("hello");
+    r.append(&lock, &[c2.clone(), o1.clone()]).unwrap_err();
+    assert_eq!(fs::read(&segment).unwrap(), before);
+    assert_eq!(r.head(&lock, &owner.id).unwrap().unwrap().seq, 1);
+
+    fs::remove_file(&blocker).unwrap();
+    r.append(&lock, &[c2, o1]).unwrap();
+    assert_eq!(r.head(&lock, &owner.id).unwrap().unwrap().seq, 2);
+    assert_eq!(r.head(&lock, &other.id).unwrap().unwrap().seq, 1);
+    r.verify().unwrap();
+}
+
+/// DESIGN §5: catch-up cannot see segments that fill gaps below an indexed head, so a
+/// merge must leave the rebuild marker, durably, before it writes any segment.
+#[cfg(unix)]
+#[test]
+fn merge_writes_the_rebuild_marker_before_any_segment_and_only_when_it_adds() {
+    let sa = Scratch::new("marker-src");
+    let (a, mut owner, genesis) = new_space(&sa.0);
+    let c2 = owner.note("two");
+    a.append(&a.lock().unwrap(), std::slice::from_ref(&c2)).unwrap();
+
+    let sb = Scratch::new("marker-dst");
+    let b = Replica::create_replica(&sb.0, a.manifest()).unwrap();
+    let lb = b.lock().unwrap();
+    // The segment write fails (see `an_append_that_fails_part_way_is_undone`), yet the
+    // marker is already there.
+    let blocker = b.root().join("log").join(owner.id.as_str());
+    std::os::unix::fs::symlink(sb.path("nowhere"), &blocker).unwrap();
+    b.merge(&lb, &[genesis.clone(), c2.clone()]).unwrap_err();
+    assert!(marker(&sb.0).is_file());
+
+    fs::remove_file(&blocker).unwrap();
+    fs::remove_file(marker(&sb.0)).unwrap();
+    assert_eq!(b.merge(&lb, std::slice::from_ref(&genesis)).unwrap().added, 1);
+    assert!(marker(&sb.0).is_file());
+
+    // Nothing new: nothing written, no marker.
+    fs::remove_file(marker(&sb.0)).unwrap();
+    assert_eq!(b.merge(&lb, std::slice::from_ref(&genesis)).unwrap().skipped_existing, 1);
+    assert!(!marker(&sb.0).exists());
+}
+
+#[test]
+fn import_writes_the_rebuild_marker_when_it_adds_claims_or_blobs() {
+    let s = Scratch::new("import-marker");
+    let (a, owner, claims, blobs) = populated(&s.path("a"));
+    write_bundle(&a, &s.path("claims.knowa"), &meta_for(&a, "shared", &owner.id), &claims, &[]).unwrap();
+    write_bundle(&a, &s.path("all.knowa"), &meta_for(&a, "private", &owner.id), &claims, &blobs).unwrap();
+
+    import_bundle(&s.path("claims.knowa"), &s.path("b")).unwrap();
+    assert!(marker(&s.path("b")).is_file());
+    fs::remove_file(marker(&s.path("b"))).unwrap();
+
+    let (_, _, rep) = import_bundle(&s.path("claims.knowa"), &s.path("b")).unwrap();
+    assert_eq!(rep.added, 0);
+    assert!(!marker(&s.path("b")).exists());
+
+    // Only blobs are new: a text blob changes the full-text documents of claims that
+    // are already indexed, which catch-up never revisits.
+    let (_, _, rep) = import_bundle(&s.path("all.knowa"), &s.path("b")).unwrap();
+    assert_eq!((rep.added, rep.blobs_added), (0, 2));
+    assert!(marker(&s.path("b")).is_file());
+}
+
+/// DESIGN §7.3: the manifest's owner and genesis must be backed by a real genesis
+/// claim, or a bundle can name anyone as the owner of a space.
+#[test]
+fn import_rejects_a_genesis_that_is_not_an_owner_claim() {
+    let s = Scratch::new("fake-genesis");
+    let space = Id::new_space().unwrap();
+    let mut mallory = Author::new(&space);
+    let victim = Author::new(&space);
+    let not_owner_claims = [
+        mallory.note("seq 1, but not a knowa:owner claim"),
+        Author::new(&space).push(Draft::new(space.clone(), Term::parse(OWNER).unwrap(), Value::Ref(victim.id.clone()))),
+    ];
+    for (i, first) in not_owner_claims.into_iter().enumerate() {
+        let manifest =
+            Manifest { format: 1, space: space.clone(), owner: first.body.actor.clone(), genesis: first.id.clone() };
+        let m = Replica::create_replica(&s.path(&format!("m{i}")), &manifest).unwrap();
+        m.merge(&m.lock().unwrap(), std::slice::from_ref(&first)).unwrap();
+        let bundle = s.path(&format!("m{i}.knowa"));
+        write_bundle(&m, &bundle, &meta_for(&m, "private", &first.body.actor), std::slice::from_ref(&first), &[]).unwrap();
+        let err = import_bundle(&bundle, &s.path(&format!("dest{i}"))).err().unwrap();
+        assert_eq!(err.code, ErrorCode::Integrity, "case {i}: {err:?}");
+        assert!(!s.path(&format!("dest{i}")).exists(), "case {i}");
+    }
 }

@@ -7,20 +7,20 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use knowa_model::query::Order;
-use knowa_model::view::EntityWhen;
+use knowa_model::view::{EntityWhen, WhenSource};
 use knowa_model::{ClaimView, EntityView, Error, Id, Result, Timestamp};
 
 /// Merges entity lists from several spaces (in selection order) by id, keeping
 /// first-appearance order: `spaces`, `types` and supporting `claims` are unioned;
-/// `label`, `when` and `where` come from the first space that has them (`distanceKm`
-/// travels with the `where` it was measured from); `score` is the best one.
-pub(crate) fn merge_entities(lists: Vec<Vec<EntityView>>) -> Vec<EntityView> {
+/// `label` and `where` come from the first space that has them (`distanceKm` travels
+/// with the `where` it was measured from); `when` as `merge_when`; `score` is the best.
+pub(crate) fn merge_entities(lists: Vec<Vec<EntityView>>) -> Result<Vec<EntityView>> {
     let mut out: Vec<EntityView> = Vec::new();
     let mut pos: HashMap<Id, usize> = HashMap::new();
     for list in lists {
         for e in list {
             match pos.get(&e.id) {
-                Some(&i) => absorb(&mut out[i], e),
+                Some(&i) => absorb(&mut out[i], e)?,
                 None => {
                     pos.insert(e.id.clone(), out.len());
                     out.push(e);
@@ -28,19 +28,17 @@ pub(crate) fn merge_entities(lists: Vec<Vec<EntityView>>) -> Vec<EntityView> {
             }
         }
     }
-    out
+    Ok(out)
 }
 
-fn absorb(into: &mut EntityView, e: EntityView) {
+fn absorb(into: &mut EntityView, e: EntityView) -> Result<()> {
     union(&mut into.spaces, e.spaces);
     union(&mut into.types, e.types);
     union(&mut into.claims, e.claims);
     if into.label.is_none() {
         into.label = e.label;
     }
-    if into.when.is_none() {
-        into.when = e.when;
-    }
+    into.when = merge_when(into.when.take(), e.when)?;
     if into.where_.is_none() {
         into.where_ = e.where_;
         into.distance_km = e.distance_km;
@@ -49,6 +47,24 @@ fn absorb(into: &mut EntityView, e: EntityView) {
         (Some(a), Some(b)) => Some(a.max(b)),
         (a, b) => a.or(b),
     };
+    Ok(())
+}
+
+/// `first` is from an earlier space in selection order than `later`. A `knowa:when`
+/// (`source: claim`) is evidence and `source: recorded` only the DESIGN §4.8 fallback,
+/// so evidence wins whatever the order. Between two `knowa:when`s the first space wins,
+/// as for the other display fields. Between two fallbacks the earlier time wins: the
+/// fallback is the earliest record time of the entity's claims, and the merged entity
+/// has the claims of both spaces.
+fn merge_when(first: Option<EntityWhen>, later: Option<EntityWhen>) -> Result<Option<EntityWhen>> {
+    Ok(match (first, later) {
+        (Some(a), Some(b)) => Some(match (a.source, b.source) {
+            (WhenSource::Recorded, WhenSource::Claim) => b,
+            (WhenSource::Recorded, WhenSource::Recorded) if when_bounds(&b)?.0 < when_bounds(&a)?.0 => b,
+            _ => a,
+        }),
+        (a, b) => a.or(b),
+    })
 }
 
 fn union<T: PartialEq>(into: &mut Vec<T>, from: Vec<T>) {
@@ -189,7 +205,7 @@ pub(crate) fn sort_claims(items: &mut [ClaimView], sort: ClaimSort) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use knowa_model::view::{EntityWhere, WhenSource};
+    use knowa_model::view::EntityWhere;
     use knowa_model::{ErrorCode, Term};
 
     fn id(s: &str) -> Id {
@@ -231,7 +247,7 @@ mod tests {
         let mut c = ent(E2, S2);
         c.label = Some("other".into());
 
-        let merged = merge_entities(vec![vec![a], vec![c, b]]);
+        let merged = merge_entities(vec![vec![a], vec![c, b]]).unwrap();
         assert_eq!(merged.len(), 2);
         let m = &merged[0];
         assert_eq!(m.id, id(E1));
@@ -249,8 +265,35 @@ mod tests {
         a.label = Some("first".into());
         let mut b = ent(E1, S2);
         b.label = Some("second".into());
-        let merged = merge_entities(vec![vec![a], vec![b]]);
+        let merged = merge_entities(vec![vec![a], vec![b]]).unwrap();
         assert_eq!(merged[0].label.as_deref(), Some("first"));
+    }
+
+    fn recorded(at: i64) -> EntityWhen {
+        EntityWhen { source: WhenSource::Recorded, ..when(Some(at), Some(at + 1)) }
+    }
+
+    fn merged_when(first: Option<EntityWhen>, later: Option<EntityWhen>) -> Option<EntityWhen> {
+        let mut a = ent(E1, S1);
+        a.when = first;
+        let mut b = ent(E1, S2);
+        b.when = later;
+        merge_entities(vec![vec![a], vec![b]]).unwrap().remove(0).when
+    }
+
+    #[test]
+    fn a_when_claim_beats_a_record_time_fallback_in_any_space_order() {
+        let claimed = when(Some(0), Some(100));
+        assert_eq!(merged_when(Some(recorded(5_000)), Some(claimed.clone())), Some(claimed.clone()));
+        assert_eq!(merged_when(Some(claimed.clone()), Some(recorded(5_000))), Some(claimed.clone()));
+        // Two claims: the first space wins, as for the other display fields.
+        let other = when(Some(200), Some(300));
+        assert_eq!(merged_when(Some(other.clone()), Some(claimed.clone())), Some(other));
+        // Two fallbacks: the earliest record time, which is what one space holding
+        // both spaces' claims would report.
+        assert_eq!(merged_when(Some(recorded(9_000)), Some(recorded(5_000))), Some(recorded(5_000)));
+        assert_eq!(merged_when(Some(recorded(5_000)), Some(recorded(9_000))), Some(recorded(5_000)));
+        assert_eq!(merged_when(None, Some(recorded(5_000))), Some(recorded(5_000)));
     }
 
     #[test]

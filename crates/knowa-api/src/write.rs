@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use knowa_config::Actor;
 use knowa_index::Index;
-use knowa_model::query::{WriteItem, WriteResult};
-use knowa_model::{ClaimBody, Draft, Error, Id, Result, Term, Timestamp, Value, vocab};
+use knowa_model::query::{Order, View, Where, WriteItem, WriteResult};
+use knowa_model::{ClaimBody, Draft, Error, Id, Result, Status, Term, Timestamp, Value, vocab};
 use knowa_store::WriteLock;
 
 use crate::select::Space;
@@ -47,6 +47,17 @@ impl<'a> Txn<'a> {
         }
         for (i, d) in drafts.iter().enumerate() {
             d.validate().map_err(|e| at_draft(e, i))?;
+            // DESIGN §4.6: the prelude below is the only writer of actorKind; an explicit
+            // one is an actor relabeling itself (e.g. an agent claiming to be Human).
+            if d.p.as_str() == vocab::ACTOR_KIND {
+                return Err(at_draft(
+                    Error::invalid(format!(
+                        "{} is written by the system (an actor's first write in a space declares its kind); it cannot be drafted",
+                        vocab::ACTOR_KIND
+                    )),
+                    i,
+                ));
+            }
         }
         let minted = mint_placeholders(&drafts)?;
         let resolved = drafts
@@ -56,10 +67,9 @@ impl<'a> Txn<'a> {
             .collect::<Result<Vec<_>>>()?;
 
         // Prelude (DESIGN §4.6): an actor's kind is self-declared by its first claim in
-        // the space. Prepended to the batch, so a caller draft identical to it dedupes
-        // against it like any other within-batch duplicate.
+        // the space, prepended to the batch.
         let kind_draft = actor_kind_draft(actor)?;
-        let needs_prelude = self.index.equivalent(&actor.id, &kind_draft.equiv_key()?)?.is_none();
+        let needs_prelude = !self.has_declared_kind(actor)?;
         let mut entries = Vec::with_capacity(resolved.len() + 1);
         if needs_prelude {
             entries.push(kind_draft);
@@ -126,10 +136,29 @@ impl<'a> Txn<'a> {
     }
 }
 
+impl Txn<'_> {
+    /// Whether the actor already has any `knowa:actorKind` claim here, whatever its
+    /// status: only the first one is effective (DESIGN §4.6), so a rejected or
+    /// retracted first declaration must not be followed by another.
+    fn has_declared_kind(&self, actor: &Actor) -> Result<bool> {
+        let w = Where {
+            s: vec![actor.id.clone()],
+            p: vec![term(vocab::ACTOR_KIND)?],
+            actors: vec![actor.id.clone()],
+            ..Where::default()
+        };
+        let every_status = View {
+            status: vec![Status::Accepted, Status::Proposed, Status::Rejected, Status::Retracted, Status::Superseded],
+            ..View::default()
+        };
+        Ok(!self.index.find_claims(&w, &every_status, Order::Recorded, 1, None)?.items.is_empty())
+    }
+}
+
 /// What to do with one batch entry.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Plan {
-    /// an equivalent, non-retracted claim by the same actor exists: no-op
+    /// an equivalent active (accepted|proposed), non-stale claim by the same actor exists: no-op
     Existing(Id),
     /// duplicate of an earlier entry in this batch (index into the batch)
     SameAs(usize),

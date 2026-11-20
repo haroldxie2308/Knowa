@@ -126,9 +126,10 @@ impl Knowa {
     // ---------- primitives ----------
 
     /// DESIGN §4.4 / §6. Under the replica lock: refuse readonly spaces (`usage`);
-    /// mint ids for placeholders; validate drafts; if this is the actor's first claim in
+    /// mint ids for placeholders; validate drafts (a `knowa:actorKind` draft →
+    /// `invalid`: only the system writes it); if this is the actor's first claim in
     /// the space, prepend a `knowa:actorKind` claim; dedupe via equivalence key (same
-    /// actor, not retracted → `created:false`, nothing appended); seal; append; apply
+    /// actor, active and not stale → `created:false`, nothing appended); seal; append; apply
     /// to the index. All-or-nothing per call.
     pub fn write(&self, sel: &Sel, drafts: Vec<Draft>) -> Result<WriteResult> {
         let space = select::current(&self.home, sel)?;
@@ -162,7 +163,8 @@ impl Knowa {
     /// `unsupported`, `nearId` resolution, `order: distance` without near → `invalid`),
     /// fans out to each selected replica's index, and merges:
     /// - find: entities merged by id (spaces unioned, types unioned, display fields from
-    ///   the first space in selection order), then ordered by the requested order.
+    ///   the first space in selection order, except that a `knowa:when` beats another
+    ///   space's record-time fallback), then ordered by the requested order.
     /// - get / context / path / log as documented in DESIGN §6.2.
     pub fn query(&self, sel: &Sel, doc: QueryDoc) -> Result<QueryResult> {
         query::query(&self.home, sel, doc)
@@ -208,7 +210,9 @@ impl Knowa {
     }
 
     /// Imports into `dir` (default `<home>/replicas/<space-id>`), registers it readonly
-    /// under `alias` (default: the space's label slugified, else the space id).
+    /// under `alias` (default: the space's label slugified, else the space id). A
+    /// registered replica of the same space id with a different owner or genesis →
+    /// `conflict`, before anything is written (DESIGN §7.3).
     pub fn import(&self, bundle: &Path, dir: Option<&Path>, alias: Option<&str>) -> Result<ImportResult> {
         admin::import(&self.home, bundle, dir, alias)
     }
@@ -224,7 +228,8 @@ impl Knowa {
     }
 
     /// Registers an existing replica directory under `alias` (default: the space's label
-    /// slugified, else the directory name). Local config only; writes no claims.
+    /// slugified, else the directory name). Local config only; writes no claims. Same
+    /// identity rule as `import`.
     pub fn space_add(&self, dir: &Path, alias: Option<&str>, readonly: bool) -> Result<SpaceAddResult> {
         admin::space_add(&self.home, dir, alias, readonly)
     }

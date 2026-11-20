@@ -38,7 +38,7 @@ fn selection() -> Value {
         "space": "Writes, blob.put, feed and admin ops act on one space: --space / KNOWA_SPACE (alias or replica path), else the current space (knowa space use). Missing → usage.",
         "actor": "Writes are signed by the selected actor: --actor / KNOWA_ACTOR (actor name), else the current actor (knowa actor use). Missing → usage.",
         "readonly": "Spaces registered readonly (e.g. imported bundles) refuse writes with usage. To annotate someone else's content, write in your own space and refer to their ids.",
-        "querySpaces": "A query document's spaces field: [] (default) = the selected space; [\"*\"] = every registered space (cannot be combined with other entries); otherwise aliases or replica paths. Several replicas of the same space count once (the first wins)."
+        "querySpaces": "A query document's spaces field: [] (default) = the selected space; [\"*\"] = every registered space (cannot be combined with other entries); otherwise aliases or replica paths. Several replicas of the same space count once (the first wins). A space is its id and genesis: selected replicas that share a space id but differ in owner or genesis → conflict."
     })
 }
 
@@ -51,8 +51,8 @@ fn primitives() -> Value {
                 "All-or-nothing: every draft is validated and signed before anything is appended.",
                 "items are in draft order, one per draft.",
                 "Placeholders _:name may stand for an id in s, o.ref, q refs and src (not replaces). Each distinct placeholder becomes one fresh e_ entity id for the whole batch; the mapping is returned.",
-                "Idempotent: a draft whose {s,p,o,q,valid} equals a non-retracted claim of the same actor in the space returns that claim with created:false and appends nothing. A repeated draft within one batch returns the first one's id with created:false.",
-                "The first time an actor writes in a space, a knowa:actorKind claim declaring its kind is prepended automatically (it is not listed in items).",
+                "Idempotent: a draft whose {s,p,o,q,valid} equals an active (accepted or proposed), non-stale claim of the same actor in the space returns that claim with created:false and appends nothing; superseded, rejected, retracted or stale equivalents do not block a new claim. A repeated draft within one batch returns the first one's id with created:false.",
+                "The first time an actor writes in a space, a knowa:actorKind claim declaring its kind is prepended automatically (it is not listed in items). Only the system writes knowa:actorKind: a draft with that predicate → invalid.",
                 "The system assigns v, space, actor, seq, prev, at, id and sig."
             ]
         },
@@ -103,15 +103,15 @@ fn admin() -> Value {
         },
         "export": {
             "args": {"out": "bundle file", "level": "knowa:Private (everything) | knowa:Shared | knowa:Public"},
-            "does": "Writes a tar bundle (bundle.json, log segments, blobs). Below private it contains the claims whose effective visibility (claim's own, else its subject's, else the space default) is at least the level, all policy claims, and the blobs they reference; such bundles are partial.",
+            "does": "Writes a tar bundle (bundle.json, log segments, blobs). Below private it contains: non-policy claims whose effective visibility (claim's own, else its subject's, else the space default) is at least the level; trust claims (owner, role, autoAccept, actorKind, defaultVisibility) always, so their notes are effectively public; review/retract claims whose target is exported; no visibility claims. Blob bytes are included only when the blob's own effective visibility is at least the level. Such bundles are partial.",
             "out": {"path": "absolute path", "level": "visibility term", "partial": "bool", "claims": "count", "blobs": "count"}
         },
         "import": {
             "args": {"bundle": "bundle file", "dir": "replica directory, default <home>/replicas/<space-id>", "alias": "default: the space label slugified, else the space id"},
-            "does": "Verifies every signature, blob hash and chain run, merges into the replica (creating it), rebuilds its index and registers it readonly. Importing into a directory registered as a writable space → conflict.",
+            "does": "Verifies every signature, blob hash and chain run, and that the genesis is a knowa:owner claim by the owner, merges into the replica (creating it), reindexes it and registers it readonly. Importing into a directory registered as a writable space → conflict. A space is its id and genesis: if a registered replica of the same space id has a different owner or genesis → conflict, and nothing is written (space add applies the same rule).",
             "out": {"space": "s_…", "path": "absolute path", "alias": "string", "added": "claims added", "skippedExisting": "claims already present", "blobsAdded": "count", "gaps": "number of missing seq runs (partial bundles)"}
         },
-        "verify": {"does": "Checks every claim (id, signature, space, chain within contiguous runs, unique seq), every blob hash and the genesis. Problems → integrity with the list in detail.", "out": {"claims": "count", "blobs": "count", "actors": "count", "gaps": "[[actor, first missing seq, last missing seq]]", "problems": "[]"}},
+        "verify": {"does": "Takes the space's write lock (which first truncates a torn final line left by a crashed append), then checks every claim (id, signature, space, chain within contiguous runs, unique seq), every blob hash and the genesis. Problems → integrity with the list in detail.", "out": {"claims": "count", "blobs": "count", "actors": "count", "gaps": "[[actor, first missing seq, last missing seq]]", "problems": "[]"}},
         "reindex": {"does": "Deletes and rebuilds the space's index from its logs; outstanding feed cursors expire.", "out": "the new index epoch"},
         "schema": {"does": "Prints this document."}
     })
