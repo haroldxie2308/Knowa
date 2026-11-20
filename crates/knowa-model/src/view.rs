@@ -46,6 +46,19 @@ pub enum Role {
     Viewer,
 }
 
+impl Role {
+    /// The kernel term for this role (DESIGN §4.6).
+    pub fn as_term(self) -> &'static str {
+        match self {
+            Role::Owner => crate::vocab::ROLE_OWNER,
+            Role::Member => crate::vocab::ROLE_MEMBER,
+            Role::Agent => crate::vocab::ROLE_AGENT,
+            Role::Worker => crate::vocab::ROLE_WORKER,
+            Role::Viewer => crate::vocab::ROLE_VIEWER,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ActorKind {
     #[serde(rename = "knowa:Human")]
@@ -54,6 +67,17 @@ pub enum ActorKind {
     Agent,
     #[serde(rename = "knowa:Worker")]
     Worker,
+}
+
+impl ActorKind {
+    /// The kernel term for this kind (DESIGN §4.6).
+    pub fn as_term(self) -> &'static str {
+        match self {
+            ActorKind::Human => crate::vocab::KIND_HUMAN,
+            ActorKind::Agent => crate::vocab::KIND_AGENT,
+            ActorKind::Worker => crate::vocab::KIND_WORKER,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
