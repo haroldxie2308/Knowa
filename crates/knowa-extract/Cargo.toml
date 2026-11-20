@@ -1,0 +1,11 @@
+[package]
+name = "knowa-extract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+infer = "0.22.0"
+kamadak-exif = "0.6.2"
+knowa-model = { version = "0.1.0", path = "../knowa-model" }
