@@ -236,6 +236,9 @@ pub struct LogDoc {
     pub cursor: Option<String>,
 }
 
+// Deserialized/serialized once per request; boxing variants would complicate the public API
+// for no measurable gain.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum QueryDoc {
@@ -262,6 +265,9 @@ pub struct FindResult {
     pub cursor: Option<String>,
 }
 
+// Deserialized/serialized once per request; boxing variants would complicate the public API
+// for no measurable gain.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum GetItem {
@@ -324,6 +330,9 @@ pub struct LogResult {
     pub cursor: Option<String>,
 }
 
+// Deserialized/serialized once per request; boxing variants would complicate the public API
+// for no measurable gain.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum QueryResult {
