@@ -398,6 +398,7 @@ Global flags (each with an env override) are `--home` (`KNOWA_HOME`, default `~/
 | `worker run <actor-name> --cmd "<exe args>" [--batch N] [--follow]` | feed → external command → write |
 | `export <file.knowa> [--level private\|shared\|public]` · `import <file.knowa> [--alias]` | bundles |
 | `verify` · `reindex` · `schema` | admin |
+| `serve [--port N]` | the local web UI (§7.4) |
 
 ### 7.1 Workers *(v0)*
 
@@ -428,6 +429,60 @@ Text blobs (`text/*`, ≤ 1 MiB) are indexed for full-text search directly from 
 - `import` verifies every signature, blob hash and chain run, then merges into a replica directory (creating it if needed), registers it read-only, and reindexes.
 - Readonly replicas refuse local writes. To annotate someone else's content, write in **your** space and refer to their ids.
 
+### 7.4 Web UI *(experimental)*
+
+> **Experimental** until it has been used in a browser by its owner: views and endpoints may change. The HTTP API is the five primitives' documents over HTTP; it adds no new semantics.
+
+`knowa serve [--port N]` runs a web UI over the home directory's spaces, for this machine only.
+
+- **Local only.**
+  - The server binds `127.0.0.1`. The default port is 4747; `--port 0` picks a free one.
+  - It prints its URL with a random 256-bit token in the fragment: `http://127.0.0.1:<port>/#k=<token>`. The app sends the token as `Authorization: Bearer <token>` on every API call. A fragment is never sent to a server, so the token does not appear in request logs.
+  - An `/api/` request without the right token gets 401.
+  - A request whose `Host` is not `127.0.0.1:<port>` or `localhost:<port>` gets 403, which defeats DNS rebinding.
+  - The server sends no CORS headers.
+  - It serves nothing from disk except its embedded assets and blob bytes by id.
+- **API.** JSON in and out, with the same documents as `--json`. An error is the §6.3 error object, with an HTTP status by code:
+
+  | Code | HTTP status |
+  |---|---|
+  | `usage`, `invalid` | 400 |
+  | `not_found` | 404 |
+  | `conflict` | 409 |
+  | `cursor_expired` | 410 |
+  | `unsupported` | 422 |
+  | `integrity`, `internal` | 500 |
+
+  | Endpoint | Maps to |
+  |---|---|
+  | `GET /api/schema` | `schema` |
+  | `GET /api/spaces` | the registry: `[{alias, space, readonly, current}]` |
+  | `POST /api/query` | **query** (a query document) |
+  | `GET /api/feed?space=&cursor=&limit=` | **feed** |
+  | `GET /api/blob/<b_…>` | **blob.get** |
+  | `POST /api/review` `{"space"?, "decision":"accept"\|"reject", "claims":["c_…"], "note"?}` | `review` with explicit claims only: the UI reviews exactly the claims it shows. It is the only write, and it is signed by the serving actor (`--actor` / `KNOWA_ACTOR`). Without one, the UI is read-only, and this endpoint is a `usage` error naming the variable to set |
+
+- **Blob bytes are untrusted content**, because a blob can be HTML or SVG with scripts. Every blob response carries:
+  - `Content-Security-Policy: sandbox; default-src 'none'; img-src 'self'; style-src 'unsafe-inline'`;
+  - `X-Content-Type-Options: nosniff`;
+  - a `Content-Type` chosen as follows: the accepted `knowa:mediaType` when it is `image/jpeg`, `image/png`, `image/gif`, `image/webp`, `image/avif` or `text/plain` (sent as `text/plain; charset=utf-8`); otherwise `application/octet-stream` with `Content-Disposition: attachment`.
+
+  SVG and HTML are never rendered inline.
+- **The app** is embedded in the binary: plain HTML, CSS and JavaScript modules, with no build step and no third-party code. It makes no request outside its own origin: no web fonts, CDNs, analytics or map tiles. It works offline and leaks nothing.
+- **Views:**
+  - **Search.** Free text, type and not-type filters, and the view (statuses; actor kinds). It returns entities.
+  - **Entity**, built on the `context` op:
+    - label, types, `when` with its source, and `where`;
+    - its claims, grouped by predicate. Each claim shows status, stale, author and author kind, `via`, `conf` and `note`, and links to its `src`;
+    - inbound claims, neighbors, and temporal neighbors;
+    - a blob entity also shows its image, or text up to 1 MiB.
+
+    Provenance is part of every claim, not a separate page.
+  - **Timeline.** Entities by `when`, grouped by period. A visible toggle hides files (`notType: knowa:File`).
+  - **Gallery.** `knowa:Photo` entities as a grid, ordered by `when`.
+  - **Review.** Proposed claims, grouped by author, then by `via.session` (or by record day when there is none), then by subject. Each group shows its claims in full. Accept all and Reject all act on exactly those claims, and each claim can also be reviewed on its own.
+  - Map and graph views are *(later)*. A map needs tiles from a third party, which would leak locations.
+
 ## 8. Implementation (invisible) *(v0)*
 
 - Rust (edition 2024), single static binary `knowa`. Every public API is synchronous. The object-store backend runs its client on a private current-thread tokio runtime and blocks on it; no async type crosses a crate boundary.
@@ -441,6 +496,7 @@ Text blobs (`text/*`, ≤ 1 MiB) are indexed for full-text search directly from 
 | `knowa-extract` | media sniffing, EXIF, the extractor registry | infer, kamadak-exif |
 | `knowa-config` | home: actor keys, space registry | — |
 | `knowa-api` | the five primitives and the admin ops. Composes store + index + extract across spaces: fan-out, merge, context, path | — |
+| `knowa-web` | the local web UI (§7.4): HTTP server, routes over the primitives, the embedded app | tiny_http |
 | `knowa-cli` | the `knowa` binary: argument parsing and rendering only | clap |
 
 - The index is one SQLite file per replica per machine, kept under the home directory (§5.2). Multi-space queries fan out to each replica's index and merge in `knowa-api`.
@@ -457,7 +513,7 @@ Text blobs (`text/*`, ≤ 1 MiB) are indexed for full-text search directly from 
   - capability-based sharing (UCAN/Meadowcap-style)
   - encryption per collection, and crypto-shredding for real deletion
   - an MCP server
-  - a web UI with graph, timeline, map, gallery and provenance views
+  - map and graph views in the web UI (§7.4)
   - GPX and Takeout connectors
   - PDF/OCR/ASR extractors
   - LLM summary and insight workers

@@ -7,7 +7,7 @@ Knowa is a universal, local-first and distributable knowledge-base format, plus 
 ## Stack
 
 - Rust, edition 2024. Public APIs are sync only. tokio exists solely inside `knowa-store`'s object-store backend, on a private runtime (DESIGN §8). Cargo workspace in `crates/*`.
-- Crate boundaries and dependencies: DESIGN §8. The dependency direction is `model ← store ← index ← api ← cli`. `extract` and `config` depend only on `model`.
+- Crate boundaries and dependencies: DESIGN §8. The dependency direction is `model ← store ← index ← api ← web ← cli`. `extract` and `config` depend only on `model`.
 - The only SQLite is `rusqlite` with the bundled feature (FTS5 and rtree available).
 
 ## Commands
