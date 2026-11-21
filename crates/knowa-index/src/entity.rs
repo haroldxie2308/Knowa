@@ -76,10 +76,16 @@ pub(crate) struct Summary {
 pub(crate) fn summarize(mut evidence: Vec<Evidence>) -> Summary {
     display_sort(&mut evidence);
     let mut supporting: Vec<&str> = Vec::new();
-    let label = evidence.iter().find_map(|a| match &a.o {
-        Value::Text { text, .. } if a.p == vocab::LABEL => Some((text.clone(), a.id.as_str())),
-        _ => None,
-    });
+    // The display-chosen text value of `p`.
+    let shown_text = |p: &str| {
+        evidence.iter().find_map(|a| match &a.o {
+            Value::Text { text, .. } if a.p == p => Some((text.clone(), a.id.as_str())),
+            _ => None,
+        })
+    };
+    // label (§4.7): knowa:label, else knowa:name, so a file shows the name it was added
+    // under until someone labels it
+    let label = shown_text(vocab::LABEL).or_else(|| shown_text(vocab::NAME));
     if let Some((_, id)) = &label {
         supporting.push(id);
     }
@@ -95,7 +101,10 @@ pub(crate) fn summarize(mut evidence: Vec<Evidence>) -> Summary {
     }
 
     // when, first match wins (§4.8): the display-chosen knowa:when; else the chosen
-    // knowa:modified; else the earliest record time.
+    // knowa:modified; else, for a knowa:Note only, the earliest record time; else none.
+    // Record time is world time only for notes: other entities are recorded when an
+    // actor learns of them, not when they happen.
+    let is_note = types.iter().any(|t| t == vocab::T_NOTE);
     let earliest = evidence.iter().min_by(|a, b| a.at.cmp(&b.at).then(a.id.cmp(&b.id)));
     let claimed = evidence.iter().find_map(|a| match &a.o {
         Value::When(w) if a.p == vocab::WHEN => Some((w, a.id.as_str())),
@@ -116,7 +125,7 @@ pub(crate) fn summarize(mut evidence: Vec<Evidence>) -> Summary {
     } else if let Some((a, w)) = modified {
         supporting.push(&a.id);
         Some(WhenSummary { value: w.raw.clone(), lo: w.lo, hi: w.hi, source: WhenSource::File, key: when_key(w) })
-    } else if let Some(e) = earliest {
+    } else if is_note && let Some(e) = earliest {
         supporting.push(&e.id);
         Some(WhenSummary { value: Timestamp(e.at).format(), lo: Some(e.at), hi: Some(e.at + 1), source: WhenSource::Recorded, key: Some(e.at) })
     } else {

@@ -243,9 +243,53 @@ fn agent_claim_is_pending_until_the_owner_accepts_it() {
     assert_eq!(item["status"], "proposed");
     assert_eq!(item["via"]["model"], "test");
 
-    alice.ok(&["review", &c, "accept", "--note", "looks right"]);
+    alice.ok(&["review", "accept", &c, "--note", "looks right"]);
     assert_eq!(show_claim(&alice, &c)["status"], "accepted");
     assert!(!ids(&alice.ok(&["pending"])["items"]).contains(&c));
+}
+
+#[test]
+fn review_by_author_accepts_every_pending_claim_of_theirs_at_once() {
+    let sb = Sandbox::new("bulk-review");
+    let alice = setup(&sb);
+    alice.ok(&["actor", "new", "bot", "--kind", "agent"]);
+    alice.ok(&["actor", "new", "bot2", "--kind", "agent"]);
+    let e = note(&alice, &["planning meeting"]);
+    let b1 = last_id(&alice.as_actor("bot").ok(&["assert", &e, "ex:topic", "text:roadmap"]));
+    let b2 = last_id(&alice.as_actor("bot").ok(&["assert", &e, "ex:topic", "text:budget"]));
+    let other = last_id(&alice.as_actor("bot2").ok(&["assert", &e, "ex:topic", "text:hiring"]));
+
+    // pending takes the same selectors: a preview of what review will select
+    let by_bot = ids(&alice.ok(&["pending", "--by", "bot"])["items"]);
+    assert!(by_bot.contains(&b1) && by_bot.contains(&b2) && !by_bot.contains(&other), "{by_bot:?}");
+    let by_id = ids(&alice.ok(&["pending", "--by", &actor_id(&alice, "bot")])["items"]);
+    assert_eq!(by_id, by_bot, "an actor id selects what its local name does");
+    assert!(ids(&alice.ok(&["pending"])["items"]).contains(&other));
+
+    let w = alice.ok(&["review", "accept", "--by", "bot", "--note", "checked"]);
+    let items = w["items"].as_array().unwrap();
+    assert_eq!(items.len(), by_bot.len(), "one review per selected claim: {w}");
+    assert!(items.iter().all(|i| i["created"] == true && i["status"] == "accepted"), "{w}");
+    assert_eq!((show_claim(&alice, &b1)["status"].clone(), show_claim(&alice, &b2)["status"].clone()), (json!("accepted"), json!("accepted")));
+    assert_eq!(show_claim(&alice, &other)["status"], "proposed", "another author's claim");
+    assert!(ids(&alice.ok(&["pending", "--by", "bot"])["items"]).is_empty());
+
+    // text output counts what was written and what was already there
+    let out = alice.run(&["review", "accept", &b1, &b2], None);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(text.trim(), "reviews: 0 written, 2 already present");
+}
+
+#[test]
+fn review_needs_a_claim_or_a_selector() {
+    let sb = Sandbox::new("review-usage");
+    let alice = setup(&sb);
+    let (code, err) = alice.fail(&["review", "accept"]);
+    assert_eq!((code, &err["error"]["code"]), (2, &json!("usage")), "{err}");
+    let (code, err) = alice.fail(&["review", "accept", "--by", "nobody"]);
+    assert_eq!((code, &err["error"]["code"]), (3, &json!("not_found")), "{err}");
+    assert!(err["error"]["message"].as_str().unwrap().contains("nobody"), "{err}");
 }
 
 #[test]

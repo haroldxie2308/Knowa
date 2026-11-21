@@ -6,8 +6,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use knowa_config::Home;
-use knowa_model::query::{BlobPutResult, FeedResult, QueryDoc, QueryResult, WriteResult};
-use knowa_model::{Draft, Error, ErrorCode, Id, IdKind, Result, Visibility};
+use knowa_model::query::{BlobPutResult, FeedResult, QueryDoc, QueryResult, Where, WriteResult};
+use knowa_model::{Draft, Error, ErrorCode, Id, IdKind, Result, Visibility, vocab};
 use serde::Serialize;
 
 mod admin;
@@ -17,6 +17,7 @@ mod ingest;
 mod merge;
 mod path;
 mod query;
+mod review;
 mod schema;
 mod select;
 #[cfg(test)]
@@ -100,6 +101,22 @@ pub const SKIPPED_EXIT: i32 = 9;
 /// An error code in a result document as its contract string (DESIGN §6.3).
 fn error_code<S: serde::Serializer>(code: &ErrorCode, s: S) -> std::result::Result<S::Ok, S::Error> {
     s.serialize_str(code.as_str())
+}
+
+/// The verdict a `review` writes (DESIGN §4.6 `knowa:review`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewDecision {
+    Accept,
+    Reject,
+}
+
+impl ReviewDecision {
+    fn term(self) -> &'static str {
+        match self {
+            ReviewDecision::Accept => vocab::REVIEW_ACCEPT,
+            ReviewDecision::Reject => vocab::REVIEW_REJECT,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -244,6 +261,18 @@ impl Knowa {
     /// Failures of the replica, the lock, the index or the claim writes stop the run.
     pub fn put(&self, sel: &Sel, paths: &[PathBuf], opts: PutOptions) -> Result<PutResult> {
         ingest::put(&self.home, sel, paths, opts)
+    }
+
+    /// DESIGN §7 `review`: writes one `knowa:review` with `decision` (and `note`) per
+    /// target, all in ONE `write`. Targets are `claims` in the given order, then every
+    /// **proposed** claim of the current space (the one the write goes to) matching
+    /// `select`, oldest first; duplicates keep their first position. Neither claims nor
+    /// a selector → `usage`, and so is an empty selector: there is no "review
+    /// everything". An id in `claims` that is not a claim id → `invalid`. No target
+    /// left → an empty result, nothing written. A review equal to an active one by the
+    /// same actor is not written again (`created:false`), by `write`'s equivalence rule.
+    pub fn review(&self, sel: &Sel, claims: &[Id], select: Option<Where>, decision: ReviewDecision, note: Option<String>) -> Result<WriteResult> {
+        review::review(self, sel, claims, select, decision, note)
     }
 
     /// Runs built-in extractors on blobs that lack their output (`all` = re-run every

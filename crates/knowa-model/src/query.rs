@@ -96,6 +96,10 @@ pub struct Where {
     /// entity has `knowa:type` with any of these
     #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "type")]
     pub type_: Vec<Term>,
+    /// entity has `knowa:type` with none of these; an entity without a type is kept.
+    /// Like `type`, only type claims passing the view count
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_type: Vec<Term>,
     /// full-text query (FTS syntax is NOT exposed: the string is tokenized and
     /// all tokens must match, prefix-matching the last token)
     #[serde(default, skip_serializing_if = "Option::is_none")]

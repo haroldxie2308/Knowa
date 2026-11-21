@@ -88,6 +88,20 @@ fn admin() -> Value {
             "does": "Directories are walked recursively; names starting with . are not walked and symlinks met during a walk are not followed (explicitly named paths are). Per file: blob.put, then knowa:name, knowa:source (absolute path), knowa:modified and knowa:created (when the OS reports one; whole seconds UTC) on the blob by the selected actor, then the built-in extractors, written by the extract actor with via.worker = <extractor>. A file's own failure skips that file, not the run: one whose size or modification time changed while being stored (conflict), that vanished (not_found), that cannot be read, or whose name is not UTF-8 or that is no longer a regular file (invalid) goes to skipped, the other files are still added, and the process exits 9. Failures of the replica itself (integrity, the lock, writing the space) stop the run; files already added stay, and a rerun is idempotent. Evicted files (macOS dataless: contents left in the cloud) are not read, because reading one downloads it: each is skipped as unsupported, unless downloadEvicted is set, which reads it so the OS downloads it and then takes its times. Extractor failures, and file times with no EDTF form, are reported per file and do not stop the run. With noStore each file is hashed in place and gets the same claims, extractors included (they read the source file, and the size and modification time check runs after them), but its bytes are not copied: blob.get is not_found for it, extract skips it, and a later put without noStore stores the bytes under the same id.",
             "out": {"items": [{"path": "absolute path", "blob": "b_…", "created": "bool", "stored": "bool: the replica holds the file's bytes after this item (always true without noStore; with noStore true only if an earlier put stored them)", "size": "bytes", "claims": "ids of the claims recording this file (including existing ones matched idempotently)", "errors": "per-file problems that did not stop the run: \"<worker>: <message>\" per failed extractor, or a file time with no EDTF form"}], "skipped": [{"path": "absolute path", "code": "error code of the file's own failure: conflict, not_found, invalid, unsupported (evicted), internal (another I/O failure reading it)", "message": "that failure's message"}]}
         },
+        "review": {
+            "args": {
+                "decision": "accept | reject",
+                "claims": "c_…[] to review (optional)",
+                "by": "author filter: a_… ids or local actor names (selector, where.actors)",
+                "about": "subject ids (selector, where.s)",
+                "p": "predicate terms (selector, where.p)",
+                "since": "RFC 3339 record-time lower bound, inclusive (selector, where.recordedAfter)",
+                "until": "RFC 3339 record-time upper bound, exclusive (selector, where.recordedBefore)",
+                "note": "rationale, written on every review"
+            },
+            "does": "Writes one knowa:review (knowa:Accept or knowa:Reject) per target, all in one write by the selected actor. Targets are the listed claims plus, when any selector is given, every proposed claim in the current space matching all selectors, oldest first; duplicates count once. Neither a claim nor a selector → usage: there is no review of everything. Preview a selection with pending and the same selectors. A review equal to an active one the actor already wrote is not written again (created:false); no target left → nothing is written.",
+            "out": "as write: {items: [{id, created, status}], placeholders: {}}, one item per target"
+        },
         "extract": {
             "args": {"all": "re-run every extractor on every blob (idempotent)"},
             "does": "Runs the built-in extractors on stored blobs that have no claim from them yet.",
@@ -270,6 +284,7 @@ fn find_op() -> Value {
                 "fields": {
                     "ids": "id[]", "s": "subject id[]", "p": "predicate term[]", "o": "value (exact match)",
                     "type": "term[]: entity has knowa:type with any of these",
+                    "notType": "term[]: entity has knowa:type with none of these; an entity without a type is kept. Like type, only type claims passing the view count, and it applies wherever type does",
                     "text": "free text; tokens all match, the last token as a prefix (no FTS syntax)",
                     "when": "{from?: EDTF, to?: EDTF}: entity when overlaps [from.lo, to.hi)",
                     "near": "{lat, lon, km} decimal strings",
@@ -302,8 +317,8 @@ fn find_op() -> Value {
 fn results() -> Value {
     json!({
         "EntityView": {
-            "id": "id", "spaces": "s_…[] that describe it", "label": "display label (omitted if none)", "types": "term[]",
-            "when": "{value: EDTF as written or the record timestamp, from: timestamp|null, to: timestamp|null (half-open, null = open), source: claim|file|recorded}; file means no knowa:when exists and the display-chosen knowa:modified stands in; recorded means neither exists and the earliest record time of its claims stands in",
+            "id": "id", "spaces": "s_…[] that describe it", "label": "display label: the display-chosen knowa:label, else the display-chosen knowa:name (omitted if neither)", "types": "term[]",
+            "when": "{value: EDTF as written or the record timestamp, from: timestamp|null, to: timestamp|null (half-open, null = open), source: claim|file|recorded}; file means no knowa:when exists and the display-chosen knowa:modified stands in; recorded means neither exists, the entity is a knowa:Note and the earliest record time of its claims stands in. Any other entity without a knowa:when or knowa:modified has no when: it is not on the timeline and matches no when filter",
             "where": "{lat, lon, r?} numbers", "score": "text relevance (find with text)", "distanceKm": "distance (near queries)",
             "claims": "ids of the claims that supplied label, types, when and where",
             "displayRule": "Display fields use claims with status accepted or proposed regardless of the query view (accepted before proposed, then latest at); the view decides which entities match."

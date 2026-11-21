@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use knowa_api::ReviewDecision;
 use knowa_model::query::DEFAULT_LIMIT;
 use knowa_model::{ActorKind, Status, Visibility, vocab};
 
@@ -69,7 +70,7 @@ pub enum Cmd {
     Assert(AssertArgs),
     /// Retract a claim
     Retract(RetractArgs),
-    /// Accept or reject a claim
+    /// Accept or reject claims: listed ones and/or proposed ones matching selectors
     Review(ReviewArgs),
     /// Give an actor a role in the current space
     Grant(GrantArgs),
@@ -271,11 +272,46 @@ pub struct RetractArgs {
     pub note: Option<String>,
 }
 
+/// Selectors over claims, shared by `review` and `pending`; every given one must match.
 #[derive(Debug, Args)]
+pub struct ClaimSelect {
+    /// Author: an actor id (`a_…`) or a local actor name
+    #[arg(long, num_args = 1.., value_name = "A")]
+    pub by: Vec<String>,
+    /// Subject id
+    #[arg(long, num_args = 1.., value_name = "ID")]
+    pub about: Vec<String>,
+    /// Predicate term (`ns:name`)
+    #[arg(long, num_args = 1.., value_name = "TERM")]
+    pub p: Vec<String>,
+    /// Record-time lower bound (RFC 3339, inclusive)
+    #[arg(long, value_name = "RFC3339")]
+    pub since: Option<String>,
+    /// Record-time upper bound (RFC 3339, exclusive)
+    #[arg(long, value_name = "RFC3339")]
+    pub until: Option<String>,
+}
+
+impl ClaimSelect {
+    pub fn is_given(&self) -> bool {
+        !self.by.is_empty() || !self.about.is_empty() || !self.p.is_empty() || self.since.is_some() || self.until.is_some()
+    }
+}
+
+#[derive(Debug, Args)]
+#[command(after_help = "Targets are the listed claims plus, when any selector is given, every proposed \
+                        claim in the current space matching all selectors. Naming neither is a usage \
+                        error. Preview a selection with `pending` and the same selectors.")]
 pub struct ReviewArgs {
-    pub claim: String,
+    /// The verdict written on every target
     #[arg(value_enum)]
     pub decision: Decision,
+    /// Claim ids to review
+    #[arg(value_name = "CLAIM")]
+    pub claims: Vec<String>,
+    #[command(flatten)]
+    pub select: ClaimSelect,
+    /// Rationale, written on every review
     #[arg(long)]
     pub note: Option<String>,
 }
@@ -301,9 +337,14 @@ pub struct ShareArgs {
 #[derive(Debug, Args)]
 pub struct PendingArgs {
     #[command(flatten)]
+    pub select: ClaimSelect,
+    #[command(flatten)]
     pub spaces: SpacesArg,
     #[arg(long)]
     pub limit: Option<u32>,
+    /// Continue a previous single-space listing
+    #[arg(long)]
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -313,6 +354,9 @@ pub struct SearchArgs {
     /// Only entities with any of these `knowa:type` terms
     #[arg(long = "type", num_args = 1.., value_name = "TERM")]
     pub types: Vec<String>,
+    /// Leave out entities with any of these `knowa:type` terms
+    #[arg(long = "not-type", num_args = 1.., value_name = "TERM")]
+    pub not_types: Vec<String>,
     /// World-time lower bound (EDTF)
     #[arg(long)]
     pub from: Option<String>,
@@ -353,10 +397,16 @@ pub struct TimelineArgs {
     pub to: Option<String>,
     #[arg(long = "type", num_args = 1.., value_name = "TERM")]
     pub types: Vec<String>,
+    /// Leave out entities with any of these `knowa:type` terms
+    #[arg(long = "not-type", num_args = 1.., value_name = "TERM")]
+    pub not_types: Vec<String>,
     #[command(flatten)]
     pub spaces: SpacesArg,
     #[arg(long)]
     pub limit: Option<u32>,
+    /// Continue a previous single-space timeline
+    #[arg(long)]
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -514,10 +564,10 @@ pub enum Decision {
 }
 
 impl Decision {
-    pub fn term(self) -> &'static str {
+    pub fn decision(self) -> ReviewDecision {
         match self {
-            Decision::Accept => vocab::REVIEW_ACCEPT,
-            Decision::Reject => vocab::REVIEW_REJECT,
+            Decision::Accept => ReviewDecision::Accept,
+            Decision::Reject => ReviewDecision::Reject,
         }
     }
 }

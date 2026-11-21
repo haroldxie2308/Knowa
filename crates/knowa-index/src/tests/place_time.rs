@@ -118,7 +118,7 @@ fn reversed_when_range_is_invalid() {
 }
 
 #[test]
-fn recorded_fallback_when_and_ordering() {
+fn recorded_fallback_dates_a_note_and_orders_it() {
     let mut w = World::new(1);
     let dir = TempDir::new();
     let mut idx = w.index(&dir);
@@ -129,9 +129,10 @@ fn recorded_fallback_when_and_ordering() {
     let at = w.clock;
     let n1 = w.label(G, &note, "a note");
     let n2 = w.label(G, &note, "renamed note");
+    let typ = w.say(G, &note, vocab::TYPE, term(vocab::T_NOTE));
     let c_old = w.say(G, &old, vocab::WHEN, when("1999"));
     let c_new = w.say(G, &new, vocab::WHEN, when("2030"));
-    apply(&mut idx, &[&g, &n2, &n1, &c_old, &c_new]);
+    apply(&mut idx, &[&g, &n2, &n1, &typ, &c_old, &c_new]);
 
     let e = idx.entity(&note, &View::default()).unwrap().unwrap();
     let when = e.when.unwrap();
@@ -145,10 +146,68 @@ fn recorded_fallback_when_and_ordering() {
     assert_eq!(ids(&idx, &Where::default(), Order::Relevance), vec![new, note, old], "relevance without text = -when");
 }
 
+// ---- §4.8 rules 3 and 4: record time dates notes only ----
+
+#[test]
+fn record_time_dates_a_note_and_no_other_entity() {
+    const AGENT: usize = 1;
+    let mut w = World::new(2);
+    let dir = TempDir::new();
+    let mut idx = w.index(&dir);
+    let g = w.genesis();
+    // what an agent creates while reading, with no stated time: a concept, a person
+    let concept = ent();
+    let person = ent();
+    let c1 = w.label(AGENT, &concept, "Project Phoenix");
+    let c2 = w.say(AGENT, &concept, vocab::SUMMARY, text("a codename from the minutes"));
+    let p1 = w.say(AGENT, &person, vocab::TYPE, term(vocab::T_PERSON));
+    let p2 = w.label(AGENT, &person, "Ada");
+    let note = ent();
+    let note_at = w.clock;
+    let n1 = w.say(AGENT, &note, vocab::BODY, text("call Ada about Phoenix"));
+    let n2 = w.say(AGENT, &note, vocab::TYPE, term(vocab::T_NOTE));
+    apply(&mut idx, &[&g, &c1, &c2, &p1, &p2, &n1, &n2]);
+    assert_eq!(status(&idx, &n2), knowa_model::Status::Proposed);
+
+    let shown = |id: &Id| idx.entity(id, &View::default()).unwrap().unwrap();
+    assert_eq!(shown(&concept).when, None, "untyped");
+    assert_eq!(shown(&person).when, None, "a person is not a note");
+    let n = shown(&note);
+    let when = n.when.unwrap();
+    assert_eq!((when.source, when.value), (WhenSource::Recorded, knowa_model::Timestamp(note_at).format()));
+    assert!(n.claims.contains(&n1.id), "the earliest claim supports when");
+
+    // every claim above was recorded in 2023
+    let in_2023 = when_filter(Some("2023"), Some("2023"));
+    assert_eq!(ids(&idx, &in_2023, Order::When), vec![note.clone()], "only the note is on the timeline");
+    assert_eq!(ids(&idx, &Where::default(), Order::When)[0], note, "undated entities sort after dated ones");
+    super::evidence::assert_routes_agree(&idx, &[Where::default(), in_2023], "record time dates notes only");
+}
+
+#[test]
+fn a_note_type_that_does_not_pass_the_view_does_not_date_the_entity() {
+    const AGENT: usize = 1;
+    let mut w = World::new(2);
+    let dir = TempDir::new();
+    let mut idx = w.index(&dir);
+    let g = w.genesis();
+    let e = ent();
+    let body = w.say(G, &e, vocab::BODY, text("met Ada"));
+    let typ = w.say(AGENT, &e, vocab::TYPE, term(vocab::T_NOTE));
+    apply(&mut idx, &[&g, &body, &typ]);
+
+    let when = idx.entity(&e, &View::default()).unwrap().unwrap().when.unwrap();
+    assert_eq!((when.source, when.value), (WhenSource::Recorded, body.body.at.format()));
+    let owner_only = View { actors: vec![w.owner()], ..View::default() };
+    assert_eq!(idx.entity(&e, &owner_only).unwrap().unwrap().when, None, "in this view it is not a note");
+    let in_2023 = when_filter(Some("2023"), Some("2023"));
+    assert!(idx.find_entities(&in_2023, &owner_only, Order::When, 10, None).unwrap().items.is_empty());
+}
+
 // ---- §4.8 rule 2: the file time (knowa:modified) ----
 
 #[test]
-fn a_when_claim_beats_a_file_time_which_beats_record_time() {
+fn a_when_claim_beats_a_file_time_and_record_time_does_not_date_a_file() {
     let mut w = World::new(1);
     let dir = TempDir::new();
     let mut idx = w.index(&dir);
@@ -157,7 +216,7 @@ fn a_when_claim_beats_a_file_time_which_beats_record_time() {
     let name = w.say(G, &blob, vocab::NAME, text("report.pdf"));
     apply(&mut idx, &[&g, &name]);
     let shown = |idx: &crate::Index, id: &Id| idx.entity(id, &View::default()).unwrap().unwrap();
-    assert_eq!(shown(&idx, &blob).when.unwrap().source, WhenSource::Recorded);
+    assert_eq!(shown(&idx, &blob).when, None, "a file is not a note: when it was added is not when it was made");
 
     let modified = w.say(G, &blob, vocab::MODIFIED, when("2014-05-13T16:53:20Z"));
     apply(&mut idx, &[&modified]);
@@ -179,7 +238,7 @@ fn a_when_claim_beats_a_file_time_which_beats_record_time() {
     let other = MemBlobs::default().put(b"other bytes");
     let created = w.say(G, &other, vocab::CREATED, when("2001-01-01T00:00:00Z"));
     apply(&mut idx, &[&created]);
-    assert_eq!(shown(&idx, &other).when.unwrap().source, WhenSource::Recorded);
+    assert_eq!(shown(&idx, &other).when, None);
 }
 
 #[test]
@@ -231,7 +290,7 @@ fn an_accepted_file_time_beats_an_earlier_proposed_one() {
 }
 
 #[test]
-fn a_view_excluding_the_file_times_author_falls_back_to_record_time() {
+fn a_view_excluding_the_file_times_author_leaves_the_file_undated() {
     const AGENT: usize = 1;
     let mut w = World::new(2);
     let dir = TempDir::new();
@@ -245,9 +304,8 @@ fn a_view_excluding_the_file_times_author_falls_back_to_record_time() {
     assert_eq!(idx.entity(&blob, &View::default()).unwrap().unwrap().when.unwrap().source, WhenSource::File);
     let owner_only = View { actors: vec![w.owner()], ..View::default() };
     let e = idx.entity(&blob, &owner_only).unwrap().unwrap();
-    let when = e.when.unwrap();
-    assert_eq!((when.source, when.value), (WhenSource::Recorded, name.body.at.format()));
-    assert_eq!(e.claims, vec![name.id.clone()]);
+    assert_eq!(e.when, None, "no file time passes, and record time dates only notes");
+    assert_eq!(e.claims, vec![name.id.clone()], "the name, as the label");
     let in_2001 = when_filter(Some("2001"), Some("2001"));
     assert!(idx.find_entities(&in_2001, &owner_only, Order::When, 10, None).unwrap().items.is_empty());
     assert_eq!(ids(&idx, &in_2001, Order::When), vec![blob]);

@@ -17,8 +17,9 @@ use knowa_model::{Dec, Draft, Error, Id, IdKind, Result, Status, Term, Value, Wh
 use serde_json::json;
 
 use crate::cli::{
-    ActorCmd, AssertArgs, BlobCmd, Cli, Cmd, ContextArgs, DEFAULT_NEAR_KM, FeedArgs, GrantArgs, LogArgs, NearArgs,
-    NoteArgs, PathArgs, PendingArgs, PutArgs, ReviewArgs, SearchArgs, ShareArgs, SpaceCmd, TimelineArgs, WorkerCmd,
+    ActorCmd, AssertArgs, BlobCmd, ClaimSelect, Cli, Cmd, ContextArgs, DEFAULT_NEAR_KM, FeedArgs, GrantArgs, LogArgs,
+    NearArgs, NoteArgs, PathArgs, PendingArgs, PutArgs, ReviewArgs, SearchArgs, ShareArgs, SpaceCmd, TimelineArgs,
+    WorkerCmd,
 };
 use crate::parse::{self, NearTarget};
 use crate::render::{self, Out, json_of};
@@ -255,13 +256,13 @@ fn assert(a: AssertArgs, g: &Globals, out: &mut Out) -> Result<()> {
 }
 
 fn review(a: ReviewArgs, g: &Globals, out: &mut Out) -> Result<()> {
-    let mut d = Draft::new(
-        claim_id(&a.claim)?,
-        Term::parse(vocab::REVIEW)?,
-        Value::Term(Term::parse(a.decision.term())?),
-    );
-    d.note = a.note;
-    write(g, out, vec![d])
+    let claims = a.claims.iter().map(|c| claim_id(c)).collect::<Result<Vec<_>>>()?;
+    let given = a.select.is_given();
+    let select = SelectArgs::parse(a.select)?;
+    let api = g.knowa()?;
+    let select = if given { Some(select.into_where(api.home())?) } else { None };
+    let r = api.review(&g.sel, &claims, select, a.decision.decision(), a.note)?;
+    out.result(|| json_of!(&r), || Ok(render::review(&r)))
 }
 
 fn grant(a: GrantArgs, g: &Globals, out: &mut Out) -> Result<()> {
@@ -281,18 +282,20 @@ fn share(a: ShareArgs, g: &Globals, out: &mut Out) -> Result<()> {
 // ---------- read sugar ----------
 
 fn pending(a: PendingArgs, g: &Globals, out: &mut Out) -> Result<()> {
-    let view = View { status: vec![Status::Proposed], ..View::default() };
+    let select = SelectArgs::parse(a.select)?;
+    let api = g.knowa()?;
     let doc = FindDoc {
         spaces: a.spaces.spaces,
-        view,
+        view: View { status: vec![Status::Proposed], ..View::default() },
         as_of: None,
         target: Target::Claims,
-        where_: Where::default(),
+        where_: select.into_where(api.home())?,
         order: None,
         limit: a.limit,
-        cursor: None,
+        cursor: a.cursor,
     };
-    query(g, out, QueryDoc::Find(doc))
+    let r = api.query(&g.sel, QueryDoc::Find(doc))?;
+    out.result(|| json_of!(&r), || Ok(render::query(&r)))
 }
 
 fn search(a: SearchArgs, g: &Globals, out: &mut Out) -> Result<()> {
@@ -312,6 +315,7 @@ fn search(a: SearchArgs, g: &Globals, out: &mut Out) -> Result<()> {
     let where_ = Where {
         text: Some(a.text),
         type_: terms(&a.types)?,
+        not_type: terms(&a.not_types)?,
         when: when_range(a.from, a.to),
         near,
         ..Where::default()
@@ -335,10 +339,15 @@ fn timeline(a: TimelineArgs, g: &Globals, out: &mut Out) -> Result<()> {
         view: View::default(),
         as_of: None,
         target: Target::Entities,
-        where_: Where { type_: terms(&a.types)?, when: when_range(a.from, a.to), ..Where::default() },
+        where_: Where {
+            type_: terms(&a.types)?,
+            not_type: terms(&a.not_types)?,
+            when: when_range(a.from, a.to),
+            ..Where::default()
+        },
         order: Some(Order::When),
         limit: a.limit,
-        cursor: None,
+        cursor: a.cursor,
     };
     query(g, out, QueryDoc::Find(doc))
 }
@@ -502,6 +511,48 @@ fn id_of_kind(s: &str, kind: IdKind, what: &str) -> Result<Id> {
         return Err(Error::invalid(format!("{s:?} is not {what}")));
     }
     Ok(id)
+}
+
+/// `ClaimSelect` with every argument converted that needs no home.
+struct SelectArgs {
+    /// `a_` ids as given, and local actor names still to resolve, in argument order
+    by: Vec<By>,
+    s: Vec<Id>,
+    p: Vec<Term>,
+    since: Option<String>,
+    until: Option<String>,
+}
+
+enum By {
+    Id(Id),
+    Name(String),
+}
+
+impl SelectArgs {
+    fn parse(c: ClaimSelect) -> Result<SelectArgs> {
+        // An `a_` prefix means an id (DESIGN §7: "an `a_` id or a local actor name");
+        // a malformed one is `invalid`, not looked up as a name.
+        let by = c
+            .by
+            .into_iter()
+            .map(|b| if b.starts_with("a_") { actor_id(&b).map(By::Id) } else { Ok(By::Name(b)) })
+            .collect::<Result<_>>()?;
+        Ok(SelectArgs { by, s: ids(&c.about)?, p: terms(&c.p)?, since: c.since, until: c.until })
+    }
+
+    /// The `where` of DESIGN §7's selector table (no selector → the empty `where`); an
+    /// unknown actor name → `not_found` naming it.
+    fn into_where(self, home: &Home) -> Result<Where> {
+        let actors = self
+            .by
+            .into_iter()
+            .map(|b| match b {
+                By::Id(id) => Ok(id),
+                By::Name(name) => home.actor(&name).map(|a| a.id),
+            })
+            .collect::<Result<_>>()?;
+        Ok(Where { actors, s: self.s, p: self.p, recorded_after: self.since, recorded_before: self.until, ..Where::default() })
+    }
 }
 
 fn when_range(from: Option<String>, to: Option<String>) -> Option<WhenRange> {

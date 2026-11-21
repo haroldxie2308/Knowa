@@ -137,6 +137,13 @@ pub fn write(r: &WriteResult) -> Vec<String> {
     out
 }
 
+/// `review`: one line counting the reviews written and those already present
+/// (`created:false`).
+pub fn review(r: &WriteResult) -> Vec<String> {
+    let written = r.items.iter().filter(|i| i.created).count();
+    vec![format!("reviews: {written} written, {} already present", r.items.len() - written)]
+}
+
 pub fn query(r: &QueryResult) -> Vec<String> {
     match r {
         QueryResult::Find(f) => find(f),

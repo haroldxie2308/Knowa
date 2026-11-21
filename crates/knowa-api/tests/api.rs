@@ -440,3 +440,146 @@ fn put_skips_an_unreadable_file_and_adds_the_others() {
         }
     }
 }
+
+// ---------- review: listed and selected claims in one write (DESIGN §7) ----------
+
+/// Alice's space `main` with three proposed claims by the agent `bot` and one by the
+/// agent `bot2`, plus a proposed claim by `bot` in alice's second space `other`.
+struct Reviewing {
+    _s: Scratch,
+    k: Knowa,
+    alice: Sel,
+    bot: Id,
+    /// bot's claims in `main`
+    b: Vec<Id>,
+    /// bot's `knowa:actorKind` declaration in `main`, written with its first claim there:
+    /// also a proposed claim by bot
+    bot_kind: Id,
+    /// bot2's claim in `main`
+    o: Id,
+    /// bot's claim in `other`
+    elsewhere: Id,
+}
+
+fn reviewing(tag: &str) -> Reviewing {
+    let s = Scratch::new(tag);
+    let (k, alice, _) = alice(&s);
+    k.init(&alice, &s.path("other-space"), "other notes", Some("other")).unwrap();
+    let bot = k.home().new_actor("bot", ActorKind::Agent).unwrap().id;
+    k.home().new_actor("bot2", ActorKind::Agent).unwrap();
+    let write = |space: Option<&str>, actor: &str, texts: &[&str]| -> Vec<Id> {
+        let sel = Sel { space: space.map(String::from), actor: Some(actor.into()) };
+        let e = Id::parse("x:ex:roadmap").unwrap();
+        let drafts = texts.iter().map(|t| Draft::new(e.clone(), term("ex:topic"), Value::text(*t))).collect();
+        k.write(&sel, drafts).unwrap().items.into_iter().map(|i| i.id).collect()
+    };
+    let b = write(None, "bot", &["one", "two", "three"]);
+    let o = write(None, "bot2", &["four"]).remove(0);
+    let elsewhere = write(Some("other"), "bot", &["five"]).remove(0);
+    let kind_doc = serde_json::json!({"op": "find", "target": "claims", "where": {"s": [bot], "p": [ACTOR_KIND]}});
+    let bot_kind = match find(&k, &alice, kind_doc) {
+        FindItems::Claims(mut c) if c.len() == 1 => c.remove(0).claim.id,
+        other => panic!("expected bot's one actorKind claim, got {other:?}"),
+    };
+    Reviewing { _s: s, k, alice, bot, b, bot_kind, o, elsewhere }
+}
+
+fn claim_view(k: &Knowa, sel: &Sel, id: &Id) -> knowa_model::ClaimView {
+    let doc = serde_json::json!({"op": "get", "ids": [id]});
+    match k.query(sel, serde_json::from_value(doc).unwrap()).unwrap() {
+        QueryResult::Get(mut g) => match g.items.pop() {
+            Some(knowa_model::query::GetItem::Claim { claim }) if g.items.is_empty() => claim,
+            other => panic!("expected one claim, got {other:?}"),
+        },
+        other => panic!("get returned {other:?}"),
+    }
+}
+
+/// The ids of the claims the reviews in `w` target, in item order.
+fn targets(k: &Knowa, sel: &Sel, w: &knowa_model::query::WriteResult) -> Vec<Id> {
+    w.items.iter().map(|i| claim_view(k, sel, &i.id).claim.body.s).collect()
+}
+
+fn reviews_of(k: &Knowa, sel: &Sel, target: &Id) -> usize {
+    let doc = serde_json::json!({"op": "find", "target": "claims", "where": {"s": [target], "p": ["knowa:review"]}});
+    match find(k, sel, doc) {
+        FindItems::Claims(c) => c.len(),
+        FindItems::Entities(_) => panic!("target is claims"),
+    }
+}
+
+fn by(actor: &Id) -> Option<knowa_model::query::Where> {
+    Some(knowa_model::query::Where { actors: vec![actor.clone()], ..Default::default() })
+}
+
+fn sorted(mut v: Vec<Id>) -> Vec<Id> {
+    v.sort();
+    v
+}
+
+#[test]
+fn review_by_author_reviews_exactly_their_proposed_claims_here_in_one_write() {
+    use knowa_api::ReviewDecision::Accept;
+    use knowa_model::Status::{Accepted, Proposed};
+    let r = reviewing("review-select");
+    let (k, alice) = (&r.k, &r.alice);
+    // already accepted: the selector (proposed claims only) leaves it alone
+    k.review(alice, std::slice::from_ref(&r.b[2]), None, Accept, None).unwrap();
+
+    let w = k.review(alice, &[], by(&r.bot), Accept, Some("bulk".into())).unwrap();
+    assert!(w.items.iter().all(|i| i.created && i.status == Accepted), "{w:?}");
+    assert_eq!(sorted(targets(k, alice, &w)), sorted(vec![r.b[0].clone(), r.b[1].clone(), r.bot_kind.clone()]));
+    let reviews: Vec<_> = w.items.iter().map(|i| claim_view(k, alice, &i.id).claim.body).collect();
+    for pair in reviews.windows(2) {
+        assert_eq!(pair[0].at, pair[1].at, "one write, one record time");
+        assert_eq!(pair[0].seq + 1, pair[1].seq, "one write, consecutive seqs");
+    }
+    assert!(reviews.iter().all(|c| c.note.as_deref() == Some("bulk")));
+    assert_eq!(claim_view(k, alice, &r.b[0]).status, Accepted);
+
+    assert_eq!(reviews_of(k, alice, &r.b[2]), 1, "only the earlier review");
+    assert_eq!((claim_view(k, alice, &r.o).status, reviews_of(k, alice, &r.o)), (Proposed, 0), "another author");
+    let other = Sel { space: Some("other".into()), actor: Some("alice".into()) };
+    assert_eq!((claim_view(k, &other, &r.elsewhere).status, reviews_of(k, &other, &r.elsewhere)), (Proposed, 0), "another space");
+
+    let again = k.review(alice, &[], by(&r.bot), Accept, None).unwrap();
+    assert!(again.items.is_empty(), "nothing proposed is left to select: {again:?}");
+}
+
+#[test]
+fn review_unions_listed_and_selected_claims_and_dedupes_them() {
+    let r = reviewing("review-union");
+    let listed = [r.o.clone(), r.b[1].clone()];
+    let w = r.k.review(&r.alice, &listed, by(&r.bot), knowa_api::ReviewDecision::Reject, None).unwrap();
+    let got = targets(&r.k, &r.alice, &w);
+    assert_eq!(got[..2], listed, "listed claims first, in the given order");
+    let selected = vec![r.b[0].clone(), r.b[2].clone(), r.bot_kind.clone()];
+    assert_eq!(sorted(got[2..].to_vec()), sorted(selected), "then the selection, without b[1] again");
+    for c in got {
+        assert_eq!(claim_view(&r.k, &r.alice, &c).status, knowa_model::Status::Rejected);
+    }
+}
+
+#[test]
+fn review_needs_claims_or_a_selector() {
+    let r = reviewing("review-usage");
+    let before = claim_count(&r.k, &r.alice);
+    for select in [None, Some(knowa_model::query::Where::default())] {
+        let err = r.k.review(&r.alice, &[], select.clone(), knowa_api::ReviewDecision::Accept, None).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Usage, "{select:?}: {err:?}");
+    }
+    let err = r.k.review(&r.alice, std::slice::from_ref(&r.bot), None, knowa_api::ReviewDecision::Accept, None).unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid, "an actor id is not a claim: {err:?}");
+    assert_eq!(claim_count(&r.k, &r.alice), before, "nothing written");
+}
+
+#[test]
+fn a_repeated_review_is_not_written_again() {
+    let r = reviewing("review-again");
+    let review = || r.k.review(&r.alice, std::slice::from_ref(&r.b[0]), None, knowa_api::ReviewDecision::Accept, None).unwrap();
+    let first = review();
+    let again = review();
+    assert!(first.items[0].created);
+    assert_eq!((&again.items[0].id, again.items[0].created), (&first.items[0].id, false));
+    assert_eq!(reviews_of(&r.k, &r.alice, &r.b[0]), 1);
+}

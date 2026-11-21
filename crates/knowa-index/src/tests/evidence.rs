@@ -141,7 +141,6 @@ fn type_when_and_near_match_only_through_passing_claims() {
     let (mut w, _d, mut idx) = setup();
     let e = ent();
     let l = w.label(G, &e, "place");
-    let at = l.body.at;
     let when_c = w.say(A, &e, vocab::WHEN, when("1999"));
     let where_c = w.say(A, &e, vocab::WHERE, geo("35.68", "139.76"));
     let typ = w.say(A, &e, vocab::TYPE, term(vocab::T_PHOTO));
@@ -157,8 +156,7 @@ fn type_when_and_near_match_only_through_passing_claims() {
 
     let v = idx.entity(&e, &humans_accepted()).unwrap().unwrap();
     assert!(v.types.is_empty() && v.where_.is_none());
-    let when = v.when.unwrap();
-    assert_eq!((when.source, when.value), (WhenSource::Recorded, at.format()));
+    assert!(v.when.is_none(), "the agent's when does not pass, and record time dates only notes");
     assert_eq!(v.claims, vec![l.id.clone()]);
 }
 
@@ -169,7 +167,8 @@ fn display_values_and_the_recorded_fallback_follow_the_view() {
     let early = w.label(A, &e, "agent's, earliest");
     let owner = w.label(G, &e, "owner's");
     let agent_when = w.say(A, &e, vocab::WHEN, when("2001"));
-    apply(&mut idx, &[&early, &owner, &agent_when]);
+    let note = w.say(G, &e, vocab::TYPE, term(vocab::T_NOTE));
+    apply(&mut idx, &[&early, &owner, &agent_when, &note]);
 
     let default = idx.entity(&e, &View::default()).unwrap().unwrap();
     assert_eq!(default.label.as_deref(), Some("owner's"), "accepted before proposed");
@@ -206,6 +205,51 @@ fn text_blob_content_counts_as_text_of_the_claim_that_links_it() {
     assert_eq!(ids(&find(&idx, &text_q("plans"), &agents())), vec![txt.clone()], "the note's text hangs on the owner's content claim");
 }
 
+#[test]
+fn not_type_drops_entities_only_through_passing_type_claims() {
+    let (mut w, _d, mut idx) = setup();
+    let file = ent();
+    let untyped = ent();
+    let agent_typed = ent();
+    let fl = w.label(G, &file, "report alpha");
+    let ft = w.say(G, &file, vocab::TYPE, term(vocab::T_FILE));
+    let ul = w.label(G, &untyped, "idea alpha");
+    let al = w.label(G, &agent_typed, "scan alpha");
+    let agent_type = w.say(A, &agent_typed, vocab::TYPE, term(vocab::T_FILE));
+    // a claim whose subject is not an entity: never typed, so never dropped
+    let review = w.review(G, &agent_type, true);
+    apply(&mut idx, &[&fl, &ft, &ul, &al, &agent_type]);
+    apply(&mut idx, &[&review]);
+
+    let not_files = Where { not_type: vec![Term::parse(vocab::T_FILE).unwrap()], ..Where::default() };
+    let sorted = |mut v: Vec<Id>| {
+        v.sort();
+        v
+    };
+    assert_eq!(ids(&find(&idx, &not_files, &View::default())), vec![untyped.clone()], "both files dropped, the untyped entity kept");
+    assert!(find(&idx, &not_files, &agents()).is_empty(), "in this view agent_typed is typed and the others have no passing claim");
+    assert_eq!(
+        sorted(ids(&find(&idx, &not_files, &humans_accepted()))),
+        sorted(vec![untyped.clone(), agent_typed.clone()]),
+        "the agent's type claim does not pass, so it drops nothing"
+    );
+    let with_text = Where { text: Some("alpha".into()), ..not_files.clone() };
+    assert_eq!(ids(&find(&idx, &with_text, &View::default())), vec![untyped.clone()]);
+
+    let claims = |v: &View| -> Vec<Id> {
+        idx.find_claims(&not_files, v, Order::Recorded, 100, None).unwrap().items.into_iter().map(|c| c.claim.id).collect()
+    };
+    let got = claims(&View::default());
+    assert!(got.contains(&ul.id) && got.contains(&review.id), "{got:?}");
+    assert!(![&fl.id, &ft.id, &al.id, &agent_type.id].iter().any(|c| got.contains(c)), "claims about a dropped entity go too: {got:?}");
+    assert!(claims(&humans_accepted()).contains(&al.id));
+
+    let typed = Where { type_: vec![Term::parse(vocab::T_FILE).unwrap()], ..not_files.clone() };
+    assert!(find(&idx, &typed, &View::default()).is_empty(), "type and notType of the same term exclude each other");
+    let compared = assert_routes_agree(&idx, &[not_files, with_text, typed], "notType");
+    assert!(compared > 0);
+}
+
 /// The queries `assert_routes_agree` runs over the fixtures here and in the
 /// equivalence test: every entity-level filter, alone and combined, plus claim filters.
 pub(super) fn route_queries(owner: &Id) -> Vec<Where> {
@@ -221,6 +265,8 @@ pub(super) fn route_queries(owner: &Id) -> Vec<Where> {
         Where { text: t("plans"), ..Where::default() },
         Where { type_: typed(&[vocab::T_PHOTO]), ..Where::default() },
         Where { type_: typed(&[vocab::T_NOTE, vocab::T_PERSON]), text: t("gamma"), ..Where::default() },
+        Where { not_type: typed(&[vocab::T_PHOTO]), ..Where::default() },
+        Where { not_type: typed(&[vocab::T_NOTE]), type_: typed(&[vocab::T_PHOTO, vocab::T_PERSON]), when: when("2010", "2030"), ..Where::default() },
         Where { when: when("2012", "2020"), ..Where::default() },
         Where { near: near(), ..Where::default() },
         Where { near: near(), when: when("2010", "2030"), ..Where::default() },

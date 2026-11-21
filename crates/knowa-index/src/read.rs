@@ -1,8 +1,8 @@
 //! Single-replica reads: find (claims/entities), lookups, log, feed, actors.
 //!
-//! Views apply to evidence (DESIGN §4.7): an entity matches `text`, `type`, `when` and
-//! `near`, and gets its display fields, only through claims that pass the view. Two
-//! routes implement that, chosen by the view alone:
+//! Views apply to evidence (DESIGN §4.7): an entity matches `text`, `type`, `notType`,
+//! `when` and `near`, and gets its display fields, only through claims that pass the
+//! view. Two routes implement that, chosen by the view alone:
 //! - stored: the default view reads the summaries kept in `entities` and pages in SQL;
 //! - computed: any other view summarizes each candidate entity from its passing
 //!   claims with `entity::summarize`, the function that also fills `entities`.
@@ -14,7 +14,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use knowa_model::query::{Near, Order, View, Where};
-use knowa_model::{ActorInfo, ClaimView, Dec, Dir, Edge, EntityView, Error, Id, Result, Status, Timestamp, Value, When, vocab};
+use knowa_model::{ActorInfo, ClaimView, Dec, Dir, Edge, EntityView, Error, Id, Result, Status, Term, Timestamp, Value, When, vocab};
 use rusqlite::{Connection, params_from_iter};
 
 use crate::Page;
@@ -133,6 +133,8 @@ pub(crate) struct WhereF {
     o: Option<String>,
     /// canonical JSON of the `{"term": …}` values
     types: Vec<String>,
+    /// as `types`, for `notType`
+    not_types: Vec<String>,
     /// one FTS5 MATCH expression per query token
     terms: Option<Vec<String>>,
     /// [lo, hi) with None = open
@@ -168,12 +170,14 @@ impl WhereF {
             None => None,
         };
         let strs = |v: &[Id]| v.iter().map(|x| x.as_str().to_string()).collect::<Vec<_>>();
+        let terms = |v: &[Term]| v.iter().map(|t| canonical(&Value::Term(t.clone()))).collect::<Result<Vec<_>>>();
         Ok(WhereF {
             ids: strs(&w.ids),
             s: strs(&w.s),
             p: w.p.iter().map(|t| t.as_str().to_string()).collect(),
             o: w.o.as_ref().map(canonical).transpose()?,
-            types: w.type_.iter().map(|t| canonical(&Value::Term(t.clone()))).collect::<Result<_>>()?,
+            types: terms(&w.type_)?,
+            not_types: terms(&w.not_type)?,
             terms: w.text.as_deref().map(fts::match_terms).transpose()?,
             when,
             near: w.near.as_ref().map(NearF::parse).transpose()?,
@@ -219,12 +223,17 @@ impl WhereF {
         }
     }
 
-    /// `SELECT t.s FROM claims t WHERE …`: subjects of `knowa:type` claims passing `v`
-    /// with one of the wanted types. Callers check `types` is non-empty.
-    fn type_subjects_sql(&self, q: &mut Sql, v: &ViewF) {
-        q.add(&format!("SELECT t.s FROM claims t WHERE t.p = {TYPE_LITERAL} AND t.ent = 1 AND t.o IN "))
-            .list(self.types.iter().cloned());
-        v.sql(q, "t");
+    /// ` AND {subject} NOT IN (…)`: drops subjects that have one of the `notType`s
+    /// through a type claim passing `v` (DESIGN §6.1). A pure exclusion: a subject with
+    /// no type, or that is not an entity at all, is kept. It depends on the subject
+    /// alone, so it is applied to the subject column directly, never through
+    /// `entities` (which a claim's subject may lack).
+    fn not_type_sql(&self, q: &mut Sql, v: &ViewF, subject: &str) {
+        if !self.not_types.is_empty() {
+            q.add(&format!(" AND {subject} NOT IN ("));
+            type_subjects_sql(q, &self.not_types, v);
+            q.add(")");
+        }
     }
 
     /// Entity-level filters on the stored (default-view) summaries of `entities`
@@ -233,7 +242,7 @@ impl WhereF {
     fn stored_sql(&self, q: &mut Sql, v: &ViewF) {
         if !self.types.is_empty() {
             q.add(" AND e.id IN (");
-            self.type_subjects_sql(q, v);
+            type_subjects_sql(q, &self.types, v);
             q.add(")");
         }
         if let Some((lo, hi)) = self.when {
@@ -259,6 +268,13 @@ impl WhereF {
                 .add(")");
         }
     }
+}
+
+/// `SELECT t.s FROM claims t WHERE …`: subjects of `knowa:type` claims passing `v`
+/// with one of `types` (canonical JSON). Callers check `types` is non-empty.
+fn type_subjects_sql(q: &mut Sql, types: &[String], v: &ViewF) {
+    q.add(&format!("SELECT t.s FROM claims t WHERE t.p = {TYPE_LITERAL} AND t.ent = 1 AND t.o IN ")).list(types.iter().cloned());
+    v.sql(q, "t");
 }
 
 #[derive(Clone, Copy)]
@@ -467,8 +483,8 @@ fn point(s: &Summary) -> Option<(f64, f64)> {
     s.point.map(|(lat, lon, _)| (lat, lon))
 }
 
-/// Computed route: entities matching `w`'s entity-level filters (type, text, when,
-/// near) through claims passing `v`, in id order. For `find_entities`
+/// Computed route: entities matching `w`'s entity-level filters (type, notType, text,
+/// when, near) through claims passing `v`, in id order. For `find_entities`
 /// (`for_entities`), also `w.ids` and the claim-level filters: some passing claim
 /// about the entity satisfies all of them.
 fn computed_hits(conn: &Connection, w: &WhereF, v: &ViewF, scores: Option<&BTreeMap<String, f64>>, for_entities: bool) -> Result<Vec<Hit>> {
@@ -487,9 +503,16 @@ fn computed_hits(conn: &Connection, w: &WhereF, v: &ViewF, scores: Option<&BTree
     }
     if !w.types.is_empty() {
         let mut q = Sql::new("");
-        w.type_subjects_sql(&mut q, v);
+        type_subjects_sql(&mut q, &w.types, v);
         restrict(subjects(conn, &q)?);
     }
+    let excluded = if w.not_types.is_empty() {
+        BTreeSet::new()
+    } else {
+        let mut q = Sql::new("");
+        type_subjects_sql(&mut q, &w.not_types, v);
+        subjects(conn, &q)?
+    };
     if for_entities && w.has_claim_filters() {
         let mut q = Sql::new("SELECT c.s FROM claims c WHERE c.ent = 1");
         v.sql(&mut q, "c");
@@ -501,6 +524,9 @@ fn computed_hits(conn: &Connection, w: &WhereF, v: &ViewF, scores: Option<&BTree
     }
     let mut hits = Vec::new();
     for (id, summary) in computed_summaries(conn, v, only.as_ref())? {
+        if excluded.contains(&id) {
+            continue;
+        }
         if let Some((lo, hi)) = w.when
             && !summary.when_overlaps(lo, hi)
         {
@@ -548,6 +574,7 @@ pub(crate) fn find_entities(
             q.add(" AND e.id IN (SELECT value FROM json_each(").arg(json_list(s.keys())).add("))");
         }
         w.stored_sql(&mut q, &v);
+        w.not_type_sql(&mut q, &v, "e.id");
         q.add(" AND EXISTS (SELECT 1 FROM claims c WHERE c.s = e.id AND c.ent = 1");
         v.sql(&mut q, "c");
         w.claim_sql(&mut q, "c");
@@ -613,13 +640,14 @@ pub(crate) fn find_claims(
     let offset = parse_cursor(cursor)?;
     let sort = sort_of(order, &w, false)?;
     // The claim-level part, shared by every route: the claim itself passes the view
-    // and the claim filters.
+    // and the claim filters, and its subject has none of the `notType`s.
     let claim_conditions = |q: &mut Sql| {
         if !w.ids.is_empty() {
             q.add(" AND c.id IN ").list(w.ids.iter().cloned());
         }
         v.sql(q, "c");
         w.claim_sql(q, "c");
+        w.not_type_sql(q, &v, "c.s");
     };
 
     // Entity-level filters (type, text, when, near) and the `when` order apply to the

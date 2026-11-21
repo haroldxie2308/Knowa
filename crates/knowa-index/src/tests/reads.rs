@@ -115,6 +115,39 @@ fn display_value_prefers_accepted_then_latest() {
 }
 
 #[test]
+fn the_label_falls_back_to_the_display_chosen_name() {
+    let (mut w, _d, mut idx) = setup();
+    let file = MemBlobs::default().put(b"holiday photo bytes");
+    let accepted = w.say(G, &file, vocab::NAME, text("IMG_0001.jpg"));
+    let proposed = w.say(A, &file, vocab::NAME, text("IMG_0001 (copy).jpg"));
+    apply(&mut idx, &[&accepted, &proposed]);
+
+    let e = idx.entity(&file, &View::default()).unwrap().unwrap();
+    assert_eq!(e.label.as_deref(), Some("IMG_0001.jpg"), "accepted before proposed, as for a label");
+    assert!(e.claims.contains(&accepted.id) && !e.claims.contains(&proposed.id), "the chosen name supports the label");
+    let agents = View { actor_kinds: vec![ActorKind::Agent], ..View::default() };
+    assert_eq!(idx.entity(&file, &agents).unwrap().unwrap().label.as_deref(), Some("IMG_0001 (copy).jpg"), "only passing names count");
+    super::evidence::assert_routes_agree(&idx, &[Where::default()], "name as label");
+}
+
+#[test]
+fn a_label_beats_a_name_whatever_their_statuses() {
+    let (mut w, _d, mut idx) = setup();
+    let file = MemBlobs::default().put(b"scanned pages");
+    let name = w.say(G, &file, vocab::NAME, text("scan_0042.pdf"));
+    let label = w.label(A, &file, "Tax return 2019");
+    apply(&mut idx, &[&name, &label]);
+    assert_eq!(status(&idx, &label), Status::Proposed);
+
+    let e = idx.entity(&file, &View::default()).unwrap().unwrap();
+    assert_eq!(e.label.as_deref(), Some("Tax return 2019"), "a proposed label beats an accepted name");
+    assert!(e.claims.contains(&label.id) && !e.claims.contains(&name.id), "an unused name supports nothing");
+    let r = w.retract(A, &label);
+    apply(&mut idx, &[&r]);
+    assert_eq!(idx.entity(&file, &View::default()).unwrap().unwrap().label.as_deref(), Some("scan_0042.pdf"));
+}
+
+#[test]
 fn fragment_subjects_are_distinct_entities() {
     let (mut w, _d, mut idx) = setup();
     let blob = Id::blob_of(b"photo");

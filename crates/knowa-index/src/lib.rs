@@ -28,7 +28,7 @@ use crate::db::{INDEX_FILE, META_EPOCH, META_SCHEMA, META_SPACE, db};
 
 /// Bump whenever the SQLite schema or a rule that derives stored values (statuses,
 /// entity summaries, full-text documents) changes; a mismatch triggers a rebuild.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// Text blobs up to this size are full-text indexed (DESIGN §7.2).
 pub const MAX_FTS_BLOB_BYTES: u64 = 1024 * 1024;
