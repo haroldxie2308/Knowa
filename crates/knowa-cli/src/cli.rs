@@ -107,6 +107,8 @@ pub enum Cmd {
     Reindex,
     /// Print the machine-readable contract (ops, documents, vocabulary, error codes)
     Schema,
+    /// Serve the local web UI on 127.0.0.1 until interrupted
+    Serve(ServeArgs),
 }
 
 /// Which spaces a read covers.
@@ -496,6 +498,16 @@ pub enum WorkerCmd {
         #[arg(long)]
         follow: bool,
     },
+}
+
+#[derive(Debug, Args)]
+#[command(after_help = "Prints the app's address, which carries an access token after #k=; open it in a browser. \
+                        Reviews in the app are signed by the acting actor (--actor before the verb, or \
+                        KNOWA_ACTOR); without one the app is read-only.")]
+pub struct ServeArgs {
+    /// Port on 127.0.0.1; 0 picks a free one
+    #[arg(long, default_value_t = knowa_web::DEFAULT_PORT)]
+    pub port: u16,
 }
 
 #[derive(Debug, Args)]

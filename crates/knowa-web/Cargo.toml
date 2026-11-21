@@ -1,0 +1,16 @@
+[package]
+name = "knowa-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+data-encoding = "2.11.1"
+getrandom = "0.4.3"
+knowa-api = { version = "0.1.0", path = "../knowa-api" }
+knowa-config = { version = "0.1.0", path = "../knowa-config" }
+knowa-model = { version = "0.1.0", path = "../knowa-model" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tiny_http = "0.12.0"

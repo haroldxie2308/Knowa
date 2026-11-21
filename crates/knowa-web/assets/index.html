@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>Knowa</title>
+    <link rel="icon" href="/icon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/app.css">
+    <script type="module" src="/js/main.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main" id="skip-link">Skip to content</a>
+    <header class="topbar">
+      <div class="topbar-row">
+        <span class="brand">Knowa</span>
+        <nav aria-label="Views">
+          <ul class="tabs">
+            <li><a href="#/search" data-view="search">Search</a></li>
+            <li><a href="#/timeline" data-view="timeline">Timeline</a></li>
+            <li><a href="#/gallery" data-view="gallery">Gallery</a></li>
+            <li><a href="#/review" data-view="review">Review</a></li>
+          </ul>
+        </nav>
+        <div class="space-picker">
+          <label class="label" for="space">Space</label>
+          <select class="select" id="space" disabled></select>
+        </div>
+      </div>
+      <details class="view-controls" id="view-controls">
+        <summary>View: <strong id="view-summary">accepted, proposed · all author kinds</strong></summary>
+        <div class="view-panel">
+          <fieldset>
+            <legend>Claim statuses</legend>
+            <div class="options" id="status-options"></div>
+          </fieldset>
+          <fieldset>
+            <legend>Author kinds</legend>
+            <div class="options" id="kind-options"></div>
+          </fieldset>
+          <p class="hint" id="view-hint">Only claims that pass the view count: they decide which entities match and how they look. Review always lists proposed claims.</p>
+        </div>
+      </details>
+    </header>
+    <main id="main" tabindex="-1"></main>
+    <div class="sr-only" role="status" id="announce"></div>
+    <dialog id="confirm" aria-labelledby="confirm-title" aria-describedby="confirm-body">
+      <form method="dialog">
+        <h2 id="confirm-title"></h2>
+        <p id="confirm-body"></p>
+        <div class="dialog-actions">
+          <button class="btn" value="cancel" id="confirm-cancel">Cancel</button>
+          <button class="btn btn-danger-solid" value="confirm" id="confirm-ok"></button>
+        </div>
+      </form>
+    </dialog>
+  </body>
+</html>

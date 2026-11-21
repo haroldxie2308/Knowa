@@ -151,6 +151,7 @@ fn dispatch(cmd: Cmd, g: &Globals, out: &mut Out) -> Result<Finished> {
             let r = g.knowa()?.reindex(&g.sel)?;
             out.result(|| Ok(json!(r)), || Ok(vec![format!("reindexed: {r}")]))
         }
+        Cmd::Serve(a) => match knowa_web::serve(&g.knowa()?, &g.sel, a.port)? {},
         Cmd::Schema => {
             // No home is opened: the contract is static.
             let s = knowa_api::schema();
