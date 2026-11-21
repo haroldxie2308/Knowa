@@ -297,6 +297,8 @@ With `--json`, errors go to stderr as `{"error":{"code":"…","message":"…","d
 | integrity | 7 |
 | cursor_expired | 8 |
 
+Exit **9** is not an error: the command finished but skipped some of its inputs, and its result (printed as usual) lists them in `skipped`. Only `put` uses it today.
+
 ### 6.4 Stability rules
 
 - The claim format and the query and result documents only evolve **additively**. Readers ignore unknown result fields, and writers never emit unknown claim fields.
@@ -316,7 +318,7 @@ Global flags (each with an env override) are `--home` (`KNOWA_HOME`, default `~/
 | `query [<json>\|-]` | **query** |
 | `feed [--cursor C] [--limit N] [--follow]` | **feed** |
 | `blob put <file>` / `blob cat <id>` | **blob.put / blob.get** |
-| `put <paths…> [--no-extract] [--no-store]` | ingest: blob.put plus `knowa:name`/`knowa:source`/`knowa:modified`/`knowa:created` by the actor, then extractors. Times are read before and after the bytes are stored; a file whose size or modification time changed in between is a `conflict` (its bytes and times would not belong together). `--no-store` is **catalog only**: each file is hashed in place and gets the same claims, extractors included (they read the source), but its bytes are not copied into the replica; the result reports `stored` per file |
+| `put <paths…> [--no-extract] [--no-store] [--download-evicted]` | ingest: blob.put plus `knowa:name`/`knowa:source`/`knowa:modified`/`knowa:created` by the actor, then extractors. Times are read before and after the bytes are stored; a file whose size or modification time changed in between is a `conflict` (its bytes and times would not belong together). `--no-store` is **catalog only**: each file is hashed in place and gets the same claims, extractors included (they read the source), but its bytes are not copied into the replica; the result reports `stored` per file. **A file's own failure skips that file, not the run:** a file that changed while being added (`conflict`), vanished (`not_found`), cannot be read, or has a name that is not UTF-8 (`invalid`) goes to the result's `skipped` as `{path, code, message}` and the run continues, exiting 9. Failures of the replica itself (integrity, the lock, writing the space) still stop the run. **Evicted files** (macOS `dataless`: contents left in the cloud, e.g. iCloud "Optimize Mac Storage") are not read by default, because reading one downloads it; each is skipped as `unsupported` with a message saying so. `--download-evicted` reads them, so the OS downloads them first, and their times are read after the download |
 | `note <text\|-> [--title T] [--when EDTF] [--about id…]` | write a Note entity |
 | `assert <s> <p> <value> [--q p=value…] [--valid] [--src…] [--conf] [--note] [--replaces…]` | write. Value syntax: `text:…`, `term:…`, `ref:…`, `int:…`, `dec:…`, `bool:…`, `when:…`, `geo:lat,lon[,r]`, `qty:12.5:kg`. A bare token is text |
 | `retract <claim> [--note]` · `review <claim> accept\|reject [--note]` | write |
