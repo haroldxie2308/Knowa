@@ -301,6 +301,12 @@ impl Index {
         actors.sort();
         for actor in actors {
             let from = heads.get(&actor).map_or(1, |h| h + 1);
+            // The index already holds this actor's newest claim. Checked from the log's
+            // last line because `read_log` parses its newest segment from the top (up to
+            // SEGMENT_LINES lines), and every open, so every write and query, catches up.
+            if replica.last_seq(&actor)?.is_none_or(|last| last < from) {
+                continue;
+            }
             let mut chunk = Vec::with_capacity(REPLAY_CHUNK);
             for claim in replica.read_log(&actor, from)? {
                 chunk.push(claim?);

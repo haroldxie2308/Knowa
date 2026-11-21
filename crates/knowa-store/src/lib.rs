@@ -222,6 +222,13 @@ impl Replica {
         Ok(log::tail(&self.root, &self.manifest.space, actor)?.map(|t| t.head))
     }
 
+    /// Highest seq in `actor`'s log, if any. Reads and verifies only the newest
+    /// segment's last line, without the lock: like any log read, it can meet a line an
+    /// in-flight append has not finished, which is an `integrity` error.
+    pub fn last_seq(&self, actor: &Id) -> Result<Option<u64>> {
+        Ok(log::tail(&self.root, &self.manifest.space, actor)?.map(|t| t.head.seq))
+    }
+
     /// Appends locally-authored claims. For each actor, claims must continue that
     /// actor's chain exactly (seq = head+1, prev = head id), in order; each must verify.
     /// Writes JCS lines, rotates segments at SEGMENT_LINES, fsyncs before returning.

@@ -88,6 +88,32 @@ fn search(idx: &Index, q: &str) -> Vec<Id> {
     idx.find_entities(&w, &View::default(), Order::Relevance, 50, None).unwrap().items.into_iter().map(|e| e.id).collect()
 }
 
+/// Regression: every open (so every write and query) re-parsed each actor's newest
+/// segment from its first line, making `put` slower with every claim in the space.
+/// An index that already holds an actor's newest claim must not read that actor's
+/// older lines: garbling one that is already indexed is invisible to open, and
+/// `verify` is what reports it.
+#[test]
+fn a_current_index_opens_without_rereading_the_log() {
+    let dir = TempDir::new();
+    let mut w = Writer::new(1);
+    let r = w.replica(&dir);
+    let e = Id::new_entity().unwrap();
+    let c2 = w.say(0, &e, vocab::LABEL, Value::text("indexed"));
+    append(&r, &[&c2]);
+    drop(Index::open(&r).unwrap());
+
+    let segment = dir.path().join("log").join(w.actor(0).as_str()).join("000000000001.jsonl");
+    let text = std::fs::read_to_string(&segment).unwrap();
+    let (genesis_line, rest) = text.split_once('\n').unwrap();
+    std::fs::write(&segment, format!("{}\n{rest}", "x".repeat(genesis_line.len()))).unwrap();
+
+    let idx = Index::open(&r).unwrap();
+    assert_eq!(idx.actor_heads().unwrap(), vec![(w.actor(0), 2)]);
+    let err = r.verify().unwrap_err();
+    assert_eq!(err.code, knowa_model::ErrorCode::Integrity, "verify still reads every line: {}", err.message);
+}
+
 #[test]
 fn open_builds_then_catches_up_with_claims_appended_behind_its_back() {
     let dir = TempDir::new();
