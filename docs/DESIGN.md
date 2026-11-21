@@ -192,14 +192,17 @@ So output from a kind of actor (or a status) the view excludes can never make an
 
 **Text matching is normalization-insensitive.** Indexed text and query text are both brought to Unicode NFKC before tokenizing, so canonically or compatibly equivalent spellings match: decomposed Hangul from macOS file names (NFD) and composed Hangul, full-width and half-width forms, ligatures, `Ⅱ` and `II`. This is an index rule only. Claims, ids and signatures keep the exact bytes that were written, and display fields show them as written.
 
-**Display value.** When a single value is shown (for example an entity's label), the order is accepted before proposed, then the latest `at`. This is a display policy only: all values remain in the data.
+**Display value.** When a single value is shown (for example an entity's label), the order is accepted before proposed, then the latest `at`. This is a display policy only: all values remain in the data. An entity's **label** is its display-chosen `knowa:label`, else its display-chosen `knowa:name`, so a file shows the name it was added under until someone labels it.
 
 ### 4.8 Entity timeline position
 
 An entity's `when` is, first match wins:
 1. the range of its display-chosen `knowa:when` claim, `"source":"claim"`;
 2. else the range of its chosen `knowa:modified` claim, `"source":"file"`. Chosen = accepted before proposed, then the **earliest** range start, then claim id. Earliest, because a blob is one exact byte sequence: when the same bytes were seen at several paths, later copies only carry later times, so the earliest observation is the best estimate of when that version was written;
-3. else the earliest `at` among claims whose subject is the entity, `"source":"recorded"`. Correct for notes and observations, which are written when they happen; wrong for imported files, which is why rule 2 precedes it.
+3. else, **if the entity is a `knowa:Note`** (a `knowa:type knowa:Note` claim about it passes the view), the earliest `at` among claims whose subject is the entity, `"source":"recorded"`. A note is written when it happens, so its record time is its world time;
+4. else the entity has no `when`: it is not on the timeline, never matches a `when` filter, and has no temporal context.
+
+Record time is world time only for notes. An agent that creates an entity for a project, a person or a concept while reading has recorded when it *learned of* the thing, not when the thing happened; dating such entities by record time put every one of them on the timeline at the moment of reading. An actor recording any other event or observation states its `knowa:when`.
 
 `knowa:created` never feeds `when`: a copy or download gets a fresh birth time, so it usually means "arrived on this disk". Like every display field, only claims that pass the view count (§4.7, *Views apply to evidence*). Across spaces (§6), `claim` beats `file` beats `recorded`; between two `claim`s the first space wins; between two `file`s or two `recorded`s the earlier start wins.
 
@@ -249,7 +252,7 @@ Admin ops are `init, verify, reindex, export, import`. They are part of the CLI 
 
   "target": "entities | claims",
   "where": {
-    "ids": [], "s": [], "p": [], "o": {"<value>":"…"}, "type": ["knowa:Photo"],
+    "ids": [], "s": [], "p": [], "o": {"<value>":"…"}, "type": ["knowa:Photo"], "notType": ["knowa:File"],
     "text": "free text",
     "when": {"from": "<EDTF>", "to": "<EDTF>"},
     "near": {"lat": "…", "lon": "…", "km": "…"},
@@ -271,6 +274,7 @@ Admin ops are `init, verify, reindex, export, import`. They are part of the CLI 
 - Multi-space `find` with a `cursor` is `unsupported` in v0, so use a larger `limit`.
 - Each op uses only its own fields. A field from another op is an `invalid` error, so typos fail fast.
 - `limit` defaults to 50 and has a maximum of 1000. `hops` ≤ 3. `maxHops` ≤ 6.
+- `type` keeps entities that have any of the listed `knowa:type`s; `notType` drops entities that have any of them (an entity with no type is kept). Both count only claims that pass the view, and both apply wherever `type` applies.
 
 ### 6.2 Results
 
@@ -321,10 +325,11 @@ Global flags (each with an env override) are `--home` (`KNOWA_HOME`, default `~/
 | `put <paths…> [--no-extract] [--no-store] [--download-evicted]` | ingest: blob.put plus `knowa:name`/`knowa:source`/`knowa:modified`/`knowa:created` by the actor, then extractors. Times are read before and after the bytes are stored; a file whose size or modification time changed in between is a `conflict` (its bytes and times would not belong together). `--no-store` is **catalog only**: each file is hashed in place and gets the same claims, extractors included (they read the source), but its bytes are not copied into the replica; the result reports `stored` per file. **A file's own failure skips that file, not the run:** a file that changed while being added (`conflict`), vanished (`not_found`), cannot be read, or has a name that is not UTF-8 (`invalid`) goes to the result's `skipped` as `{path, code, message}` and the run continues, exiting 9. Failures of the replica itself (integrity, the lock, writing the space) still stop the run. **Evicted files** (macOS `dataless`: contents left in the cloud, e.g. iCloud "Optimize Mac Storage") are not read by default, because reading one downloads it; each is skipped as `unsupported` with a message saying so. `--download-evicted` reads them, so the OS downloads them first, and their times are read after the download |
 | `note <text\|-> [--title T] [--when EDTF] [--about id…]` | write a Note entity |
 | `assert <s> <p> <value> [--q p=value…] [--valid] [--src…] [--conf] [--note] [--replaces…]` | write. Value syntax: `text:…`, `term:…`, `ref:…`, `int:…`, `dec:…`, `bool:…`, `when:…`, `geo:lat,lon[,r]`, `qty:12.5:kg`. A bare token is text |
-| `retract <claim> [--note]` · `review <claim> accept\|reject [--note]` | write |
+| `retract <claim> [--note]` | write |
+| `review accept\|reject [<claim>…] [--by A…] [--about ID…] [--p TERM…] [--since T] [--until T] [--note N]` | write one `knowa:review` per target, all in one write. Targets are the listed claims plus, when any selector is given, every **proposed** claim in the current space that matches all selectors: `--by` (author: an `a_` id or a local actor name) ↔ `where.actors`, `--about` ↔ `where.s`, `--p` ↔ `where.p`, `--since`/`--until` (RFC 3339 record time) ↔ `recordedAfter`/`recordedBefore`. Neither a claim nor a selector is a `usage` error: there is no "review everything". Preview a selection with `pending` and the same selectors. A review equal to one the actor already wrote is not written again (`created:false`) |
 | `grant <actor> <role> [--auto-accept]` · `share <id> private\|shared\|public` | write (policy) |
-| `pending` | find claims with status proposed |
-| `search <text> [filters]` · `timeline [--from --to]` · `near <lat,lon\|id> [--km]` | find |
+| `pending [--by…] [--about…] [--p…] [--since] [--until] [--limit] [--cursor]` | find claims with status proposed; the selectors are `review`'s |
+| `search <text> [filters]` · `timeline [--from --to]` · `near <lat,lon\|id> [--km]` | find. `search` and `timeline` take `--type` and `--not-type`, and `--cursor` to continue a page |
 | `show <id…>` | get |
 | `context <id> [--window P1D] [--km 1] [--hops 1]` | context |
 | `path <a> <b>` | path |
