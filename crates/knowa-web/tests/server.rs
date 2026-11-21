@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
-use knowa_api::{Knowa, PutOptions, Sel};
+use knowa_api::{Knowa, Location, PutOptions, Sel};
 use knowa_config::Home;
 use knowa_model::{ActorKind, Draft, Id, Term, Value};
 use knowa_web::Server;
@@ -56,7 +56,7 @@ fn home(s: &Scratch) -> Knowa {
     home.new_actor("ada", ActorKind::Human).unwrap();
     home.new_actor("scout", ActorKind::Agent).unwrap();
     let k = Knowa::new(home);
-    k.init(&as_actor("ada"), &s.path("main"), "main notes", Some("main")).unwrap();
+    k.init(&as_actor("ada"), &Location::Dir(s.path("main")), None, "main notes", Some("main")).unwrap();
     k
 }
 

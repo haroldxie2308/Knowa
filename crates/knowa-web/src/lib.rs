@@ -52,7 +52,7 @@ impl<'k> Server<'k> {
     pub fn bind(knowa: &'k Knowa, sel: &Sel, port: u16) -> Result<Server<'k>> {
         let home = knowa.home();
         if let Some(space) = &sel.space {
-            home.resolve_space(Some(space))?;
+            home.resolve_space(Some(space), knowa_api::canonical_location)?;
         }
         let selected = sel.actor.is_some() || home.load_config()?.current_actor.is_some();
         let writer = if selected {

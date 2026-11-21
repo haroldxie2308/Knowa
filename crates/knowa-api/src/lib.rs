@@ -12,6 +12,7 @@ use serde::Serialize;
 
 /// Where a replica or its blobs live (DESIGN §5.2): `init` and `space add` take it.
 pub use knowa_store::Location;
+pub use select::canonical as canonical_location;
 
 mod admin;
 mod context;

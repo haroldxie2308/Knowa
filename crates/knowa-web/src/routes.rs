@@ -98,7 +98,7 @@ fn spaces(server: &Server) -> Result<Resp> {
     let current = if server.space.is_none() && config.current_space.is_none() {
         None
     } else {
-        home.resolve_space(server.space.as_deref())?.alias
+        home.resolve_space(server.space.as_deref(), knowa_api::canonical_location)?.alias
     };
     let items: Vec<_> = config
         .spaces

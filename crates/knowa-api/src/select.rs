@@ -95,8 +95,9 @@ pub(crate) fn current(home: &Home, sel: &Sel) -> Result<Space> {
 }
 
 /// A space selector that is not a registered alias, as the canonical location the
-/// registry is keyed by (DESIGN §5.2).
-fn canonical(selector: &str) -> Result<String> {
+/// registry is keyed by (DESIGN §5.2). The `canonical` argument of
+/// `Home::resolve_space` for every caller.
+pub fn canonical(selector: &str) -> Result<String> {
     Location::parse(selector).and_then(|l| l.canonical()).map_err(|mut e| {
         e.message = format!("{selector:?} is not a registered space alias, and as a location: {}", e.message);
         e

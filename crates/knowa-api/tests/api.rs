@@ -684,7 +684,7 @@ fn a_cursor_pages_through_any_index_of_the_replica_exactly_once() {
 
     // Another machine reading the same replica, with its own home and index.
     let other = Knowa::new(Home::open(Some(&s.path("home-b"))).unwrap());
-    other.space_add(&s.path("alice-space"), Some("shared"), true).unwrap();
+    other.space_add(&s.dir("alice-space"), None, Some("shared"), true).unwrap();
     let other_sel = Sel { space: Some("shared".into()), actor: None };
 
     let mut cursor: Option<String> = None;
@@ -763,7 +763,7 @@ fn chain(space: &Id, n: u64) -> Vec<knowa_model::Claim> {
 fn a_merge_that_fills_a_gap_expires_feed_cursors() {
     let s = Scratch::new("feed-gap");
     let (k, sel, space) = alice(&s);
-    let replica = Replica::open(&s.path("alice-space")).unwrap();
+    let replica = s.open("alice-space");
     let dave = chain(&space, 3);
     replica.merge(&[dave[0].clone(), dave[2].clone()]).unwrap();
     let page = k.feed(&sel, None, MAX_LIMIT).unwrap();
