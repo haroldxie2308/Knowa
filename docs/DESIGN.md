@@ -240,7 +240,7 @@ Directory locations add `log/<actor-id>/.lock`, the actor's advisory lock (§5.3
 - **Credentials** and the endpoint of an object store come from the environment, in the S3 client's standard variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ENDPOINT` for stores other than AWS, …). They are never written to the home config or to a replica. When one is missing, opening the replica fails with a `usage` error that names it.
 - **`init <location>` and `space add <location>`** take either form, plus `--blobs <location>`. The blob location belongs to a machine's registration of the replica, not to the space. Every machine that registers the replica must give the same blob location.
 - **The index and the feed cursors** of a replica live in `$KNOWA_HOME/index/<s_id>/<key>/`. `<key>` is the first 16 characters of b32(sha256(canonical location)), where the canonical location is the absolute path of a directory or the URL without a trailing `/`. Two registrations of one location on one machine therefore share one index.
-- **Object-store blob bytes** fetched for extraction are cached in `$KNOWA_HOME/cache/blobs/`.
+- **Object-store blob bytes** staged for upload or downloaded for reading are cached in `$KNOWA_HOME/cache/blobs/`. *(later: cache eviction.)*
 
 ### 5.3 Writing
 
@@ -267,7 +267,7 @@ Directory locations add `log/<actor-id>/.lock`, the actor's advisory lock (§5.3
 - **One writer per actor is the norm.** Racing writes of one actor stay correct but waste work, so give each agent process its own actor.
 - **Blob path.** Bytes are hashed while they are staged. They become visible under an id only once their hash is known and equals that id, so a source that changes during the copy can never be stored under the wrong id.
   - *Directory.* The bytes go to a temp file inside `blobs/`, which is hashed and then renamed to its id. If the id is already present, the temp file is discarded, so each byte sequence is stored once per replica. `put` creates the temp file as a copy-on-write clone of the source where the filesystem supports it (APFS, same volume); elsewhere it is a byte copy.
-  - *Object store.* An id already present is not uploaded again. Otherwise the source is hashed while it is uploaded, and a multipart upload is completed only if the hash equals the id it was started under. A single-part upload sends bytes that were already hashed in memory. Because the key is the hash of the bytes, two machines uploading the same blob at once write identical objects, so blobs need no conditional write.
+  - *Object store.* The bytes are first staged into this machine's blob cache (§5.2) while they are hashed, so the upload reads a stable local copy that already has its id. An id already present in the store is not uploaded again; otherwise the staged file is uploaded, in parts when large. Because the key is the hash of the bytes, two machines uploading the same blob at once write identical objects, so blobs need no conditional write. Bytes downloaded into the cache are hashed and must equal their id before they are used.
 - **Catalog-only blobs.** A replica may hold claims about a blob whose bytes it does not store. This covers files put with `--no-store`, and blobs left out of a partial import. Such a blob is still identified by its hash, and its `knowa:source` says where the bytes were.
   - `blob.get` is `not_found` for it.
   - It has no full-text content (§7.2).
