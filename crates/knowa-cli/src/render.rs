@@ -290,7 +290,11 @@ pub fn put(r: &knowa_api::PutResult) -> Vec<String> {
             i.path.display(),
             i.blob,
             i.size,
-            if i.created { "created" } else { "exists" },
+            match (i.created, i.stored) {
+                (true, _) => "created",
+                (false, true) => "exists",
+                (false, false) => "catalog only",
+            },
             i.claims.len()
         ));
         out.extend(i.errors.iter().map(|e| format!("  error: {e}")));

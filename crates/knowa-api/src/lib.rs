@@ -43,12 +43,24 @@ pub struct InitResult {
     pub claims: Vec<Id>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PutOptions {
+    /// skip the built-in extractors
+    pub no_extract: bool,
+    /// catalog only: hash each file in place and write its claims without copying its
+    /// bytes into the replica (DESIGN §5 Catalog-only blobs)
+    pub no_store: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PutItem {
     pub path: PathBuf,
     pub blob: Id,
     pub created: bool,
+    /// the replica holds this file's bytes after this item: always true when stored now,
+    /// and under no_store true only if an earlier put already stored them
+    pub stored: bool,
     pub size: u64,
     /// ids of claims written for this file (by the actor and by the extract worker)
     pub claims: Vec<Id>,
@@ -190,10 +202,12 @@ impl Knowa {
     /// they are simply not walked, as documented in CLI help). Per file: blob_put,
     /// `knowa:name` + `knowa:source` (absolute path) + `knowa:modified` + `knowa:created`
     /// (when the OS reports one) by the actor, then (unless `no_extract`) extractors
-    /// written as the extract actor. Nonexistent path → `not_found`; a file whose size or
-    /// modification time changed while being stored → `conflict` (DESIGN §7).
-    pub fn put(&self, sel: &Sel, paths: &[PathBuf], no_extract: bool) -> Result<PutResult> {
-        ingest::put(&self.home, sel, paths, no_extract)
+    /// written as the extract actor. With `no_store` each file is hashed in place
+    /// instead of stored, and extractors read the source (DESIGN §5 Catalog-only blobs).
+    /// Nonexistent path → `not_found`; a file whose size or modification time changed
+    /// while being stored (or hashed and extracted) → `conflict` (DESIGN §7).
+    pub fn put(&self, sel: &Sel, paths: &[PathBuf], opts: PutOptions) -> Result<PutResult> {
+        ingest::put(&self.home, sel, paths, opts)
     }
 
     /// Runs built-in extractors on blobs that lack their output (`all` = re-run every

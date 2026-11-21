@@ -204,6 +204,9 @@ pub struct PutArgs {
     /// Do not run the built-in extractors
     #[arg(long)]
     pub no_extract: bool,
+    /// Record the files without copying their bytes into the replica (catalog only)
+    #[arg(long)]
+    pub no_store: bool,
 }
 
 #[derive(Debug, Args)]

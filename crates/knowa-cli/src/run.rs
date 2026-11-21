@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-use knowa_api::{Knowa, Sel};
+use knowa_api::{Knowa, PutOptions, Sel};
 use knowa_config::Home;
 use knowa_model::query::{
     ContextDoc, FindDoc, GetDoc, LogDoc, Near, NearId, Order, PathDoc, QueryDoc, Target, View, WhenRange, Where,
@@ -86,7 +86,8 @@ fn dispatch(cmd: Cmd, g: &Globals, out: &mut Out) -> Result<()> {
             Ok(())
         }
         Cmd::Put(a) => {
-            let r = g.knowa()?.put(&g.sel, &a.paths, a.no_extract)?;
+            let opts = PutOptions { no_extract: a.no_extract, no_store: a.no_store };
+            let r = g.knowa()?.put(&g.sel, &a.paths, opts)?;
             out.result(|| json_of!(&r), || Ok(render::put(&r)))
         }
         Cmd::Note(a) => note(a, g, out),

@@ -7,11 +7,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use knowa_api::{Knowa, Sel};
+use knowa_api::{Knowa, PutOptions, Sel};
 use knowa_config::Home;
 use knowa_model::query::{FindItems, MAX_LIMIT, QueryDoc, QueryResult};
 use knowa_model::view::{EntityWhen, WhenSource};
-use knowa_model::vocab::{ACTOR_KIND, CREATED, MODIFIED, OWNER};
+use knowa_model::vocab::{ACTOR_KIND, CREATED, MEDIA_TYPE, MODIFIED, NAME, OWNER, SIZE, SOURCE};
 use knowa_model::{ActorKind, ClaimBody, Draft, ErrorCode, Id, Signer, Term, Timestamp, Value, When};
 use knowa_store::{BundleMeta, Replica, write_bundle};
 
@@ -240,7 +240,7 @@ fn put_records_the_file_times_and_dates_the_blob_by_its_mtime() {
     let mtime = UNIX_EPOCH + Duration::from_millis(1_400_000_000_500);
     let path = file_at(&s, "report.txt", b"quarterly numbers\n", mtime);
 
-    let put = k.put(&sel, std::slice::from_ref(&path), false).unwrap();
+    let put = k.put(&sel, std::slice::from_ref(&path), PutOptions::default()).unwrap();
     let item = &put.items[0];
     assert!(item.errors.is_empty(), "{:?}", item.errors);
     let modified = when_claims(&k, &sel, &item.blob, MODIFIED);
@@ -266,8 +266,8 @@ fn a_later_copy_of_the_same_bytes_does_not_move_when() {
     let original = file_at(&s, "original.jpg", bytes, UNIX_EPOCH + Duration::from_secs(1_400_000_000));
     let copy = file_at(&s, "copy.jpg", bytes, UNIX_EPOCH + Duration::from_secs(1_700_000_000));
 
-    let first = k.put(&sel, &[original], false).unwrap().items.remove(0);
-    let second = k.put(&sel, &[copy], false).unwrap().items.remove(0);
+    let first = k.put(&sel, &[original], PutOptions::default()).unwrap().items.remove(0);
+    let second = k.put(&sel, &[copy], PutOptions::default()).unwrap().items.remove(0);
     assert_eq!(first.blob, second.blob);
     let raw: Vec<String> = when_claims(&k, &sel, &first.blob, MODIFIED).into_iter().map(|(w, _)| w.raw).collect();
     assert_eq!(raw, vec!["2014-05-13T16:53:20Z", "2023-11-14T22:13:20Z"], "both observations are kept");
@@ -280,9 +280,85 @@ fn re_putting_an_untouched_file_creates_no_claims() {
     let s = Scratch::new("put-again");
     let (k, sel, _) = alice(&s);
     let path = file_at(&s, "notes.txt", b"unchanged\n", UNIX_EPOCH + Duration::from_secs(1_500_000_000));
-    let first = k.put(&sel, std::slice::from_ref(&path), false).unwrap().items.remove(0);
+    let first = k.put(&sel, std::slice::from_ref(&path), PutOptions::default()).unwrap().items.remove(0);
     let before = claim_count(&k, &sel);
-    let again = k.put(&sel, &[path], false).unwrap().items.remove(0);
+    let again = k.put(&sel, &[path], PutOptions::default()).unwrap().items.remove(0);
     assert_eq!(claim_count(&k, &sel), before);
     assert_eq!(again.claims, first.claims, "the existing claims are returned");
+}
+
+// ---------- put --no-store: catalog-only blobs (DESIGN §5) ----------
+
+fn catalog_only() -> PutOptions {
+    PutOptions { no_store: true, ..PutOptions::default() }
+}
+
+/// The objects of the `p` claims about `s`, oldest first.
+fn objects(k: &Knowa, sel: &Sel, s: &Id, p: &str) -> Vec<Value> {
+    let doc = serde_json::json!({"op": "find", "target": "claims", "where": {"s": [s], "p": [p]}, "order": "recorded"});
+    match find(k, sel, doc) {
+        FindItems::Claims(c) => c.into_iter().map(|c| c.claim.body.o).collect(),
+        FindItems::Entities(_) => panic!("target is claims"),
+    }
+}
+
+#[test]
+fn put_no_store_records_a_file_without_storing_its_bytes() {
+    let s = Scratch::new("put-catalog");
+    let (k, sel, _) = alice(&s);
+    let bytes = b"lecture 3: integrals\n";
+    let path = file_at(&s, "lecture.txt", bytes, UNIX_EPOCH + Duration::from_secs(1_400_000_000));
+
+    let item = k.put(&sel, std::slice::from_ref(&path), catalog_only()).unwrap().items.remove(0);
+    assert_eq!((&item.blob, item.size), (&Id::blob_of(bytes), bytes.len() as u64));
+    assert_eq!((item.created, item.stored), (false, false));
+    assert!(item.errors.is_empty(), "{:?}", item.errors);
+    assert_eq!(k.blob_path(&sel, &[], &item.blob).unwrap_err().code, ErrorCode::NotFound);
+
+    let b = &item.blob;
+    assert_eq!(objects(&k, &sel, b, NAME), vec![Value::text("lecture.txt")]);
+    assert_eq!(objects(&k, &sel, b, SOURCE), vec![Value::text(path.to_str().unwrap())]);
+    assert_eq!(objects(&k, &sel, b, MODIFIED), vec![Value::When(When::parse("2014-05-13T16:53:20Z").unwrap())]);
+    // Extractor output, read from the source.
+    assert_eq!(objects(&k, &sel, b, MEDIA_TYPE), vec![Value::text("text/plain")]);
+    assert_eq!(objects(&k, &sel, b, SIZE), vec![Value::Int(bytes.len() as i64)]);
+    let when = entity_when(&k, &sel, b);
+    assert_eq!((when.source, when.value.as_str()), (WhenSource::File, "2014-05-13T16:53:20Z"));
+
+    // Extractors need bytes: both the default run (blobs lacking some extractor's
+    // output; this one has no exif@1 claim) and a full re-run skip it.
+    for all in [false, true] {
+        let r = k.extract(&sel, all).unwrap();
+        assert_eq!((r.blobs, r.claims), (0, 0), "all = {all}");
+        assert!(r.errors.is_empty(), "all = {all}: {:?}", r.errors);
+    }
+}
+
+#[test]
+fn a_later_put_stores_a_catalog_only_file_under_the_same_id() {
+    let s = Scratch::new("put-catalog-then-store");
+    let (k, sel, _) = alice(&s);
+    let bytes = b"textbook, chapter 1\n";
+    let path = file_at(&s, "chapter1.txt", bytes, UNIX_EPOCH + Duration::from_secs(1_500_000_000));
+    let catalogued = k.put(&sel, std::slice::from_ref(&path), catalog_only()).unwrap().items.remove(0);
+    let before = claim_count(&k, &sel);
+
+    let stored = k.put(&sel, &[path], PutOptions::default()).unwrap().items.remove(0);
+    assert_eq!(stored.blob, catalogued.blob);
+    assert_eq!((stored.created, stored.stored), (true, true));
+    assert_eq!(fs::read(k.blob_path(&sel, &[], &stored.blob).unwrap()).unwrap(), bytes);
+    assert_eq!(claim_count(&k, &sel), before, "storing the bytes later writes no claims");
+    assert_eq!(stored.claims, catalogued.claims, "the existing claims are returned");
+}
+
+#[test]
+fn put_no_store_of_already_stored_bytes_reports_them_stored() {
+    let s = Scratch::new("put-store-then-catalog");
+    let (k, sel, _) = alice(&s);
+    let path = file_at(&s, "notes.txt", b"stored first\n", UNIX_EPOCH + Duration::from_secs(1_500_000_000));
+    let first = k.put(&sel, std::slice::from_ref(&path), PutOptions::default()).unwrap().items.remove(0);
+
+    let again = k.put(&sel, &[path], catalog_only()).unwrap().items.remove(0);
+    assert_eq!(again.blob, first.blob);
+    assert_eq!((again.created, again.stored), (false, true));
 }

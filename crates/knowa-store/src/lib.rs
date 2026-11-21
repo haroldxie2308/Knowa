@@ -347,6 +347,12 @@ fn manifest_kind_problem(m: &Manifest) -> Option<String> {
         .map(|(field, id, kind)| format!("{field} {id} is not a {kind:?} id"))
 }
 
+/// Hashes the file at `path` in place, without storing it (DESIGN §5 Catalog-only
+/// blobs). Missing → not_found; not a regular file → invalid.
+pub fn hash_file(path: &Path) -> Result<(Id, u64)> {
+    blob::hash_file(path)
+}
+
 /// Writes a tar bundle: `bundle.json`, then `log/<actor>/<segment>.jsonl` containing
 /// exactly `claims` (grouped per actor, ascending seq), then `blobs/<..>/<id>` for `blobs`.
 /// Selecting which claims/blobs is the caller's job.

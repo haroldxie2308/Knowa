@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use knowa_model::vocab::OWNER;
 use knowa_model::{Claim, ClaimBody, Draft, ErrorCode, Id, Signer, Term, Timestamp, Value};
-use knowa_store::{BundleMeta, Head, Manifest, Replica, import_bundle, write_bundle};
+use knowa_store::{BundleMeta, Head, Manifest, Replica, hash_file, import_bundle, write_bundle};
 
 struct Scratch(PathBuf);
 
@@ -413,6 +413,35 @@ fn put_blob_file_rejects_missing_and_non_regular_sources() {
     assert_eq!(r.put_blob_file(&dir).unwrap_err().code, ErrorCode::Invalid);
     assert_no_temp_files(&r);
     assert!(r.blob_ids().unwrap().is_empty());
+}
+
+#[test]
+fn hash_file_gives_the_stored_id_and_size_without_storing() {
+    let s = Scratch::new("hashfile");
+    let (r, _, _) = new_space(&s.path("r"));
+    // Larger than one copy buffer.
+    let data: Vec<u8> = (0..300_000u32).map(|i| (i % 241) as u8).collect();
+    let src = s.path("source.bin");
+    fs::write(&src, &data).unwrap();
+
+    let (id, size) = hash_file(&src).unwrap();
+    assert_eq!(fs::read_dir(r.root().join("blobs")).unwrap().count(), 0, "hashing wrote into blobs/");
+    assert!(!r.has_blob(&id));
+    let (stored, _, stored_size) = r.put_blob(&mut data.as_slice()).unwrap();
+    assert_eq!((id, size), (stored, stored_size));
+}
+
+#[test]
+fn hash_file_rejects_missing_and_non_regular_sources() {
+    let s = Scratch::new("hashfile-bad");
+    let missing = s.path("no-such-file");
+    let err = hash_file(&missing).unwrap_err();
+    assert_eq!(err.code, ErrorCode::NotFound);
+    assert!(err.message.contains(&missing.display().to_string()), "{}", err.message);
+
+    let dir = s.path("a-directory");
+    fs::create_dir_all(&dir).unwrap();
+    assert_eq!(hash_file(&dir).unwrap_err().code, ErrorCode::Invalid);
 }
 
 #[cfg(unix)]

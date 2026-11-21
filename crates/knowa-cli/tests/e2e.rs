@@ -366,6 +366,22 @@ fn put_text_file_is_searchable_and_hidden_files_are_skipped() {
 }
 
 #[test]
+fn put_no_store_records_files_whose_bytes_blob_cat_cannot_find() {
+    let sb = Sandbox::new("put-no-store");
+    let alice = setup(&sb);
+    let dir = sb.path("files");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("exam.txt"), "listening section, track 4\n").unwrap();
+
+    let r = alice.ok(&["put", "--no-store", s(&dir)]);
+    let item = &r["items"][0];
+    assert_eq!((&item["stored"], &item["created"]), (&json!(false), &json!(false)), "{r}");
+    let blob = item["blob"].as_str().unwrap();
+    let (_, err) = alice.fail(&["blob", "cat", blob]);
+    assert_eq!(err["error"]["code"], "not_found", "{err}");
+}
+
+#[test]
 fn context_shows_claims_inbound_links_and_neighbors() {
     let sb = Sandbox::new("context");
     let alice = setup(&sb);

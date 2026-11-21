@@ -64,9 +64,28 @@ pub(crate) fn hash_reader(r: &mut dyn Read, what: &dyn Fn() -> String) -> Result
     Ok((hasher.finish(), size))
 }
 
-fn hash_file(path: &Path) -> Result<Id> {
-    let mut f = File::open(path).map_err(|e| io_err(path, e))?;
-    Ok(hash_reader(&mut f, &|| path.display().to_string())?.0)
+/// Hashes the file at `src` in place, storing nothing (DESIGN §5 Catalog-only blobs).
+pub(crate) fn hash_file(src: &Path) -> Result<(Id, u64)> {
+    regular_source(src)?;
+    let mut f = File::open(src).map_err(|e| source_err(src, e))?;
+    hash_reader(&mut f, &|| src.display().to_string())
+}
+
+fn source_err(src: &Path, e: io::Error) -> Error {
+    match e.kind() {
+        io::ErrorKind::NotFound => Error::not_found(format!("blob source not found: {}", src.display())),
+        _ => io_err(src, e),
+    }
+}
+
+/// The metadata of `src`, which must be a regular file. Checked before `src` is
+/// opened or copied: opening a FIFO would block.
+fn regular_source(src: &Path) -> Result<fs::Metadata> {
+    let meta = fs::metadata(src).map_err(|e| source_err(src, e))?;
+    if !meta.is_file() {
+        return Err(Error::invalid(format!("blob source is not a regular file: {}", src.display())));
+    }
+    Ok(meta)
 }
 
 /// Two fan-out characters taken from the digest. `id[2..5]` is always `ciq` (the
@@ -129,22 +148,15 @@ pub(crate) fn put(root: &Path, r: &mut dyn Read) -> Result<(Id, bool, u64)> {
 /// not exist yet), then hashes the temp file, never `src`, and publishes it. A locked
 /// source is streamed instead (see `has_lock_flags`).
 pub(crate) fn put_file(root: &Path, src: &Path) -> Result<(Id, bool, u64)> {
-    let source_err = |e: io::Error| match e.kind() {
-        io::ErrorKind::NotFound => Error::not_found(format!("blob source not found: {}", src.display())),
-        _ => io_err(src, e),
-    };
-    let meta = fs::metadata(src).map_err(source_err)?;
-    // Checked up front, not left to `fs::copy`: opening a FIFO would block.
-    if !meta.is_file() {
-        return Err(Error::invalid(format!("blob source is not a regular file: {}", src.display())));
-    }
+    // Checked up front, not left to `fs::copy`.
+    let meta = regular_source(src)?;
     if has_lock_flags(&meta) {
         // Fallback: a locked source (Finder "Locked", `chflags uchg`). macOS copies BSD
         // file flags onto a clone and onto an `fcopyfile` copy alike, and std cannot
         // clear them, so the temp file could be neither chmod-ed, renamed nor deleted.
         // Streaming makes a fresh file without flags: still a byte copy, hashed as it
         // is written, so the stored bytes match their id. Only the clone is lost.
-        let mut f = File::open(src).map_err(source_err)?;
+        let mut f = File::open(src).map_err(|e| source_err(src, e))?;
         return put(root, &mut f);
     }
     let dir = root.join(BLOB_DIR);
@@ -248,6 +260,6 @@ pub(crate) fn scan(root: &Path) -> Result<Scan> {
 
 /// Recomputes the hash of the blob at `path` and compares it with `id`.
 pub(crate) fn check(id: &Id, path: &Path) -> Result<Option<String>> {
-    let got = hash_file(path)?;
+    let (got, _) = hash_file(path)?;
     Ok((got != *id).then(|| format!("{}: content hashes to {got}", path.display())))
 }

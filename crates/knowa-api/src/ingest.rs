@@ -14,22 +14,22 @@ use knowa_model::{Draft, Error, Id, Result, Timestamp, Value, When, vocab};
 
 use crate::select::{Space, current};
 use crate::write::{Txn, stamp_worker, term};
-use crate::{ExtractResult, PutItem, PutResult, Sel};
+use crate::{ExtractResult, PutItem, PutOptions, PutResult, Sel};
 
-pub(crate) fn put(home: &Home, sel: &Sel, paths: &[PathBuf], no_extract: bool) -> Result<PutResult> {
+pub(crate) fn put(home: &Home, sel: &Sel, paths: &[PathBuf], opts: PutOptions) -> Result<PutResult> {
     if paths.is_empty() {
         return Err(Error::invalid("put: no paths given"));
     }
     let space = current(home, sel)?;
     space.ensure_writable()?;
     let actor = home.resolve_actor(sel.actor.as_deref())?;
-    let extractor = if no_extract { None } else { Some(home.extract_actor()?) };
+    let extractor = if opts.no_extract { None } else { Some(home.extract_actor()?) };
     // The whole file list is gathered (and every named path checked) before anything
     // is written.
     let files = collect_files(paths)?;
     let mut items = Vec::with_capacity(files.len());
     for f in &files {
-        items.push(put_file(&space, &actor, extractor.as_ref(), f)?);
+        items.push(put_file(&space, &actor, extractor.as_ref(), opts.no_store, f)?);
     }
     Ok(PutResult { items })
 }
@@ -77,7 +77,10 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn put_file(space: &Space, actor: &Actor, extractor: Option<&Actor>, path: &Path) -> Result<PutItem> {
+/// Extractor successes and per-extractor failures for one file.
+type Extracted = (Vec<Extraction>, Vec<ExtractionError>);
+
+fn put_file(space: &Space, actor: &Actor, extractor: Option<&Actor>, no_store: bool, path: &Path) -> Result<PutItem> {
     let utf8 = |s: Option<&str>, what: &str| {
         s.map(str::to_string)
             .ok_or_else(|| Error::invalid(format!("put: {what} of {} is not valid UTF-8", path.display())))
@@ -88,13 +91,32 @@ fn put_file(space: &Space, actor: &Actor, extractor: Option<&Actor>, path: &Path
         io::ErrorKind::NotFound => Error::not_found(format!("put: file disappeared: {}", path.display())),
         _ => Error::from(e),
     };
-    // Times are read before and after the bytes are stored (DESIGN §7, `put`), from the
-    // path, so the check covers the file being rewritten or replaced at that path.
+    // Extraction is pure and may be slow: it runs before the write lock is taken.
+    let extract = |blob: &Id, bytes: &Path| -> Result<Option<Extracted>> {
+        extractor.map(|_| knowa_extract::run(blob, bytes, Some(&name), None)).transpose()
+    };
+    // Times are read before and after the bytes are obtained (DESIGN §7, `put`), from
+    // the path, so the check covers the file being rewritten or replaced at that path.
     let meta = fs::metadata(path).map_err(disappeared)?;
     let before = Stat::of(&meta)?;
-    // Same-volume APFS sources are stored as a clone (DESIGN §5 Blob path).
-    let (blob, created, size) = space.replica.put_blob_file(path)?;
-    unchanged(path, before, Stat::of(&fs::metadata(path).map_err(disappeared)?)?)?;
+    let after = || unchanged(path, before, Stat::of(&fs::metadata(path).map_err(disappeared)?)?);
+    let (blob, created, stored, size, extracted) = if no_store {
+        // Catalog only (DESIGN §5 Catalog-only blobs): hashed in place, never copied.
+        let (blob, size) = knowa_store::hash_file(path)?;
+        // Extractors read the source, which can still change: the check runs after
+        // them, so their output belongs to the hashed bytes as much as the times do.
+        let extracted = extract(&blob, path)?;
+        after()?;
+        let stored = space.replica.has_blob(&blob);
+        (blob, false, stored, size, extracted)
+    } else {
+        // Same-volume APFS sources are stored as a clone (DESIGN §5 Blob path).
+        let (blob, created, size) = space.replica.put_blob_file(path)?;
+        after()?;
+        // Extractors read the stored blob, which is immutable.
+        let extracted = extract(&blob, &space.replica.blob_path(&blob)?)?;
+        (blob, created, true, size, extracted)
+    };
 
     let mut errors = Vec::new();
     let mut drafts = vec![
@@ -125,12 +147,6 @@ fn put_file(space: &Space, actor: &Actor, extractor: Option<&Actor>, path: &Path
         }
     }
 
-    // Extraction is pure and may be slow: it runs before the write lock is taken.
-    let extracted = match extractor {
-        Some(_) => Some(knowa_extract::run(&blob, &space.replica.blob_path(&blob)?, Some(&name), None)?),
-        None => None,
-    };
-
     let mut txn = Txn::begin(space)?;
     let described = txn.write(actor, drafts)?;
     let mut claims: Vec<Id> = described.result.items.into_iter().map(|i| i.id).collect();
@@ -141,7 +157,7 @@ fn put_file(space: &Space, actor: &Actor, extractor: Option<&Actor>, path: &Path
         }
         errors.extend(failures.iter().map(describe_failure));
     }
-    Ok(PutItem { path: path.to_path_buf(), blob, created, size, claims, errors })
+    Ok(PutItem { path: path.to_path_buf(), blob, created, stored, size, claims, errors })
 }
 
 /// What must not change while `put` stores a file (DESIGN §7, `put`).
