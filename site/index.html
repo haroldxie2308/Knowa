@@ -1,0 +1,667 @@
+<!doctype html>
+<html lang="en" data-type="software" data-radius="sharp" data-ground="sky" data-buttons="solid" data-motion>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Knowa: a knowledge base for humans and agents</title>
+<meta name="description" content="A local-first knowledge-base format and Rust CLI in which people and their agents write signed, append-only claims.">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Knowa: a knowledge base for humans and agents">
+<meta property="og:description" content="A local-first knowledge-base format and Rust CLI in which people and their agents write signed, append-only claims.">
+<meta property="og:image" content="share.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<meta name="theme-color" content="#161c1a">
+<!-- canonical: none until the project has a public domain -->
+<meta name="site-kind" content="software">
+<meta name="page-type" content="software">
+<!-- fonts: Geist and Geist Mono (SIL Open Font License, fonts/OFL.txt), self-hosted, latin subset; no request leaves the page -->
+<link rel="preload" href="fonts/geist-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="fonts/geist-mono-latin.woff2" as="font" type="font/woff2" crossorigin>
+<style>
+@font-face { font-family: "Geist"; font-style: normal; font-weight: 400 700; font-display: swap; src: url("fonts/geist-latin.woff2") format("woff2"); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+@font-face { font-family: "Geist Mono"; font-style: normal; font-weight: 400 500; font-display: swap; src: url("fonts/geist-mono-latin.woff2") format("woff2"); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+</style>
+<link rel="stylesheet" href="assets/system.css">
+<link rel="stylesheet" href="assets/ui/cards.css">
+<link rel="stylesheet" href="assets/motion/motion.css">
+<link rel="stylesheet" href="assets/backgrounds/backgrounds.css">
+<link rel="stylesheet" href="assets/layout/layout.css">
+<link rel="stylesheet" href="assets/icons/icon.css">
+<style>
+:root {
+  --p-bg: #161c1a; --p-surface: #1f2725; --p-ink: #e3e2da; --p-muted: #8e948d;
+  --p-accent: #9fc7b8; --p-accent-ink: #161c1a; --p-action: #9fc7b8; --p-action-ink: #161c1a;
+  --p-inv-bg: #e3e2da; --p-inv-surface: #d3d2cb; --p-inv-ink: #161c1a; --p-inv-muted: #555a55;
+  --p-inv-accent: #161c1a; --p-inv-accent-ink: #e3e2da; --p-inv-action: #161c1a; --p-inv-action-ink: #e3e2da;
+  --font-display: "Geist", system-ui, sans-serif;
+  --font-text: "Geist", system-ui, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  --display-weight: 500;
+  --display-tracking: -0.035em;
+  --display-tracking-xl: -0.045em;
+}
+</style>
+<link rel="stylesheet" href="assets/ui/base.css">
+<link rel="stylesheet" href="assets/ui/terminal-run/fragment.css">
+<link rel="stylesheet" href="assets/diagrams/diagram.css">
+<script>document.documentElement.classList.add('m-enter');setTimeout(()=>document.documentElement.classList.add('m-enter-done'),700)</script>
+<script src="assets/backgrounds/backgrounds.js"></script>
+<script>document.documentElement.classList.add('mo-js');setTimeout(()=>document.documentElement.classList.add('mo-safe'),2500)</script>
+<link rel="modulepreload" href="assets/moments/moments.js">
+<link rel="modulepreload" href="assets/moments/lib.js">
+<link rel="modulepreload" href="assets/moments/liquid-type/moment.js">
+<link rel="modulepreload" href="assets/moments/pinned-chapters/moment.js">
+<!-- page CSS: inside the visuals (the terminals, the app frame), one --p-h per card group and the split's stacked gap -->
+<style>
+  /* the terminals: the kit's terminal look (ui/terminal-run, .ui-term) holding knowa's real output, a dark screen on
+     the lit ground. Each line is program output (<samp>) and wraps as a terminal wraps it: nothing is shortened */
+  .ui-term samp.ui-term__ln { font: inherit; }
+  .kt { width: 100%; --fx-bg: #0f1513; --fx-surface: #19211e; --fx-ink: #e3e2da; --fx-muted: #959d95; --fx-accent: #9fc7b8; }
+  .kt .ui-term__screen { -webkit-mask: none; mask: none; }
+  .kt .ui-term__head .ui-icon { color: var(--u-muted); }
+  .kt .ui-term__ln:not(.ui-term__cmd) { display: block; height: auto; white-space: pre-wrap; word-break: break-all; }
+  .kt .ui-term__cmd { height: auto; min-height: 20px; align-items: flex-start; }
+  .kt .ui-term__cmd > .ui-term__typed { flex: 0 1 auto; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .kt .ui-term__cmd > .ui-term__caret { margin-top: 2px; }
+  /* a window that reaches the panel's foot grows with its lines: the panel cuts it, never the window itself */
+  .stage > .to-edge > .kt { height: auto; min-height: 100%; }
+  .kt .k-m { color: var(--u-muted); }
+  .kt .k-hl { color: var(--u-accent); }
+  .kt .k-on { background: color-mix(in oklab, var(--u-accent) 16%, transparent); }
+  .kt.k-j b, .kt .k-j b { font-weight: 400; color: var(--u-muted); }
+
+  /* the app frame (sections-library.md, app-frame): one window across the wrap, its two panes */
+  .app.ui { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); margin-top: var(--s-7); background: var(--u-bg); border: 1px solid var(--u-border); border-radius: var(--u-r); box-shadow: var(--u-shadow); }
+  .app > .app__pane { position: relative; min-width: 0; min-height: 0; overflow: hidden; }
+  .app > .app__pane + .app__pane { border-left: 1px solid var(--u-line); }
+  .app > .app__pane > .ui-panel { width: 100%; border: 0; border-radius: 0; box-shadow: none; }
+  .app > .app__pane::after { content: ""; position: absolute; inset: auto 0 0 0; height: 64px; background: linear-gradient(transparent, var(--u-bg)); pointer-events: none; }
+  @media (min-width: 1024px) and (max-width: 1279px) { .app.ui { grid-template-columns: minmax(0, 4fr) minmax(0, 8fr); } }
+  @media (max-width: 1023px) {
+    .app.ui { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+    .app > .app__pane--list { max-height: 252px; }
+    .app > .app__pane--list::after { display: none; }
+    .app > .app__pane + .app__pane { border-left: 0; border-top: 1px solid var(--u-line); }
+  }
+  @media (max-width: 639px) {
+    .app.ui { grid-template-rows: minmax(0, 1fr); }
+    .app > .app__pane--list { display: none; }
+    .app > .app__pane + .app__pane { border-top: 0; }
+  }
+  .app.ui { --fx-bg: #0f1513; --fx-surface: #19211e; --fx-ink: #e3e2da; --fx-muted: #959d95; --fx-accent: #9fc7b8; }
+
+  /* the hero: the lead is read, so it takes the ink (7:1); the window's pause button takes the lit ground's colours,
+     so its focus ring shows on that ground; a phone shows the review alone */
+  .hero--centred .hero__lead { color: var(--ink); }
+  .hero__window { --bg: var(--ground-surface); --ink: var(--ground-ink); }
+  @media (max-width: 639px) { .hero__window .ui-term__ln.k-ph { display: none; } }
+
+  /* one panel height per card group and per lit frame */
+  #review .panel { --p-h: 312px; }
+  #files .panel { --p-h: 400px; }
+  #install .panel { --p-h: 400px; }
+  #search .frame, #agents .frame { --ratio: 80%; }
+  #design .frame { --ratio: 0px; }
+  @media (min-width: 1024px) and (max-width: 1279px) {
+    #review .panel { --p-h: 256px; }
+    #agents .frame { --ratio: 120%; }
+    #install .panel { --p-h: 280px; }
+    :is(#design, #install) > .wrap.grid > .span-5 { grid-column: 1 / span 6; }
+  }
+  /* the steps at rest (under 1024px, or under reduced motion) stand in two whole screens, so the next section never peeks in */
+  @media (max-width: 1023px) { main > #sharing[data-moment]:not(.is-live) { min-height: 200svh; } }
+  @media (max-width: 639px) { main > #sharing[data-moment]:not(.is-live) { min-height: 200lvh; } }
+  /* the steps' visuals: a terminal on the lit ground, whole. Held live, the stage's heading stands where every
+     section's does, --padt under the top (the moment centres it by default) */
+  #sharing .mo-pc__visual--lit > .kt { max-width: 560px; }
+  main > #sharing[data-moment].is-live > .mo-pc__grid { align-content: start; padding-top: var(--padt); }
+  main > #sharing[data-moment].is-live .mo-pc__visuals { aspect-ratio: auto; height: calc(100svh - var(--padt) - var(--padb)); max-height: none; background: var(--ground-bg); border-color: transparent; }
+  main > #sharing[data-moment].is-live .mo-pc__visual--lit { background: none; }
+  @media (min-width: 1280px) { #design .frame { min-height: 640px; } #search .frame, #agents .frame { --ratio: 110%; } }
+  /* a tablet held upright from 800px (820x1180): the pictures take the room its taller screen gives */
+  @media (min-width: 800px) and (max-width: 1023px) {
+    main #search .frame { --ratio: 80%; } main #agents .frame { --ratio: 90%; }
+    main #files .panel { --p-h: 600px; } main #install .panel { --p-h: 600px; }
+    main #sharing .mo-pc__visual--lit { aspect-ratio: 16 / 10; }
+  }
+  /* the app frame's panes hold what fits them under 1280px; lines past that would only run on under the cut */
+  @media (max-width: 1279px) { .app .ui-term__track > samp:nth-child(n+14), .app__pane--list .ui-term__track > samp:nth-child(n+9) { display: none; } }
+  /* a tablet held upright from 800px: the 2x2's panels take the room its two screens give */
+  @media (min-width: 800px) and (max-width: 1023px) { #review .panel { --p-h: 560px; } }
+  /* the phone hero's pill keeps its first fact, so it stays narrower than half the column */
+  @media (max-width: 639px) { .hero .pill .muted { display: none; } }
+  @media (max-width: 1023px) { .grid > :is(.frame, .panel) { margin-top: var(--s-6); } }
+  /* the tablet keeps the principles beside their heading, so the section stays one screen there */
+  @media (min-width: 640px) and (max-width: 1023px) {
+    :is(#design, #install) > .wrap.grid > .span-5 { grid-column: 1 / span 5; }
+    :is(#design, #install) > .wrap.grid > :is(.frame, .faq) { grid-column: 6 / -1; margin-top: 0; }
+    #install .panel { --p-h: 420px; }
+    main > #sharing[data-moment]:not(.is-live) .mo-pc__step { grid-template-columns: minmax(0, 1fr); }
+    main > #sharing[data-moment]:not(.is-live) .mo-pc__step .mo-pc__visual { grid-column: 1; grid-row: auto; margin-top: var(--s-4); }
+    #sharing .mo-pc__visual--lit { aspect-ratio: 2 / 1; }
+    #search .frame { --ratio: 40%; } #agents .frame { --ratio: 75%; }
+  }
+  @media (max-width: 639px) {
+    #review .panel { --p-h: 96px; } #files .panel { --p-h: 300px; } #install .panel { --p-h: 430px; } #sharing .mo-pc__visual--lit { aspect-ratio: 1; }
+    #design .frame { --ratio: 0px; } #search .frame { --ratio: 70%; } #agents .frame { --ratio: 110%; }
+    /* a phone's short panels and panes hold the lines that carry the point; the rest would only run on under the cut */
+    .kt .ui-term__ln.k-p1 { display: none; }
+    .kt .k-j > samp:nth-child(n+13) { display: none; }
+  }
+</style>
+</head>
+<body>
+<!-- type: software (a developer tool: a knowledge-base format and its Rust CLI)
+     deal: hero centred, nav nav-mega, close close-type, footer footer-columns, rhythm space, buttons solid, mark arc,
+     lit ground sky, palette green-black-bone, type geist, radius sharp
+     effect: grain-gradient in the hero window (the one live ground). Card grounds: none (no other quiet ground in
+     its family; the slot is dropped and the panels take the lit ground plain). Section grounds: pick.mjs dealt
+     bg-mist (#search) and bg-band (#install); not built, the rhythm is space (one ground)
+     moments: liquid-type on the #files statement; pinned-chapters in #sharing (marquee-row was dealt first and dealt again
+     with --exclude marquee-row: merged as a row it fails the kit's own checker, its pause button over the running words) -->
+<header class="nav">
+  <div class="wrap nav__bar">
+    <a class="skip-link" href="#top">Skip to content</a>
+    <a class="nav__logo" href="#top"><span class="mark" data-mark="arc" aria-hidden="true"></span>Knowa</a>
+    <nav class="nav__links" aria-label="Main">
+      <div class="nav__item">
+        <a class="nav__link" href="#claims">Claims <svg class="chev" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
+        <div class="nav__menu">
+          <div class="wrap grid">
+            <div class="menu-col span-3">
+              <p class="t-label">Claims</p>
+              <a href="#claims">Provenance<span>Who wrote it, when and why</span></a>
+              <a href="#review">Review<span>Agent output reads as proposed</span></a>
+            </div>
+            <div class="menu-col span-3">
+              <p class="t-label">Files</p>
+              <a href="#files">Indexes<span>Rebuilt from the files</span></a>
+              <a href="#search">Search<span>By text, date and place</span></a>
+            </div>
+            <a class="menu-card span-3 start-10" href="#agents">
+              <div class="panel">
+                <div class="stage stage--fade-br"><div class="at-corner" style="--ax:24px;--ay:24px;width:360px">
+                  <div class="ui ui-panel ui-term kt">
+                    <div class="ui-term__head"><span class="ui-dots" aria-hidden="true"><i></i><i></i><i></i></span><svg class="ui-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 5 3 3-3 3"/><path d="M8.5 11h4"/></svg><span class="ui-term__title">lisbon</span><span class="ui-spacer"></span></div>
+                    <div class="ui-term__screen"><div class="ui-term__track">
+                      <samp class="ui-term__ln ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed">knowa --json schema | jq -r '.primitives | keys[]'</span></samp>
+                      <samp class="ui-term__ln">blob.get</samp>
+                      <samp class="ui-term__ln">blob.put</samp>
+                      <samp class="ui-term__ln">feed</samp>
+                      <samp class="ui-term__ln">query</samp>
+                      <samp class="ui-term__ln">write</samp>
+                    </div></div>
+                  </div>
+                </div></div>
+              </div>
+              <span class="t-card">For agents</span>
+              <span class="t-small muted">One schema call to learn the CLI</span>
+            </a>
+          </div>
+        </div>
+      </div>
+      <div class="nav__item"><a class="nav__link" href="#search">Search</a></div>
+      <div class="nav__item"><a class="nav__link" href="#design">Design</a></div>
+      <div class="nav__item"><a class="nav__link" href="#sharing">Sharing</a></div>
+    </nav>
+    <div class="nav__actions">
+      <a class="btn btn--primary" href="#install">Install from source</a>
+    </div>
+    <button class="nav__toggle" type="button" aria-expanded="false" aria-label="Menu">
+      <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><path d="M2 5h14M2 13h14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+    </button>
+  </div>
+</header>
+
+<main id="top">
+  <section class="hero hero--centred" data-enter aria-labelledby="hero-h">
+    <div class="wrap"><div class="hero-text">
+      <div class="hero__c">
+        <p class="pill"><span>Design v0</span><span class="muted">No public release yet</span></p>
+        <h1 id="hero-h">Knowledge base for humans and agents</h1>
+        <p class="hero__lead">A local-first format and Rust command-line toolkit. People and agents write signed, append-only claims that record who, when, how and why.</p>
+        <div class="btn-row">
+          <a class="btn btn--primary" href="#install">Install from source<svg class="m-arrow" viewBox="0 0 12 12" aria-hidden="true"><path class="m-arrow__stem" d="M1 6h8"/><path class="m-arrow__head" d="M4.5 2.5 8 6l-3.5 3.5"/></svg></a>
+          <a class="btn btn--secondary" href="#design">Read the design</a>
+        </div>
+      </div>
+      <div class="hero__window" data-fx="grain-gradient" data-fx-seed="7" role="img" aria-label="A terminal: knowa pending lists three claims from the agent trip-agent, each proposed; knowa review accept then writes three reviews">
+        <div class="ly-piece">
+          <div class="ui ui-panel ui-term kt" data-ui="terminal-run">
+            <div class="ui-term__head"><span class="ui-dots" aria-hidden="true"><i></i><i></i><i></i></span><svg class="ui-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 5 3 3-3 3"/><path d="M8.5 11h4"/></svg><span class="ui-term__title">lisbon</span><span class="ui-spacer"></span></div>
+            <div class="ui-term__screen" data-term-screen><div class="ui-term__track" data-term-track>
+              <samp class="ui-term__ln ui-term__cmd k-ph"><span class="ui-term__sig">$</span><span class="ui-term__typed">knowa pending</span></samp>
+              <samp class="ui-term__ln k-ph"><span class="k-m">c_ciqovrrdxt63mu3ggmgoydjnlglrmvypvef3g3nmxxo2vuqcdyv63ui</span>  <span class="k-m">e_01m7zmcxha28p1vxnh3jvdwsr9</span>  knowa:summary  "Day trip by ferry to Cacilhas on 17 May, back mid-afternoon."  <span class="k-hl">(proposed)</span></samp>
+              <samp class="ui-term__ln k-ph"><span class="k-m">c_ciqg3h6t25gkjjnbecx5x2bixbpge7kuyfuys3qc3wwd52ecbdqjrmy</span>  <span class="k-m">a_5ua63h2ssy75e3sgzdtzxphquq5crm7gkm5aadpm3ium4swvke66cca</span>  knowa:actorKind  knowa:Agent  <span class="k-hl">(proposed)</span></samp>
+              <samp class="ui-term__ln k-ph"><span class="k-m">c_ciqlsq6xqrc2dtxrv4w55zo7rf6qusqedvf4w374ckdmcmojgbzfgha</span>  <span class="k-m">b_ciqpog37ow6qm6sa3lxw5l4543skkcxwzakwv5ehkryf3uald3k6nfa</span>  knowa:about  <span class="k-m">e_01m7zmcxha28p1vxnh3jvdwsr9</span>  <span class="k-hl">(proposed)</span></samp>
+              <samp class="ui-term__ln ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed" data-term-cmd>knowa review accept --by trip-agent --note "Checked against the photo."</span></samp>
+              <samp class="ui-term__ln" data-term-out>reviews: <span class="k-hl">3 written</span>, 0 already present</samp>
+              <samp class="ui-term__ln ui-term__cmd" data-term-next><span class="ui-term__sig">$</span><span class="ui-term__typed"></span><i class="ui-term__caret" aria-hidden="true"></i></samp>
+            </div></div>
+          </div>
+        </div>
+      </div>
+    </div></div>
+  </section>
+
+  <section class="section" id="claims" aria-labelledby="claims-h">
+    <div class="wrap">
+      <div class="grid">
+        <h2 class="span-5" id="claims-h">Provenance on every claim</h2>
+        <div class="span-6 start-7 stack-4">
+          <p class="t-lead">A claim carries its author's key, its record time, the tool behind it, its sources, a confidence and a note. Nothing is edited: a change is a new claim.</p>
+          <a class="link" href="#review">See how review works</a>
+        </div>
+      </div>
+      <div class="ui app fill" role="img" aria-label="Two terminal panes. Left: knowa context for the note Ferry to Cacilhas, its claims with their status, one agent claim marked stale. Right: that agent claim as JSON, with its actor, record time, confidence 0.9, note, sources, via tool trip-notes and signature">
+        <div class="app__pane app__pane--list">
+          <div class="ui ui-panel ui-term kt">
+            <div class="ui-term__head"><span class="ui-dots" aria-hidden="true"><i></i><i></i><i></i></span><svg class="ui-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 5 3 3-3 3"/><path d="M8.5 11h4"/></svg><span class="ui-term__title">lisbon</span><span class="ui-spacer"></span></div>
+            <div class="ui-term__screen"><div class="ui-term__track">
+              <samp class="ui-term__ln ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed">knowa context e_01m7zmcxha28p1vxnh3jvdwsr9</span></samp>
+              <samp class="ui-term__ln">entity: <span class="k-m">e_01m7zmcxha28p1vxnh3jvdwsr9</span>  Ferry to Cacilhas  [<span class="k-ty">knowa:Note</span>]  2025-05-17  -</samp>
+              <samp class="ui-term__ln">claims:</samp>
+              <samp class="ui-term__ln">  <span class="k-m">c_ciqjbtekzitspddnc6pcg2r4j6qtf3dcc4jxdhonbnrqle5m2hh55ra</span>  <span class="k-m">e_01m7zmcxha28p1vxnh3jvdwsr9</span>  knowa:type  knowa:Note  (accepted)</samp>
+              <samp class="ui-term__ln">  <span class="k-m">c_ciqjru2pwfl2qn5ky4f3z5756qh4wubhsrurqd237ko7hmn5o6anuxq</span>  <span class="k-m">e_01m7zmcxha28p1vxnh3jvdwsr9</span>  knowa:when  2025-05-17  (accepted)</samp>
+              <samp class="ui-term__ln">  <span class="k-m">c_ciqozb4w3d3mfs3nyak65tc7lk7uy6gzjvnloifthxvurp32uu3ohbq</span>  <span class="k-m">e_01m7zmcxha28p1vxnh3jvdwsr9</span>  knowa:label  "Ferry to Cacilhas"  (accepted)</samp>
+              <samp class="ui-term__ln">  <span class="k-m">c_ciqovrrdxt63mu3ggmgoydjnlglrmvypvef3g3nmxxo2vuqcdyv63ui</span>  <span class="k-m">e_01m7zmcxha28p1vxnh3jvdwsr9</span>  knowa:summary  "Day trip by ferry to Cacilhas on 17 May, back mid-afternoon."  (accepted, stale)</samp>
+              <samp class="ui-term__ln">  <span class="k-m">c_ciqnhsgymbjaxqh2srhizszvk7qfv7ctqgy2drafrgizfdyfojdnuka</span>  <span class="k-m">e_01m7zmcxha28p1vxnh3jvdwsr9</span>  knowa:body  "Took the 10:40 ferry from Cais do Sodré to Cacilhas. Lunch by the harbour, back …"  (accepted)</samp>
+              <samp class="ui-term__ln">inbound:</samp>
+              <samp class="ui-term__ln k-on">  <span class="k-m">c_ciqlsq6xqrc2dtxrv4w55zo7rf6qusqedvf4w374ckdmcmojgbzfgha</span>  <span class="k-m">b_ciqpog37ow6qm6sa3lxw5l4543skkcxwzakwv5ehkryf3uald3k6nfa</span>  knowa:about  <span class="k-m">e_01m7zmcxha28p1vxnh3jvdwsr9</span>  <span class="k-hl">(accepted, stale)</span></samp>
+              <samp class="ui-term__ln">neighbors:</samp>
+              <samp class="ui-term__ln">  1  in  knowa:about  <span class="k-m">b_ciqpog37ow6qm6sa3lxw5l4543skkcxwzakwv5ehkryf3uald3k6nfa</span>  IMG_2041.jpg  [<span class="k-ty">knowa:Photo</span>]  2025-05-17T11:02:40+01:00  38.687,-9.149</samp>
+              <samp class="ui-term__ln">temporal:</samp>
+              <samp class="ui-term__ln">  <span class="k-m">e_01m7zmcxhzf2hrs6ye6fxd3pc7</span>  Dinner on Saturday  [<span class="k-ty">knowa:Note</span>]  2025-05-17  -</samp>
+              <samp class="ui-term__ln">  <span class="k-m">b_ciqpog37ow6qm6sa3lxw5l4543skkcxwzakwv5ehkryf3uald3k6nfa</span>  IMG_2041.jpg  [<span class="k-ty">knowa:Photo</span>]  2025-05-17T11:02:40+01:00  38.687,-9.149</samp>
+              <samp class="ui-term__ln">  <span class="k-m">b_ciqjfjctoskcyimswna4somhczw4oymdfr4hlktati7qxm36mn7vcca</span>  IMG_2058.jpg  [<span class="k-ty">knowa:Photo</span>]  2025-05-17T21:14:05+01:00  38.713,-9.133</samp>
+              <samp class="ui-term__ln">spatial:</samp>
+              <samp class="ui-term__ln">  (none)</samp>
+              <samp class="ui-term__ln">actors:</samp>
+              <samp class="ui-term__ln">  <span class="k-m">a_5ua5mkbgcwcxothix42geapjdm4m7hnjtzgpfohb22goefeq2kgewkq</span>  human  owner  autoAccept=false  claims=4</samp>
+              <samp class="ui-term__ln">  <span class="k-m">a_5ua63h2ssy75e3sgzdtzxphquq5crm7gkm5aadpm3ium4swvke66cca</span>  agent  -  autoAccept=false  claims=2</samp>
+            </div></div>
+          </div>
+        </div>
+        <div class="app__pane app__pane--open">
+          <div class="ui ui-panel ui-term kt">
+            <div class="ui-term__head"><span class="ui-dots" aria-hidden="true"><i></i><i></i><i></i></span><svg class="ui-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 5 3 3-3 3"/><path d="M8.5 11h4"/></svg><span class="ui-term__title">lisbon</span><span class="ui-spacer"></span></div>
+            <div class="ui-term__screen"><div class="ui-term__track k-j">
+              <samp class="ui-term__ln ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed">knowa --json show c_ciqlsq6xqrc2dtxrv4w55zo7rf6qusqedvf4w374ckdmcmojgbzfgha | jq</span></samp>
+              <samp class="ui-term__ln">{</samp>
+              <samp class="ui-term__ln">  <b>"items"</b>: [</samp>
+              <samp class="ui-term__ln">    {</samp>
+              <samp class="ui-term__ln">      <b>"claim"</b>: {</samp>
+              <samp class="ui-term__ln">        <b>"actor"</b>: "<span class="k-m">a_5ua63h2ssy75e3sgzdtzxphquq5crm7gkm5aadpm3ium4swvke66cca</span>",</samp>
+              <samp class="ui-term__ln">        <b>"at"</b>: "2026-11-21T18:02:50.621Z",</samp>
+              <samp class="ui-term__ln">        <b>"conf"</b>: "0.9",</samp>
+              <samp class="ui-term__ln">        <b>"id"</b>: "<span class="k-m">c_ciqlsq6xqrc2dtxrv4w55zo7rf6qusqedvf4w374ckdmcmojgbzfgha</span>",</samp>
+              <samp class="ui-term__ln">        <b>"note"</b>: "Taken at Cacilhas at 11:02 on the day of the ferry note.",</samp>
+              <samp class="ui-term__ln">        <b>"o"</b>: {</samp>
+              <samp class="ui-term__ln">          <b>"ref"</b>: "<span class="k-m">e_01m7zmcxha28p1vxnh3jvdwsr9</span>"</samp>
+              <samp class="ui-term__ln">        },</samp>
+              <samp class="ui-term__ln">        <b>"p"</b>: "knowa:about",</samp>
+              <samp class="ui-term__ln">        <b>"prev"</b>: "<span class="k-m">c_ciqg3h6t25gkjjnbecx5x2bixbpge7kuyfuys3qc3wwd52ecbdqjrmy</span>",</samp>
+              <samp class="ui-term__ln">        <b>"s"</b>: "<span class="k-m">b_ciqpog37ow6qm6sa3lxw5l4543skkcxwzakwv5ehkryf3uald3k6nfa</span>",</samp>
+              <samp class="ui-term__ln">        <b>"seq"</b>: 2,</samp>
+              <samp class="ui-term__ln">        <b>"sig"</b>: "RDuBFUiKqv6hXdn7QSs7EIiqHWQfH_aIIu6uj740jq9Besmu-a1OaN5aELNsq7CTmt-lbMYN9tJgJtzfdklzBQ",</samp>
+              <samp class="ui-term__ln">        <b>"space"</b>: "<span class="k-m">s_01m7zmcxehbhsp2qyn2dsnrkeb</span>",</samp>
+              <samp class="ui-term__ln">        <b>"src"</b>: [</samp>
+              <samp class="ui-term__ln">          "<span class="k-m">c_ciqkeyfw2cm4dbxrevxyowt3noti3lawbtohraumpjeh6hjrkt6mbli</span>",</samp>
+              <samp class="ui-term__ln">          "<span class="k-m">c_ciqmomrwxifl3zpjkf2psv4wr2n4xn2asznqc5hfeuwpr4vwmzruixa</span>",</samp>
+              <samp class="ui-term__ln">          "<span class="k-m">c_ciqbrckbzwv65g55kwj6jmo5o2zltzpbcgvhgawousphrpdmg5kguuy</span>"</samp>
+              <samp class="ui-term__ln">        ],</samp>
+              <samp class="ui-term__ln">        <b>"stale"</b>: <span class="k-hl">true</span>,</samp>
+              <samp class="ui-term__ln">        <b>"status"</b>: "accepted",</samp>
+              <samp class="ui-term__ln">        <b>"v"</b>: 1,</samp>
+              <samp class="ui-term__ln">        <b>"via"</b>: {</samp>
+              <samp class="ui-term__ln">          <b>"tool"</b>: "trip-notes"</samp>
+              <samp class="ui-term__ln">        }</samp>
+              <samp class="ui-term__ln">      },</samp>
+              <samp class="ui-term__ln">      <b>"kind"</b>: "claim"</samp>
+              <samp class="ui-term__ln">    }</samp>
+              <samp class="ui-term__ln">  ]</samp>
+              <samp class="ui-term__ln">}</samp>
+            </div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section g2" id="review" aria-labelledby="review-h">
+    <div class="wrap">
+      <div class="group">
+        <div class="section-head">
+          <h2 id="review-h">Agent claims land as proposed. <span class="muted">Writes never block.</span></h2>
+        </div>
+        <div class="grid">
+          <article class="card card--row span-6 m-nolift">
+            <h3>Writes agent claims at once</h3>
+            <p>An agent's claim is stored the moment it is written, and it reads as proposed until someone reviews it.</p>
+            <div class="panel panel--flush">
+              <div class="stage stage--fade-b"><div class="at-rise fit to-edge" style="--fit-max:540px;--ax:max(24px, 50% - 270px);--ay:36px;--ay-sm:20px">
+                <div class="ui ui-panel ui-term kt">
+                  <div class="ui-term__head"><span class="ui-dots" aria-hidden="true"><i></i><i></i><i></i></span><svg class="ui-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 5 3 3-3 3"/><path d="M8.5 11h4"/></svg><span class="ui-term__title">lisbon</span><span class="ui-spacer"></span></div>
+                  <div class="ui-term__screen"><div class="ui-term__track">
+                    <samp class="ui-term__ln k-p1 ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed">KNOWA_ACTOR=trip-agent knowa assert b_ciqpog37ow6qm6sa3lxw5l4543skkcxwzakwv5ehkryf3uald3k6nfa knowa:about ref:e_01m7zmcxha28p1vxnh3jvdwsr9 --src c_ciqkeyfw2cm4dbxrevxyowt3noti3lawbtohraumpjeh6hjrkt6mbli --src c_ciqmomrwxifl3zpjkf2psv4wr2n4xn2asznqc5hfeuwpr4vwmzruixa --src c_ciqbrckbzwv65g55kwj6jmo5o2zltzpbcgvhgawousphrpdmg5kguuy --conf 0.9 --via tool=trip-notes --note "Taken at Cacilhas at 11:02 on the day of the ferry note."</span></samp>
+                    <samp class="ui-term__ln"><span class="k-m">c_ciqlsq6xqrc2dtxrv4w55zo7rf6qusqedvf4w374ckdmcmojgbzfgha</span>  created  <span class="k-hl">(proposed)</span></samp>
+                    <samp class="ui-term__ln k-p1 ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed"></span><i class="ui-term__caret" aria-hidden="true"></i></samp>
+                  </div></div>
+                </div>
+              </div></div>
+            </div>
+          </article>
+          <article class="card card--row span-6 m-nolift">
+            <h3>Lets every read choose which claims to trust</h3>
+            <p>Trust is computed when the base is read. One flag leaves agent claims out of a search.</p>
+            <div class="panel panel--flush">
+              <div class="stage stage--fade-b"><div class="at-rise fit to-edge" style="--fit-max:540px;--ax:max(24px, 50% - 270px);--ay:36px;--ay-sm:20px">
+                <div class="ui ui-panel ui-term kt">
+                  <div class="ui-term__head"><span class="ui-dots" aria-hidden="true"><i></i><i></i><i></i></span><svg class="ui-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 5 3 3-3 3"/><path d="M8.5 11h4"/></svg><span class="ui-term__title">lisbon</span><span class="ui-spacer"></span></div>
+                  <div class="ui-term__screen"><div class="ui-term__track">
+                    <samp class="ui-term__ln ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed">knowa search afternoon</span></samp>
+                    <samp class="ui-term__ln"><span class="k-m">e_01m7zmcxha28p1vxnh3jvdwsr9</span>  Ferry to Cacilhas  [<span class="k-ty">knowa:Note</span>]  2025-05-17  -  score=1.896</samp>
+                    <samp class="ui-term__ln ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed">knowa search afternoon --kinds human</span></samp>
+                    <samp class="ui-term__ln ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed"></span><i class="ui-term__caret" aria-hidden="true"></i></samp>
+                  </div></div>
+                </div>
+              </div></div>
+            </div>
+          </article>
+        </div>
+      </div>
+      <div class="grid">
+        <article class="card card--row span-6 m-nolift">
+          <h3>Marks claims built on a replaced source</h3>
+          <p>Derived claims cite their sources. Replace or retract a source and everything built on it reads as stale.</p>
+          <div class="panel panel--flush">
+            <div class="stage stage--fade-b"><div class="at-rise fit to-edge" style="--fit-max:540px;--ax:max(24px, 50% - 270px);--ay:36px;--ay-sm:20px">
+              <div class="ui ui-panel ui-term kt">
+                <div class="ui-term__head"><span class="ui-dots" aria-hidden="true"><i></i><i></i><i></i></span><svg class="ui-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 5 3 3-3 3"/><path d="M8.5 11h4"/></svg><span class="ui-term__title">lisbon</span><span class="ui-spacer"></span></div>
+                <div class="ui-term__screen"><div class="ui-term__track">
+                  <samp class="ui-term__ln k-p1 ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed">knowa assert e_01m7zmcxha28p1vxnh3jvdwsr9 knowa:body "text:Took the 10:40 ferry from Cais do Sodré to Cacilhas. Lunch by the harbour, back on the 15:40." --replaces c_ciqkeyfw2cm4dbxrevxyowt3noti3lawbtohraumpjeh6hjrkt6mbli</span></samp>
+                  <samp class="ui-term__ln k-p1"><span class="k-m">c_ciqnhsgymbjaxqh2srhizszvk7qfv7ctqgy2drafrgizfdyfojdnuka</span>  created  (accepted)</samp>
+                  <samp class="ui-term__ln ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed">knowa context e_01m7zmcxha28p1vxnh3jvdwsr9 | grep stale</span></samp>
+                  <samp class="ui-term__ln">  <span class="k-m">c_ciqovrrdxt63mu3ggmgoydjnlglrmvypvef3g3nmxxo2vuqcdyv63ui</span>  <span class="k-m">e_01m7zmcxha28p1vxnh3jvdwsr9</span>  knowa:summary  "Day trip by ferry to Cacilhas on 17 May, back mid-afternoon."  <span class="k-hl">(accepted, stale)</span></samp>
+                  <samp class="ui-term__ln k-p1">  <span class="k-m">c_ciqlsq6xqrc2dtxrv4w55zo7rf6qusqedvf4w374ckdmcmojgbzfgha</span>  <span class="k-m">b_ciqpog37ow6qm6sa3lxw5l4543skkcxwzakwv5ehkryf3uald3k6nfa</span>  knowa:about  <span class="k-m">e_01m7zmcxha28p1vxnh3jvdwsr9</span>  <span class="k-hl">(accepted, stale)</span></samp>
+                </div></div>
+              </div>
+            </div></div>
+          </div>
+        </article>
+        <article class="card card--row span-6 m-nolift">
+          <h3>Signs every claim with its writer's key</h3>
+          <p>Each actor signs with its own key and declares its kind. Agent output is never promoted silently.</p>
+          <div class="panel panel--flush">
+            <div class="dg" data-diagram='{"layout": "fanin", "alt": "Three actors, each with its own key, write claims into the space Lisbon trip: me, a human and the owner; trip-agent, an agent; and extract, the built-in worker.", "sources": [{"label": "me", "icon": "ui:user", "sub": "Human, owner"}, {"label": "trip-agent", "icon": "ui:bot", "sub": "Agent"}, {"label": "extract", "icon": "ui:cpu", "sub": "Worker"}], "target": {"label": "Lisbon trip", "icon": "ui:database"}}'></div>
+          </div>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="search" aria-labelledby="search-h">
+    <div class="wrap">
+      <div class="grid">
+        <div class="span-5 stack-5">
+          <h2 id="search-h">Search the base by text, date and place</h2>
+          <p class="t-lead">Knowa builds the base from files, photos and notes. A photo brings its EXIF time and place, and dates may be fuzzy.</p>
+          <ul class="rows rows--spec">
+            <li><span class="rows__name">Full text</span><span class="rows__value mono">knowa search</span></li>
+            <li><span class="rows__name">Time</span><span class="rows__value mono">knowa timeline</span></li>
+            <li><span class="rows__name">Place</span><span class="rows__value mono">knowa near</span></li>
+          </ul>
+        </div>
+        <div class="frame frame--split frame--lit span-6 start-7">
+          <div class="stage stage--fade-b"><div class="at-rise fit to-edge" style="--fit-max:560px;--ax:max(24px, 50% - 280px);--ay:40px;--ay-sm:20px">
+            <div class="ui ui-panel ui-term kt">
+              <div class="ui-term__head"><span class="ui-dots" aria-hidden="true"><i></i><i></i><i></i></span><svg class="ui-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 5 3 3-3 3"/><path d="M8.5 11h4"/></svg><span class="ui-term__title">lisbon</span><span class="ui-spacer"></span></div>
+              <div class="ui-term__screen"><div class="ui-term__track">
+                <samp class="ui-term__ln ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed">knowa search ferry --from 2025-05</span></samp>
+                <samp class="ui-term__ln"><span class="k-m">e_01m7zmcxha28p1vxnh3jvdwsr9</span>  Ferry to Cacilhas  [<span class="k-ty">knowa:Note</span>]  2025-05-17  -  score=2.481</samp>
+                <samp class="ui-term__ln ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed">knowa timeline --from 2025-05-17 --to 2025-05-17</span></samp>
+                <samp class="ui-term__ln"><span class="k-m">b_ciqpog37ow6qm6sa3lxw5l4543skkcxwzakwv5ehkryf3uald3k6nfa</span>  IMG_2041.jpg  [<span class="k-ty">knowa:Photo</span>]  2025-05-17T11:02:40+01:00  38.687,-9.149</samp>
+                <samp class="ui-term__ln"><span class="k-m">e_01m7zmcxha28p1vxnh3jvdwsr9</span>  Ferry to Cacilhas  [<span class="k-ty">knowa:Note</span>]  2025-05-17  -</samp>
+                <samp class="ui-term__ln"><span class="k-m">e_01m7zmcxhzf2hrs6ye6fxd3pc7</span>  Dinner on Saturday  [<span class="k-ty">knowa:Note</span>]  2025-05-17  -</samp>
+                <samp class="ui-term__ln"><span class="k-m">b_ciqjfjctoskcyimswna4somhczw4oymdfr4hlktati7qxm36mn7vcca</span>  IMG_2058.jpg  [<span class="k-ty">knowa:Photo</span>]  2025-05-17T21:14:05+01:00  38.713,-9.133</samp>
+                <samp class="ui-term__ln ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed">knowa near 38.69,-9.15 --km 1</span></samp>
+                <samp class="ui-term__ln"><span class="k-m">b_ciqpog37ow6qm6sa3lxw5l4543skkcxwzakwv5ehkryf3uald3k6nfa</span>  IMG_2041.jpg  [<span class="k-ty">knowa:Photo</span>]  2025-05-17T11:02:40+01:00  38.687,-9.149  <span class="k-hl">0.345km</span></samp>
+                <samp class="ui-term__ln ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed"></span><i class="ui-term__caret" aria-hidden="true"></i></samp>
+              </div></div>
+            </div>
+          </div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="files" data-moment="liquid-type" aria-labelledby="files-h">
+    <div class="wrap">
+      <div class="section-head" style="max-width:none"><h2 class="mo-lt__type" id="files-h">Files are canonical</h2></div>
+      <div class="grid">
+        <p class="t-lead span-5">Indexes are caches. Delete the index, rebuild it, and you get the same answers. Bytes are stored once, under their content hash.</p>
+        <div class="panel span-6 start-7">
+          <div class="stage stage--fade-b"><div class="at-rise fit to-edge" style="--fit-max:560px;--ax:max(24px, 50% - 280px);--ay:32px;--ay-sm:20px">
+            <div class="ui ui-panel ui-term kt">
+              <div class="ui-term__head"><span class="ui-dots" aria-hidden="true"><i></i><i></i><i></i></span><svg class="ui-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 5 3 3-3 3"/><path d="M8.5 11h4"/></svg><span class="ui-term__title">lisbon</span><span class="ui-spacer"></span></div>
+              <div class="ui-term__screen"><div class="ui-term__track">
+                <samp class="ui-term__ln ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed">knowa search ferry</span></samp>
+                <samp class="ui-term__ln"><span class="k-m">e_01m7zmcxha28p1vxnh3jvdwsr9</span>  Ferry to Cacilhas  [<span class="k-ty">knowa:Note</span>]  2025-05-17  -  score=1.882</samp>
+                <samp class="ui-term__ln ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed">knowa verify</span></samp>
+                <samp class="ui-term__ln">actors: 3</samp>
+                <samp class="ui-term__ln">blobs: 2</samp>
+                <samp class="ui-term__ln">claims: 47</samp>
+                <samp class="ui-term__ln">gaps: []</samp>
+                <samp class="ui-term__ln">problems: []</samp>
+                <samp class="ui-term__ln ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed">knowa reindex</span></samp>
+                <samp class="ui-term__ln">reindexed: 201fe5150e287d86053125398121d2cb</samp>
+                <samp class="ui-term__ln ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed">knowa search ferry</span></samp>
+                <samp class="ui-term__ln"><span class="k-m">e_01m7zmcxha28p1vxnh3jvdwsr9</span>  Ferry to Cacilhas  [<span class="k-ty">knowa:Note</span>]  2025-05-17  -  score=1.882</samp>
+                <samp class="ui-term__ln ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed">cd trip &amp;&amp; knowa put IMG_2041.jpg</span></samp>
+                <samp class="ui-term__ln">/Users/you/trip/IMG_2041.jpg  <span class="k-m">b_ciqpog37ow6qm6sa3lxw5l4543skkcxwzakwv5ehkryf3uald3k6nfa</span>  5668 bytes  <span class="k-hl">exists</span>  11 claims</samp>
+              </div></div>
+            </div>
+          </div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section g2m" id="design" aria-labelledby="design-h">
+    <div class="wrap grid">
+      <div class="span-5 stack-5">
+        <h2 id="design-h">Design principles of the format</h2>
+        <p class="t-lead">From docs/DESIGN.md, the contract the code is built against.</p>
+        <ul class="rows">
+          <li><span class="rows__name">Three primitives</span><p>Blob, entity, claim. Everything else is a claim.</p></li>
+          <li><span class="rows__name">Assertions, not truth</span><p>Contradictory claims coexist; reads resolve them.</p></li>
+          <li><span class="rows__name">Two times</span><p>Record time and world time, which may be fuzzy.</p></li>
+          <li><span class="rows__name">Kernel frozen, vocabulary open</span><p>Only the knowa: namespace is reserved.</p></li>
+        </ul>
+      </div>
+      <div class="frame frame--lit frame--fill span-6 start-7">
+        <div class="stage stage--fade-b"><div class="at-rise fit to-edge" style="--fit-max:520px;--ax:max(24px, 50% - 260px);--ay:40px;--ay-sm:20px">
+            <div class="ui ui-panel ui-term kt">
+              <div class="ui-term__head"><span class="ui-dots" aria-hidden="true"><i></i><i></i><i></i></span><svg class="ui-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 5 3 3-3 3"/><path d="M8.5 11h4"/></svg><span class="ui-term__title">lisbon</span><span class="ui-spacer"></span></div>
+              <div class="ui-term__screen"><div class="ui-term__track">
+                <samp class="ui-term__ln ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed">knowa --json schema | jq -r .overview</span></samp>
+                <samp class="ui-term__ln">Knowa is a local-first knowledge base of signed, append-only claims. Humans and agents write claims (subject, predicate, typed value) under their own actor keys; everything else (entities, status, search, graph) is derived at read time. Five primitives: write, blob.put, blob.get, query, feed. The claim format and the query/result documents only change additively: ignore unknown result fields.</samp>
+              </div></div>
+            </div>
+        </div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="sharing" style="--h: 2" data-moment="pinned-chapters" aria-labelledby="sharing-h">
+    <div class="wrap mo-pc__grid">
+      <div class="mo-pc__text">
+        <h2 id="sharing-h">Sharing a space in three steps</h2>
+        <p class="t-lead">Spaces are private by default. You choose what leaves, at shared or public level.</p>
+        <ol class="mo-pc__steps">
+          <li class="mo-pc__step">
+            <h3>Mark the notes and files to share</h3>
+            <p>Set an entity to shared or public. Everything else stays private.</p>
+            <figure class="mo-pc__visual mo-pc__visual--lit" role="img" aria-label="knowa share sets the ferry note to shared: one claim, accepted">
+                <div class="ui ui-panel ui-term kt">
+                  <div class="ui-term__head"><span class="ui-dots" aria-hidden="true"><i></i><i></i><i></i></span><svg class="ui-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 5 3 3-3 3"/><path d="M8.5 11h4"/></svg><span class="ui-term__title">lisbon</span><span class="ui-spacer"></span></div>
+                  <div class="ui-term__screen"><div class="ui-term__track">
+                    <samp class="ui-term__ln ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed">knowa share e_01m7zmcxha28p1vxnh3jvdwsr9 shared</span></samp>
+                    <samp class="ui-term__ln"><span class="k-m">c_ciqntyts2rvjp2rgnvknogxb77xsl5wm7h5wjcmbylmjirtxr24fowy</span>  created  <span class="k-hl">(accepted)</span></samp>
+                    <samp class="ui-term__ln ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed"></span><i class="ui-term__caret" aria-hidden="true"></i></samp>
+                  </div></div>
+                </div>
+            </figure>
+          </li>
+          <li class="mo-pc__step">
+            <h3>Export a bundle of signed claims</h3>
+            <p>A shared bundle leaves out the notes and files that are still private.</p>
+            <figure class="mo-pc__visual mo-pc__visual--lit" role="img" aria-label="knowa export at the shared level: 14 claims, no blobs, a partial bundle">
+                <div class="ui ui-panel ui-term kt">
+                  <div class="ui-term__head"><span class="ui-dots" aria-hidden="true"><i></i><i></i><i></i></span><svg class="ui-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 5 3 3-3 3"/><path d="M8.5 11h4"/></svg><span class="ui-term__title">lisbon</span><span class="ui-spacer"></span></div>
+                  <div class="ui-term__screen"><div class="ui-term__track">
+                    <samp class="ui-term__ln ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed">knowa export lisbon-shared.knowa --level shared</span></samp>
+                    <samp class="ui-term__ln">blobs: 0</samp>
+                    <samp class="ui-term__ln">claims: 14</samp>
+                    <samp class="ui-term__ln">level: <span class="k-hl">knowa:Shared</span></samp>
+                    <samp class="ui-term__ln">partial: true</samp>
+                    <samp class="ui-term__ln">path: /Users/you/lisbon-shared.knowa</samp>
+                  </div></div>
+                </div>
+            </figure>
+          </li>
+          <li class="mo-pc__step">
+            <h3>Import and verify the claims</h3>
+            <p>Import checks every signature, blob hash and chain, then registers the space read-only.</p>
+            <figure class="mo-pc__visual mo-pc__visual--lit" role="img" aria-label="On a second machine, knowa import adds the 14 claims as a read-only space">
+                <div class="ui ui-panel ui-term kt">
+                  <div class="ui-term__head"><span class="ui-dots" aria-hidden="true"><i></i><i></i><i></i></span><svg class="ui-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 5 3 3-3 3"/><path d="M8.5 11h4"/></svg><span class="ui-term__title">friend</span><span class="ui-spacer"></span></div>
+                  <div class="ui-term__screen"><div class="ui-term__track">
+                    <samp class="ui-term__ln ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed">knowa import lisbon-shared.knowa --alias lisbon-from-friend</span></samp>
+                    <samp class="ui-term__ln"><span class="k-hl">added: 14</span></samp>
+                    <samp class="ui-term__ln">alias: lisbon-from-friend</samp>
+                    <samp class="ui-term__ln">blobsAdded: 0</samp>
+                    <samp class="ui-term__ln">gaps: 4</samp>
+                    <samp class="ui-term__ln">path: /Users/friend/.knowa/replicas/<span class="k-m">s_01m7zmcxehbhsp2qyn2dsnrkeb</span></samp>
+                    <samp class="ui-term__ln">skippedExisting: 0</samp>
+                    <samp class="ui-term__ln">space: <span class="k-m">s_01m7zmcxehbhsp2qyn2dsnrkeb</span></samp>
+                  </div></div>
+                </div>
+            </figure>
+          </li>
+        </ol>
+      </div>
+      <div class="mo-pc__visuals frame"></div>
+    </div>
+  </section>
+
+  <section class="section" id="agents" aria-labelledby="agents-h">
+    <div class="wrap">
+      <div class="grid">
+        <div class="span-5 stack-5">
+          <h2 id="agents-h">Agents learn the CLI from one call</h2>
+          <p class="t-lead"><span class="mono" style="white-space:nowrap">knowa schema --json</span> describes every operation, document, term and error code. Every result cites the claim ids behind it.</p>
+        </div>
+        <div class="frame frame--split frame--lit span-6 start-7">
+          <div class="stage stage--fade-b"><div class="at-rise fit to-edge" style="--fit-max:560px;--ax:max(24px, 50% - 280px);--ay:40px;--ay-sm:20px">
+            <div class="ui ui-panel ui-term kt">
+              <div class="ui-term__head"><span class="ui-dots" aria-hidden="true"><i></i><i></i><i></i></span><svg class="ui-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 5 3 3-3 3"/><path d="M8.5 11h4"/></svg><span class="ui-term__title">lisbon</span><span class="ui-spacer"></span></div>
+              <div class="ui-term__screen"><div class="ui-term__track k-j">
+                <samp class="ui-term__ln ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed">knowa --json search ferry | jq</span></samp>
+                <samp class="ui-term__ln">{</samp>
+                <samp class="ui-term__ln">  <b>"items"</b>: [</samp>
+                <samp class="ui-term__ln">    {</samp>
+                <samp class="ui-term__ln">      <b>"claims"</b>: [</samp>
+                <samp class="ui-term__ln k-on">        "<span class="k-m">c_ciqozb4w3d3mfs3nyak65tc7lk7uy6gzjvnloifthxvurp32uu3ohbq</span>",</samp>
+                <samp class="ui-term__ln k-on">        "<span class="k-m">c_ciqjbtekzitspddnc6pcg2r4j6qtf3dcc4jxdhonbnrqle5m2hh55ra</span>",</samp>
+                <samp class="ui-term__ln k-on">        "<span class="k-m">c_ciqjru2pwfl2qn5ky4f3z5756qh4wubhsrurqd237ko7hmn5o6anuxq</span>"</samp>
+                <samp class="ui-term__ln">      ],</samp>
+                <samp class="ui-term__ln">      <b>"id"</b>: "<span class="k-m">e_01m7zmcxha28p1vxnh3jvdwsr9</span>",</samp>
+                <samp class="ui-term__ln">      <b>"label"</b>: "Ferry to Cacilhas",</samp>
+                <samp class="ui-term__ln">      <b>"score"</b>: 1.8815443939709422,</samp>
+                <samp class="ui-term__ln">      <b>"spaces"</b>: [</samp>
+                <samp class="ui-term__ln">        "<span class="k-m">s_01m7zmcxehbhsp2qyn2dsnrkeb</span>"</samp>
+                <samp class="ui-term__ln">      ],</samp>
+                <samp class="ui-term__ln">      <b>"types"</b>: [</samp>
+                <samp class="ui-term__ln">        "knowa:Note"</samp>
+                <samp class="ui-term__ln">      ],</samp>
+                <samp class="ui-term__ln">      <b>"when"</b>: {</samp>
+                <samp class="ui-term__ln">        <b>"from"</b>: "2025-05-17T00:00:00.000Z",</samp>
+                <samp class="ui-term__ln">        <b>"source"</b>: "claim",</samp>
+                <samp class="ui-term__ln">        <b>"to"</b>: "2025-05-18T00:00:00.000Z",</samp>
+                <samp class="ui-term__ln">        <b>"value"</b>: "2025-05-17"</samp>
+                <samp class="ui-term__ln">      }</samp>
+                <samp class="ui-term__ln">    }</samp>
+                <samp class="ui-term__ln">  ]</samp>
+                <samp class="ui-term__ln">}</samp>
+              </div></div>
+            </div>
+          </div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section g2m" id="install" aria-labelledby="install-h">
+    <div class="wrap grid">
+        <div class="span-5 stack-5">
+          <h2 id="install-h">Build the CLI from source</h2>
+          <p class="t-lead">There is no public release yet. From a checkout of the repository, Cargo builds and installs the CLI.</p>
+          <div class="panel">
+            <div class="stage stage--fade-b"><div class="at-rise fit to-edge" style="--fit-max:440px;--ax:max(24px, 50% - 220px);--ay:32px;--ay-sm:24px">
+            <div class="ui ui-panel ui-term kt">
+              <div class="ui-term__head"><span class="ui-dots" aria-hidden="true"><i></i><i></i><i></i></span><svg class="ui-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 5 3 3-3 3"/><path d="M8.5 11h4"/></svg><span class="ui-term__title">knowa</span><span class="ui-spacer"></span></div>
+              <div class="ui-term__screen"><div class="ui-term__track">
+                <samp class="ui-term__ln ui-term__cmd"><span class="ui-term__sig">$</span><span class="ui-term__typed">cargo install --path crates/knowa-cli</span><i class="ui-term__caret" aria-hidden="true"></i></samp>
+              </div></div>
+            </div>
+            </div></div>
+          </div>
+        </div>
+        <div class="faq span-6 start-7">
+          <div class="faq__item"><h3>Is there a hosted Knowa service?</h3><p>No. It runs on your machine, in ~/.knowa or KNOWA_HOME.</p></div>
+          <div class="faq__item"><h3>Which language models can write claims?</h3><p>Any program can be a worker; no LLM provider is linked in.</p></div>
+          <div class="faq__item"><h3>Which parts of the CLI are experimental?</h3><p>Object storage and the local web UI, knowa serve.</p></div>
+          <div class="faq__item"><h3>Can an agent sign claims as me?</h3><p>No. Each agent signs with its own key, never a human's.</p></div>
+          <div class="faq__item"><h3>Where is the format specified?</h3><p>In docs/DESIGN.md, which the code must follow.</p></div>
+        </div>
+    </div>
+  </section>
+</main>
+
+<footer class="footer closing g2m" id="contact" aria-labelledby="close-h">
+  <div class="wrap">
+    <div class="closing__cta close--type">
+      <div class="section-head">
+        <h2 id="close-h">Run Knowa on your own machine</h2>
+        <p>One Cargo command from a checkout of the repository. Spaces stay private until you export them.</p>
+      </div>
+      <a class="btn btn--primary btn--xl btn--wide" href="#install">Install from source<svg class="m-arrow" viewBox="0 0 12 12" aria-hidden="true"><path class="m-arrow__stem" d="M1 6h8"/><path class="m-arrow__head" d="M4.5 2.5 8 6l-3.5 3.5"/></svg></a>
+    </div>
+    <div class="closing__links">
+      <div class="grid">
+        <div class="span-4 stack-4">
+          <a class="nav__logo" href="#top"><span class="mark" data-mark="arc" aria-hidden="true"></span>Knowa</a>
+          <p class="footer__lede">Signed claims by humans and agents.</p>
+        </div>
+        <div class="span-2 footer__col"><h3>Claims</h3><ul><li><a href="#claims">Provenance</a></li><li><a href="#review">Review</a></li></ul></div>
+        <div class="span-2 footer__col"><h3>Search</h3><ul><li><a href="#search">Text, date, place</a></li><li><a href="#files">Indexes</a></li></ul></div>
+        <div class="span-2 footer__col"><h3>Design</h3><ul><li><a href="#design">Principles</a></li><li><a href="#agents">For agents</a></li></ul></div>
+        <div class="span-2 footer__col"><h3>Sharing</h3><ul><li><a href="#sharing">Bundles</a></li><li><a href="#install">Questions</a></li></ul></div>
+      </div>
+      <div class="footer__legal">
+        <span>Knowa &nbsp; Design v0, draft</span>
+        <div class="socials"></div>
+        <a class="credits" href="fonts/OFL.txt">Type: Geist and Geist Mono, SIL Open Font License</a>
+      </div>
+    </div>
+  </div>
+</footer>
+
+<script type="module" src="assets/system.js"></script>
+<script type="module" src="assets/motion/motion.js"></script>
+<script type="module" src="assets/layout/layout.js"></script>
+<script type="module" src="assets/diagrams/mount.js"></script>
+</body>
+</html>
