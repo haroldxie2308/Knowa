@@ -113,13 +113,15 @@ impl Serialize for ClaimView {
 pub enum WhenSource {
     /// from a `knowa:when` claim
     Claim,
-    /// fallback: earliest record time of claims about the entity (DESIGN §4.8)
+    /// fallback 1: the display-chosen `knowa:modified` claim (DESIGN §4.8)
+    File,
+    /// fallback 2: earliest record time of claims about the entity (DESIGN §4.8)
     Recorded,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EntityWhen {
-    /// EDTF as written, or the canonical timestamp for `recorded`
+    /// EDTF as written (`claim`, `file`), or the canonical timestamp for `recorded`
     pub value: String,
     /// canonical timestamp; None = open
     pub from: Option<String>,

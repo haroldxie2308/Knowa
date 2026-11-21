@@ -163,6 +163,8 @@ The **owner set** is the genesis owner plus every actor whose effective role, se
 | `knowa:source` | text | where the bytes came from (path or URI) at import |
 | `knowa:mediaType` | text | MIME type |
 | `knowa:size` | int | bytes |
+| `knowa:modified` | when | filesystem modification time of the bytes at `knowa:source`, read at import, whole seconds UTC. A fact about one copy on one disk, not a world time: copies, checkouts and exports reset it. Timeline fallback (§4.8) |
+| `knowa:created` | when | filesystem creation (birth) time of the file at `knowa:source`, read at import, whole seconds UTC. Written only when the OS reports one. Usually when the file arrived on that disk. Not a timeline input |
 
 Extractor-specific vocabulary lives in its own namespace, for example `exif:make`, `exif:model`, `exif:width`.
 
@@ -192,7 +194,12 @@ So output from a kind of actor (or a status) the view excludes can never make an
 
 ### 4.8 Entity timeline position
 
-An entity's `when` is the range of its display-chosen `knowa:when` claim. With no `knowa:when`, it falls back to the earliest `at` among claims whose subject is the entity, and is reported with `"source":"recorded"`. That fallback is correct for notes and observations, which are written when they happen, and the output always labels which source was used.
+An entity's `when` is, first match wins:
+1. the range of its display-chosen `knowa:when` claim, `"source":"claim"`;
+2. else the range of its chosen `knowa:modified` claim, `"source":"file"`. Chosen = accepted before proposed, then the **earliest** range start, then claim id. Earliest, because a blob is one exact byte sequence: when the same bytes were seen at several paths, later copies only carry later times, so the earliest observation is the best estimate of when that version was written;
+3. else the earliest `at` among claims whose subject is the entity, `"source":"recorded"`. Correct for notes and observations, which are written when they happen; wrong for imported files, which is why rule 2 precedes it.
+
+`knowa:created` never feeds `when`: a copy or download gets a fresh birth time, so it usually means "arrived on this disk". Like every display field, only claims that pass the view count (§4.7, *Views apply to evidence*). Across spaces (§6), `claim` beats `file` beats `recorded`; between two `claim`s the first space wins; between two `file`s or two `recorded`s the earlier start wins.
 
 ## 5. Space on disk *(v0)*
 
@@ -207,6 +214,7 @@ A **space** is identified by `s_…`. A **directory is one replica** of a space.
   .lock                            advisory write lock
 ```
 
+- **Blob path:** bytes go to a fresh temp file inside `blobs/`, the temp file is hashed, then renamed to its id; if that id is already present the temp file is discarded, so each byte sequence is stored once per replica. `put` creates the temp file as a copy-on-write clone of the source where the filesystem supports it (APFS, same volume), so storing costs no space until either side changes; elsewhere it is a byte copy. The hash is taken from the temp file, never the source, so a source that changes mid-copy cannot be stored under the wrong id.
 - **Write path:** take the lock, read the actor's head (last seq and id) from the log tail, build claims, validate, sign, append and fsync, apply them to the index, release the lock.
 - **On open:** if the index lags the logs (crash, or files copied in), it catches up from each actor's last indexed seq. If the index is missing or has the wrong schema version, it rebuilds and gets a new epoch. Catch-up can't see segments that fill gaps below an indexed head, so `merge` writes `.index/needs-rebuild` **before** writing any segment. Open then rebuilds whenever that marker is present, and removes it afterwards.
 - **Logs are never trusted.** Every claim read from a log (catch-up, rebuild, export) is verified, both id and signature, before use. A forged or corrupted line is an `integrity` error.
@@ -263,7 +271,7 @@ Admin ops are `init, verify, reindex, export, import`. They are part of the CLI 
 
 ### 6.2 Results
 
-- **EntityView** `{id, spaces[], label?, types[], when?:{value, from?, to?, source:"claim"|"recorded"}, where?:{lat,lon,r?}, score?, distanceKm?, claims: [ids supporting the fields above]}`. `from`/`to` are canonical timestamps; absent means open.
+- **EntityView** `{id, spaces[], label?, types[], when?:{value, from?, to?, source:"claim"|"file"|"recorded"}, where?:{lat,lon,r?}, score?, distanceKm?, claims: [ids supporting the fields above]}`. `from`/`to` are canonical timestamps; absent means open.
 - **ClaimView** = the full claim + `{status, stale, space}`
 - `find`: `{items: EntityView[] | ClaimView[], cursor?}`
 - `get`: `{items: (EntityView+claims | ClaimView | BlobView)[]}`
@@ -305,7 +313,7 @@ Global flags (each with an env override) are `--home` (`KNOWA_HOME`, default `~/
 | `query [<json>\|-]` | **query** |
 | `feed [--cursor C] [--limit N] [--follow]` | **feed** |
 | `blob put <file>` / `blob cat <id>` | **blob.put / blob.get** |
-| `put <paths…> [--no-extract]` | ingest: blob.put plus `knowa:name`/`knowa:source` by the actor, then extractors |
+| `put <paths…> [--no-extract]` | ingest: blob.put plus `knowa:name`/`knowa:source`/`knowa:modified`/`knowa:created` by the actor, then extractors. Times are read before and after the bytes are stored; a file whose size or modification time changed in between is a `conflict` (its bytes and times would not belong together) |
 | `note <text\|-> [--title T] [--when EDTF] [--about id…]` | write a Note entity |
 | `assert <s> <p> <value> [--q p=value…] [--valid] [--src…] [--conf] [--note] [--replaces…]` | write. Value syntax: `text:…`, `term:…`, `ref:…`, `int:…`, `dec:…`, `bool:…`, `when:…`, `geo:lat,lon[,r]`, `qty:12.5:kg`. A bare token is text |
 | `retract <claim> [--note]` · `review <claim> accept\|reject [--note]` | write |

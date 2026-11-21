@@ -34,6 +34,10 @@ pub const NAME: &str = "knowa:name";
 pub const SOURCE: &str = "knowa:source";
 pub const MEDIA_TYPE: &str = "knowa:mediaType";
 pub const SIZE: &str = "knowa:size";
+/// Filesystem modification time of the bytes at `knowa:source`, read at import.
+pub const MODIFIED: &str = "knowa:modified";
+/// Filesystem creation (birth) time of the file at `knowa:source`, read at import.
+pub const CREATED: &str = "knowa:created";
 
 // Terms used as values.
 pub const ROLE_OWNER: &str = "knowa:Owner";

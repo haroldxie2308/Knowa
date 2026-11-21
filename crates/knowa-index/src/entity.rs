@@ -330,6 +330,7 @@ pub(crate) fn refresh(conn: &Connection, entity: &str) -> Result<()> {
 fn source_str(s: WhenSource) -> &'static str {
     match s {
         WhenSource::Claim => "claim",
+        WhenSource::File => "file",
         WhenSource::Recorded => "recorded",
     }
 }
@@ -345,6 +346,7 @@ pub(crate) fn stored_at(row: &rusqlite::Row<'_>, at: usize) -> Result<(String, S
             let source: String = row.get(at + 7).map_err(db)?;
             let source = match source.as_str() {
                 "claim" => WhenSource::Claim,
+                "file" => WhenSource::File,
                 "recorded" => WhenSource::Recorded,
                 other => return Err(corrupt(format_args!("when source {other:?}"))),
             };

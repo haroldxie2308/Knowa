@@ -302,7 +302,7 @@ fn results() -> Value {
     json!({
         "EntityView": {
             "id": "id", "spaces": "s_…[] that describe it", "label": "display label (omitted if none)", "types": "term[]",
-            "when": "{value: EDTF as written or the record timestamp, from: timestamp|null, to: timestamp|null (half-open, null = open), source: claim|recorded}; recorded means no knowa:when exists and the earliest record time of its claims stands in",
+            "when": "{value: EDTF as written or the record timestamp, from: timestamp|null, to: timestamp|null (half-open, null = open), source: claim|file|recorded}; file means no knowa:when exists and the display-chosen knowa:modified stands in; recorded means neither exists and the earliest record time of its claims stands in",
             "where": "{lat, lon, r?} numbers", "score": "text relevance (find with text)", "distanceKm": "distance (near queries)",
             "claims": "ids of the claims that supplied label, types, when and where",
             "displayRule": "Display fields use claims with status accepted or proposed regardless of the query view (accepted before proposed, then latest at); the view decides which entities match."
@@ -349,6 +349,8 @@ fn vocabulary() -> Value {
         (vocab::SOURCE, "text", "where the bytes came from at import (path or URI)"),
         (vocab::MEDIA_TYPE, "text", "MIME type"),
         (vocab::SIZE, "int", "bytes"),
+        (vocab::MODIFIED, "when", "filesystem modification time of the source file, read at import; the timeline fallback when no knowa:when exists"),
+        (vocab::CREATED, "when", "filesystem creation time of the source file, read at import when the OS reports one"),
     ] {
         descriptive.insert(p.into(), json!({"o": o, "meaning": meaning}));
     }
