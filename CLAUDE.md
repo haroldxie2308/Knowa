@@ -6,7 +6,7 @@ Knowa is a universal, local-first and distributable knowledge-base format, plus 
 
 ## Stack
 
-- Rust, edition 2024, sync only (no tokio). Cargo workspace in `crates/*`.
+- Rust, edition 2024. Public APIs are sync only. tokio exists solely inside `knowa-store`'s object-store backend, on a private runtime (DESIGN §8). Cargo workspace in `crates/*`.
 - Crate boundaries and dependencies: DESIGN §8. The dependency direction is `model ← store ← index ← api ← cli`. `extract` and `config` depend only on `model`.
 - The only SQLite is `rusqlite` with the bundled feature (FTS5 and rtree available).
 
@@ -38,7 +38,7 @@ When testing the CLI, run it against a scratch home: `KNOWA_HOME=$(mktemp -d)`. 
 
 - **Claims are immutable and append-only.** Never rewrite or delete a log line. A change is a new claim (`replaces` / `knowa:retract` / `knowa:review`).
 - **Canonical bytes are JCS** with integers only. A claim id is `c_` + b32(multihash(sha256)) over the claim without `id`/`sig`. Changing canonicalization breaks every existing id, so don't.
-- **Files are canonical, `.index/` is derived.** Nothing may be stored only in the index. `knowa reindex` must reproduce the same answers.
+- **The replica is canonical; the index is derived** (machine-local, under `$KNOWA_HOME/index/`, DESIGN §5.2). Nothing may be stored only in the index. `knowa reindex` must reproduce the same answers.
 - **Status is computed, never stored in claims** (DESIGN §4.7). There is exactly one implementation of the status rules, and it lives in `knowa-index`.
 - **No floats in canonical data.** Decimals are strings (`Dec`). Floats are allowed only in result fields such as `score` and `distanceKm`.
 - **Every write goes through `knowa_api::Knowa::write`** (or the store's `merge` for imports). No other path appends to logs.

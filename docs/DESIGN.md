@@ -31,7 +31,7 @@ Sections marked *(v0)* ship now; *(later)* are reserved so v0 choices don't bloc
 4. **Every claim is attributable.** Each claim carries an actor key, record time, and optionally the tool, model or session (`via`), its inputs (`src`), a confidence and a rationale (`note`).
 5. **Human, agent and machine output are always distinguishable.** Agent output is never silently promoted.
 6. **Two times.** `at` is record time (when we learned it). `valid` and `knowa:when` are world time (when it was true). Both are first-class, and world time may be fuzzy (EDTF).
-7. **Files are canonical, indexes are caches.** Delete `.index/`, rebuild, and you get the same answers.
+7. **Files are canonical, indexes are caches.** Delete an index, rebuild it, and you get the same answers.
 8. **Local-first, distributable by construction.** Each writer has its own append-only log, so a replica is a union of logs and needs no coordinator.
 9. **Kernel frozen, vocabulary open.** Only the `knowa:` namespace is reserved. Every other namespace is free. Evolution is additive only.
 10. **Fail fast.** Invalid input, missing config and unsupported features return errors with codes. Nothing is silently defaulted.
@@ -206,26 +206,86 @@ Record time is world time only for notes. An agent that creates an entity for a 
 
 `knowa:created` never feeds `when`: a copy or download gets a fresh birth time, so it usually means "arrived on this disk". Like every display field, only claims that pass the view count (§4.7, *Views apply to evidence*). Across spaces (§6), `claim` beats `file` beats `recorded`; between two `claim`s the first space wins; between two `file`s or two `recorded`s the earlier start wins.
 
-## 5. Space on disk *(v0)*
+## 5. Replicas and storage *(experimental)*
 
-A **space** is identified by `s_…`. A **directory is one replica** of a space. Several replicas sync by exchanging logs.
+> **Experimental.** Rewritten on 2026-11-22 to separate the claim logs from blob storage and to allow object storage. Until it has been tested against S3 and against a JuiceFS mount shared by several machines, anything in this section may still change incompatibly. The claim format, ids and query contract (§4, §6) do not depend on it. Directory replicas written before this change need nothing except an index rebuild, which happens on open. Their old `.index/` directory is no longer read and can be deleted, and worker cursors stored there are not carried over: a worker starts from the beginning of the feed again, which is safe because writes are idempotent.
+
+A **space** is identified by `s_…`. A **replica** is one copy of it, made of three parts:
+- the **manifest** `knowa.json`, `{"format":1,"space":"s_…","owner":"a_…","genesis":"c_…"}`, written once and never changed;
+- the **claim logs**, one append-only chain per actor;
+- the **blobs**, raw bytes addressed by their hash.
+
+The manifest and the logs live at the replica's **location**. The blobs live there too, unless the replica is registered with a separate **blob location**. That way the logs, which are small and written often, can sit on low-latency storage while the bytes sit on cheap bulk storage. A replica is canonical. Everything derived from it (the index, feed cursors, cached blob bytes) is **machine-local** state under the home directory of the machine reading the replica, never inside the replica. Several replicas sync by exchanging logs. Several machines may also read and write one shared replica (§5.3, §5.4).
+
+### 5.1 Layout
+
+Every location kind uses the same relative layout:
 
 ```
-<dir>/
-  knowa.json                       {"format":1,"space":"s_…","owner":"a_…","genesis":"c_…"}
-  log/<actor-id>/<000000000001>.jsonl   per-actor append-only segments; file name = first seq (12 digits); rotate at 10000 lines
-  blobs/<id[6:8]>/<blob-id>        raw bytes (id[2:5] is always "ciq", the multihash header)
-  .index/                          derived (SQLite etc.); never exported; deletable
-  .lock                            advisory write lock
+knowa.json
+log/<actor-id>/<000000000001>.jsonl   a segment: name = its first seq (12 digits); lines in seq order
+blobs/<id[6:8]>/<blob-id>             raw bytes (id[2:5] is always "ciq", the multihash header)
+generation                            rebuild generation (§5.4); absent until the first merge
 ```
 
-- **Blob path:** bytes go to a fresh temp file inside `blobs/`, the temp file is hashed, then renamed to its id; if that id is already present the temp file is discarded, so each byte sequence is stored once per replica. `put` creates the temp file as a copy-on-write clone of the source where the filesystem supports it (APFS, same volume), so storing costs no space until either side changes; elsewhere it is a byte copy. The hash is taken from the temp file, never the source, so a source that changes mid-copy cannot be stored under the wrong id.
-- **Catalog-only blobs.** A replica may hold claims about a blob whose bytes it does not store: files put with `--no-store`, and blobs left out of a partial import. Such a blob is still identified by its hash, and its `knowa:source` says where the bytes were. `blob.get` is `not_found` for it, it has no full-text content (§7.2), `extract` skips it (extractors need bytes; catalog-only files get extractor output at `put` time only), and exports carry its claims but not its bytes. `put` without `--no-store` stores the bytes later, and nothing else changes: the id is the same.
-- **Write path:** take the lock, read the actor's head (last seq and id) from the log tail, build claims, validate, sign, append and fsync, apply them to the index, release the lock.
-- **On open:** if the index lags the logs (crash, or files copied in), it catches up from each actor's last indexed seq. If the index is missing or has the wrong schema version, it rebuilds and gets a new epoch. Catch-up can't see segments that fill gaps below an indexed head, so `merge` writes `.index/needs-rebuild` **before** writing any segment. Open then rebuilds whenever that marker is present, and removes it afterwards.
+Directory locations add `log/<actor-id>/.lock`, the actor's advisory lock (§5.3). Segment names sort by seq, so a reader can list one actor's segments starting after a known one.
+
+### 5.2 Locations
+
+| Location | Form | Status |
+|---|---|---|
+| directory | a path; also a mounted shared filesystem (JuiceFS, NFS) | local disk: as v0. Shared by several machines: experimental |
+| object store | `s3://bucket/prefix`: S3 and S3-compatible stores (R2, MinIO, …) | experimental |
+
+- **Credentials** and the endpoint of an object store come from the environment, in the S3 client's standard variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ENDPOINT` for stores other than AWS, …). They are never written to the home config or to a replica. When one is missing, opening the replica fails with a `usage` error that names it.
+- **`init <location>` and `space add <location>`** take either form, plus `--blobs <location>`. The blob location belongs to a machine's registration of the replica, not to the space. Every machine that registers the replica must give the same blob location.
+- **The index and the feed cursors** of a replica live in `$KNOWA_HOME/index/<s_id>/<key>/`. `<key>` is the first 16 characters of b32(sha256(canonical location)), where the canonical location is the absolute path of a directory or the URL without a trailing `/`. Two registrations of one location on one machine therefore share one index.
+- **Object-store blob bytes** fetched for extraction are cached in `$KNOWA_HOME/cache/blobs/`.
+
+### 5.3 Writing
+
+- **Write path:**
+  1. Take the actor's write exclusivity.
+  2. Bring the local index up to date for that actor.
+  3. Read the actor's head (last seq and id).
+  4. Build, validate and sign the claims.
+  5. Append them as one batch.
+  6. Apply them to the local index.
+
+  Exclusivity is **per actor**. Writers for different actors never wait for each other, and readers wait only for a writer of the actor whose log they are reading.
+- **Lock order:** a writer holds its actor lock and then takes the index lock. A reader therefore never waits for an actor lock while it holds the index lock. It reads an actor's new lines first, releases that actor's lock, and then applies the lines under the index lock, skipping any (actor, seq) already applied.
+- **Directory.** Exclusivity is an exclusive advisory lock on `log/<actor>/.lock`.
+  - A batch is appended to the actor's newest segment and fsynced before the write returns. Segments rotate at 10000 lines.
+  - A reader takes the same lock **shared** while reading the actor's new lines. It can therefore never read a batch that is still being written, or one that a failed write will truncate.
+  - A write that fails part-way is truncated back to the state before it.
+  - Torn-tail recovery: an unterminated final line found under the exclusive lock is an unacknowledged write left by a crash, and it is truncated.
+- **Object store.** There is no lock.
+  - A batch is one new segment object, `log/<actor>/<first seq>.jsonl`, created only if absent (`If-None-Match: *`). Two writers racing for an actor's next seq create the same key, and exactly one succeeds.
+  - The loser reads the head again, rebuilds and re-signs its claims, and retries. After 3 attempts in total it fails with `conflict`.
+  - Segment objects are never modified, and nothing rotates. *(later: compaction of small segments)*
+- **One writer per actor is the norm.** Racing writes of one actor stay correct but waste work, so give each agent process its own actor.
+- **Blob path.** Bytes are hashed while they are staged. They become visible under an id only once their hash is known and equals that id, so a source that changes during the copy can never be stored under the wrong id.
+  - *Directory.* The bytes go to a temp file inside `blobs/`, which is hashed and then renamed to its id. If the id is already present, the temp file is discarded, so each byte sequence is stored once per replica. `put` creates the temp file as a copy-on-write clone of the source where the filesystem supports it (APFS, same volume); elsewhere it is a byte copy.
+  - *Object store.* An id already present is not uploaded again. Otherwise the source is hashed while it is uploaded, and a multipart upload is completed only if the hash equals the id it was started under. A single-part upload sends bytes that were already hashed in memory. Because the key is the hash of the bytes, two machines uploading the same blob at once write identical objects, so blobs need no conditional write.
+- **Catalog-only blobs.** A replica may hold claims about a blob whose bytes it does not store. This covers files put with `--no-store`, and blobs left out of a partial import. Such a blob is still identified by its hash, and its `knowa:source` says where the bytes were.
+  - `blob.get` is `not_found` for it.
+  - It has no full-text content (§7.2).
+  - `extract` skips it, because extractors need bytes. Catalog-only files get extractor output at `put` time only.
+  - Exports carry its claims but not its bytes.
+
+  `put` without `--no-store` stores the bytes later, and nothing else changes: the id is the same.
 - **Logs are never trusted.** Every claim read from a log (catch-up, rebuild, export) is verified, both id and signature, before use. A forged or corrupted line is an `integrity` error.
-- **Torn tail recovery:** `append` fsyncs whole lines before returning. An unterminated final line in an actor's newest segment is therefore an unacknowledged write left by a crash, and taking the write lock truncates it.
 - **Replicas** may have *gaps* in an actor's seq when imported from a partial bundle. Chain verification covers contiguous runs only, and gaps are reported.
+
+### 5.4 Reading and the local index
+
+- **Catch-up.** On open, a machine brings its index up to date actor by actor, from that actor's last indexed seq, reading only the segments after it. It takes no replica-wide lock, only the index's own. Processes on one machine therefore serialize their catch-up, and nothing else.
+- **Rebuild generation.** Catch-up cannot see segments that fill gaps below an indexed head.
+  - `merge` (bundle import) writes a fresh `generation` (a new ULID) before its first segment and again after its last.
+  - An index records the generation it was built against. It rebuilds when the replica's generation differs.
+  - This replaces v0's `.index/needs-rebuild` marker, which only the importing machine could see.
+- **Rebuild on mismatch.** An index that is missing or has the wrong schema version is rebuilt and gets a new epoch.
+- **`verify`** reads every blob in full. On an object store, that downloads the whole store.
 
 ## 6. The interface (stable contract) *(v0)*
 
@@ -237,7 +297,7 @@ Five primitives. Everything else is sugar.
 | **blob.put** | bytes | `{id, created, size}`. The media type is not part of the bytes: it arrives as a `knowa:mediaType` claim from the `media` extractor |
 | **blob.get** | `{id}` (in any selected space) | bytes |
 | **query** | a query document (6.1) | the op's result (6.2) |
-| **feed** | `{space, cursor?, limit}` | `{claims:[ClaimView], cursor}` in local arrival order. The cursor is `<epoch>:<n>`. If the epoch no longer matches, the call fails with `cursor_expired` |
+| **feed** | `{space, cursor?, limit}` | `{claims:[ClaimView], cursor}` in local arrival order. The cursor is opaque. It records the replica's rebuild generation and, per actor, the highest seq already delivered, so it stays valid across a reindex and on every machine that reads the replica *(experimental, §5)*. If the replica's generation has changed since (a merge filled gaps), the call fails with `cursor_expired` |
 
 Admin ops are `init, verify, reindex, export, import`. They are part of the CLI but not the query contract.
 
@@ -315,8 +375,8 @@ Global flags (each with an env override) are `--home` (`KNOWA_HOME`, default `~/
 
 | Verb | Maps to |
 |---|---|
-| `init <dir> --name N [--alias A]` | create space + genesis + actorKind + label; grant the built-in `extract` worker Worker role + autoAccept; register the alias |
-| `space ls\|add <dir> [--alias] [--readonly]\|rm <alias>\|use <alias>` | registry |
+| `init <location> --name N [--alias A] [--blobs <location>]` | create space + genesis + actorKind + label; grant the built-in `extract` worker Worker role + autoAccept; register the alias |
+| `space ls\|add <location> [--alias] [--readonly] [--blobs <location>]\|rm <alias>\|use <alias>` | registry. A location is a directory or an object-store URL (§5.2) |
 | `actor ls\|new <name> --kind human\|agent\|worker\|use <name>\|show` | local keys |
 | `write` (JSONL drafts on stdin) | **write** |
 | `query [<json>\|-]` | **query** |
@@ -341,7 +401,7 @@ Global flags (each with an env override) are `--home` (`KNOWA_HOME`, default `~/
 
 ### 7.1 Workers *(v0)*
 
-`worker run` reads the feed from a cursor stored in `<space>/.index/cursors/<actor>.json`. For each batch it executes `--cmd`, with this JSON on stdin:
+`worker run` reads the feed from a cursor stored with the machine-local index, in `$KNOWA_HOME/index/<s_id>/<key>/cursors/<actor>.json` (§5.2). For each batch it executes `--cmd`, with this JSON on stdin:
 `{"space":"s_…","cursor":"…","claims":[ClaimView…]}`
 and with `KNOWA_HOME`, `KNOWA_SPACE` and `KNOWA_ACTOR` set, so the command can call `knowa query` itself. The command's stdout is JSONL drafts, which are written under the worker's actor with `via.worker = <actor-name>`. A non-zero exit stops the run and does **not** advance the cursor. Any program can be a worker, and LLM agents are just one kind of worker. No LLM provider is linked into the core.
 
@@ -370,20 +430,20 @@ Text blobs (`text/*`, ≤ 1 MiB) are indexed for full-text search directly from 
 
 ## 8. Implementation (invisible) *(v0)*
 
-- Rust (edition 2024), synchronous (no async runtime in v0), single static binary `knowa`.
+- Rust (edition 2024), single static binary `knowa`. Every public API is synchronous. The object-store backend runs its client on a private current-thread tokio runtime and blocks on it; no async type crosses a crate boundary.
 - Crates (Cargo workspace, `crates/*`):
 
 | Crate | Owns | Third-party deps |
 |---|---|---|
 | `knowa-model` | ids, values, claims, JCS, EDTF, signing, validation, kernel vocab, the query/result contract types, the shared `Error` | serde, serde_json, ed25519-dalek, sha2, data-encoding, getrandom |
-| `knowa-store` | the replica directory: manifest, lock, logs, blobs, verify, bundles | tar, sha2 |
+| `knowa-store` | the replica: manifest, logs, blobs, locks, verify, bundles; directory and object-store backends (§5) | tar, sha2, object_store (aws), tokio (rt) |
 | `knowa-index` | the derived SQLite index of one replica: apply, status/stale, FTS5, geo, edges, arrival feed, single-replica reads | rusqlite (bundled) |
 | `knowa-extract` | media sniffing, EXIF, the extractor registry | infer, kamadak-exif |
 | `knowa-config` | home: actor keys, space registry | — |
 | `knowa-api` | the five primitives and the admin ops. Composes store + index + extract across spaces: fan-out, merge, context, path | — |
 | `knowa-cli` | the `knowa` binary: argument parsing and rendering only | clap |
 
-- The index is one SQLite file per replica. Multi-space queries fan out to each replica's index and merge in `knowa-api`.
+- The index is one SQLite file per replica per machine, kept under the home directory (§5.2). Multi-space queries fan out to each replica's index and merge in `knowa-api`.
 - Swapping the index engine means re-implementing `knowa-index`'s public surface and reindexing. Nothing else changes.
 - Why Rust: one core that embeds into the CLI, an MCP server, Python/Node bindings and WASM (for the browser visualizer); native access to the later stack (tantivy, Lance, iroh/Willow, h3o); sum types for values and status.
 
@@ -409,4 +469,5 @@ Text blobs (`text/*`, ≤ 1 MiB) are indexed for full-text search directly from 
 
 - Local key separation is a convention: an agent on the same machine could use a human's key. *(later: OS keychain + per-actor prompts.)*
 - Partial replicas have seq gaps, so their chain verification is weaker.
+- Object-store replicas and directory replicas shared by several machines are experimental (§5): the conditional-write and shared-lock behaviour they rely on is untested against real S3 and JuiceFS.
 - SQLite with one index per replica is fine up to roughly 10^7 claims per space. Beyond that, the `index.Index` boundary is where a new engine plugs in.
