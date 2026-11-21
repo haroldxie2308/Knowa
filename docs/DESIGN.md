@@ -190,6 +190,8 @@ Policy claims (`role`, `autoAccept`, `visibility`, `defaultVisibility`, `actorKi
 
 So output from a kind of actor (or a status) the view excludes can never make an entity match, or change how it looks. For `text`, an entity matches when every query token is found in the text of at least one claim that passes the view. The tokens may come from different claims.
 
+**Text matching is normalization-insensitive.** Indexed text and query text are both brought to Unicode NFKC before tokenizing, so canonically or compatibly equivalent spellings match: decomposed Hangul from macOS file names (NFD) and composed Hangul, full-width and half-width forms, ligatures, `Ⅱ` and `II`. This is an index rule only. Claims, ids and signatures keep the exact bytes that were written, and display fields show them as written.
+
 **Display value.** When a single value is shown (for example an entity's label), the order is accepted before proposed, then the latest `at`. This is a display policy only: all values remain in the data.
 
 ### 4.8 Entity timeline position
@@ -215,6 +217,7 @@ A **space** is identified by `s_…`. A **directory is one replica** of a space.
 ```
 
 - **Blob path:** bytes go to a fresh temp file inside `blobs/`, the temp file is hashed, then renamed to its id; if that id is already present the temp file is discarded, so each byte sequence is stored once per replica. `put` creates the temp file as a copy-on-write clone of the source where the filesystem supports it (APFS, same volume), so storing costs no space until either side changes; elsewhere it is a byte copy. The hash is taken from the temp file, never the source, so a source that changes mid-copy cannot be stored under the wrong id.
+- **Catalog-only blobs.** A replica may hold claims about a blob whose bytes it does not store: files put with `--no-store`, and blobs left out of a partial import. Such a blob is still identified by its hash, and its `knowa:source` says where the bytes were. `blob.get` is `not_found` for it, it has no full-text content (§7.2), `extract` skips it (extractors need bytes; catalog-only files get extractor output at `put` time only), and exports carry its claims but not its bytes. `put` without `--no-store` stores the bytes later, and nothing else changes: the id is the same.
 - **Write path:** take the lock, read the actor's head (last seq and id) from the log tail, build claims, validate, sign, append and fsync, apply them to the index, release the lock.
 - **On open:** if the index lags the logs (crash, or files copied in), it catches up from each actor's last indexed seq. If the index is missing or has the wrong schema version, it rebuilds and gets a new epoch. Catch-up can't see segments that fill gaps below an indexed head, so `merge` writes `.index/needs-rebuild` **before** writing any segment. Open then rebuilds whenever that marker is present, and removes it afterwards.
 - **Logs are never trusted.** Every claim read from a log (catch-up, rebuild, export) is verified, both id and signature, before use. A forged or corrupted line is an `integrity` error.
@@ -313,7 +316,7 @@ Global flags (each with an env override) are `--home` (`KNOWA_HOME`, default `~/
 | `query [<json>\|-]` | **query** |
 | `feed [--cursor C] [--limit N] [--follow]` | **feed** |
 | `blob put <file>` / `blob cat <id>` | **blob.put / blob.get** |
-| `put <paths…> [--no-extract]` | ingest: blob.put plus `knowa:name`/`knowa:source`/`knowa:modified`/`knowa:created` by the actor, then extractors. Times are read before and after the bytes are stored; a file whose size or modification time changed in between is a `conflict` (its bytes and times would not belong together) |
+| `put <paths…> [--no-extract] [--no-store]` | ingest: blob.put plus `knowa:name`/`knowa:source`/`knowa:modified`/`knowa:created` by the actor, then extractors. Times are read before and after the bytes are stored; a file whose size or modification time changed in between is a `conflict` (its bytes and times would not belong together). `--no-store` is **catalog only**: each file is hashed in place and gets the same claims, extractors included (they read the source), but its bytes are not copied into the replica; the result reports `stored` per file |
 | `note <text\|-> [--title T] [--when EDTF] [--about id…]` | write a Note entity |
 | `assert <s> <p> <value> [--q p=value…] [--valid] [--src…] [--conf] [--note] [--replaces…]` | write. Value syntax: `text:…`, `term:…`, `ref:…`, `int:…`, `dec:…`, `bool:…`, `when:…`, `geo:lat,lon[,r]`, `qty:12.5:kg`. A bare token is text |
 | `retract <claim> [--note]` · `review <claim> accept\|reject [--note]` | write |
@@ -342,7 +345,7 @@ Built-in extractors are pure Rust with no external tools. They write as the `ext
 - **media@1**: `knowa:mediaType` (sniffed from content first, extension second), `knowa:size`, and `knowa:type` (`knowa:Photo` for `image/*`, otherwise `knowa:File`).
 - **exif@1**: finds the EXIF/TIFF block in JPEG, HEIC/HEIF, PNG (`eXIf`) and TIFF files. Writes `knowa:when` from DateTimeOriginal (+ OffsetTimeOriginal when present, otherwise local-unknown), `knowa:where` from GPS, and `exif:make`, `exif:model`, `exif:width`, `exif:height`, `exif:orientation`.
 
-Text blobs (`text/*`, ≤ 1 MiB) are indexed for full-text search directly from the blob store. No claims are needed, because the text is derived.
+Text blobs (`text/*`, ≤ 1 MiB) are indexed for full-text search directly from the blob store. No claims are needed, because the text is derived. A blob the replica does not store (catalog only, §5) has no indexed content.
 
 ### 7.3 Sharing *(v0)*
 
