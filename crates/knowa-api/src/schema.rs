@@ -69,9 +69,13 @@ fn primitives() -> Value {
         },
         "query": {"in": "a query document (see query)", "out": "the op's result (see results)"},
         "feed": {
-            "in": {"cursor": "<epoch>:<n> or absent to start from the beginning", "limit": format!("1..{MAX_LIMIT}")},
-            "out": {"claims": "ClaimView[] in local arrival order (all statuses)", "cursor": "<epoch>:<n>; pass it back to continue (unchanged when nothing new arrived)"},
-            "rules": ["A malformed cursor → invalid. If the index was rebuilt since the cursor was issued, its epoch no longer matches → cursor_expired: restart without a cursor."]
+            "in": {"cursor": "opaque, as a previous feed returned it, or absent to start from the beginning", "limit": format!("1..{MAX_LIMIT}")},
+            "out": {"claims": "ClaimView[] the cursor has not delivered, in this machine's local arrival order (all statuses)", "cursor": "opaque; pass it back to continue (unchanged when nothing new arrived)"},
+            "rules": [
+                "The cursor records the replica's rebuild generation and, per actor, the highest seq delivered, so it stays valid across reindex and on every machine that reads the replica; it delivers every claim exactly once, whichever of those indexes serves each page.",
+                "A malformed cursor → invalid.",
+                "If the replica's rebuild generation changed since the cursor was issued (a merge filled gaps in its logs) → cursor_expired: restart from the beginning without a cursor; writes are idempotent."
+            ]
         }
     })
 }
@@ -113,7 +117,7 @@ fn admin() -> Value {
         },
         "worker run": {
             "args": {"actor": "an existing actor of kind agent or worker (else usage)", "cmd": "program and arguments", "batch": format!("feed page size, 1..{MAX_LIMIT}"), "follow": "keep polling every 2 s when caught up"},
-            "does": "Reads the feed from the cursor stored with this machine's index of the replica, in <home>/index/<space-id>/<location key>/cursors/<actor>.json, skipping claims written by the worker actor itself. For each batch it runs cmd with stdin {\"space\":\"s_…\",\"cursor\":\"<epoch>:<n> after this batch\",\"claims\":[ClaimView…]} and env KNOWA_HOME, KNOWA_SPACE (replica path), KNOWA_ACTOR. The command's stdout is JSONL drafts, written by the worker actor with via.worker = <actor> (a draft naming a different via.worker → invalid). A non-zero exit stops the run (error detail carries stderr) and the cursor is not advanced. cursor_expired names the cursor file to delete.",
+            "does": "Reads the feed from the cursor stored with this machine's index of the replica, in <home>/index/<space-id>/<location key>/cursors/<actor>.json, skipping claims written by the worker actor itself. For each batch it runs cmd with stdin {\"space\":\"s_…\",\"cursor\":\"the feed cursor after this batch\",\"claims\":[ClaimView…]} and env KNOWA_HOME, KNOWA_SPACE (replica path), KNOWA_ACTOR. The command's stdout is JSONL drafts, written by the worker actor with via.worker = <actor> (a draft naming a different via.worker → invalid). A non-zero exit stops the run (error detail carries stderr) and the cursor is not advanced. The stored cursor survives reindex. cursor_expired (a merge changed the replica's rebuild generation) names the cursor file to delete.",
             "out": {"batches": "commands run", "claimsIn": "claims passed to the command", "claimsOut": "claims newly created", "cursor": "final cursor"}
         },
         "export": {
@@ -127,7 +131,7 @@ fn admin() -> Value {
             "out": {"space": "s_…", "path": "absolute path", "alias": "string", "added": "claims added", "skippedExisting": "claims already present", "blobsAdded": "count", "gaps": "number of missing seq runs (partial bundles)"}
         },
         "verify": {"does": "Under each actor's write lock in turn (taking it first truncates a torn final line left by a crashed append), checks every claim of that actor (id, signature, space, chain within contiguous runs, unique seq); then every blob hash and the genesis. Problems → integrity with the list in detail.", "out": {"claims": "count", "blobs": "count", "actors": "count", "gaps": "[[actor, first missing seq, last missing seq]]", "problems": "[]"}},
-        "reindex": {"does": "Deletes and rebuilds this machine's index of the space from its logs; outstanding feed cursors expire.", "out": "the new index epoch"},
+        "reindex": {"does": "Deletes and rebuilds this machine's index of the space from its logs; feed cursors stay valid.", "out": "the new index epoch"},
         "schema": {"does": "Prints this document."}
     })
 }
@@ -403,7 +407,7 @@ fn errors() -> Value {
         (ErrorCode::Conflict, "the operation contradicts existing state (alias taken, chain conflict)"),
         (ErrorCode::Unsupported, "valid but not supported in v0 (asOf, multi-space cursor, search beyond its bounds)"),
         (ErrorCode::Integrity, "signature, hash or chain verification failed"),
-        (ErrorCode::CursorExpired, "the cursor's index epoch no longer exists; restart without it"),
+        (ErrorCode::CursorExpired, "the replica's rebuild generation changed since the feed cursor was issued (a merge filled gaps); restart without it"),
     ];
     json!({
         "envelope": "With --json, errors go to stderr as {\"error\": {\"code\", \"message\", \"detail\"?}} and the process exits with the code's exit status.",

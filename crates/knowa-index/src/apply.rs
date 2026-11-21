@@ -33,6 +33,8 @@ const POLICY_INPUTS: [&str; 4] = [vocab::ROLE, vocab::AUTO_ACCEPT, vocab::ACTOR_
 
 pub(crate) fn apply(conn: &Connection, space: &Id, genesis_owner: &Id, blobs: &dyn BlobSource, claims: &[Claim]) -> Result<()> {
     let mut work = Work::default();
+    // Arrival numbers follow the order `claims` is given in. The feed needs each actor's
+    // in ascending seq; `read::feed` says why every caller outside tests keeps that.
     let mut next_n: i64 = conn.query_row("SELECT COALESCE(MAX(n), 0) + 1 FROM claims", [], |r| r.get(0)).map_err(db)?;
     let mut policy_input = false;
     let mut seen: HashSet<&Id> = HashSet::new();

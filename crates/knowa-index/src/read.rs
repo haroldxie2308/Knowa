@@ -10,15 +10,15 @@
 //! Text matching and scoring (`text_scores`), type matching and the result order
 //! (`Keys`, mirroring the SQL ORDER BY) are shared by both routes.
 
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use knowa_model::query::{Near, Order, View, Where};
 use knowa_model::{ActorInfo, ClaimView, Dec, Dir, Edge, EntityView, Error, Id, Result, Status, Term, Timestamp, Value, When, vocab};
 use rusqlite::{Connection, params_from_iter};
 
 use crate::Page;
-use crate::db::{Sql, canonical, check_limit, claim_view_at, conf_key, db, i64_of, id_from, make_cursor, parse_cursor, term_from, u64_of};
+use crate::db::{Sql, canonical, check_limit, claim_view_at, conf_key, corrupt, db, i64_of, id_from, make_cursor, parse_cursor, term_from, u64_of};
 use crate::entity::{self, Summary};
 use crate::fts;
 use crate::geo;
@@ -816,19 +816,88 @@ pub(crate) fn edges(conn: &Connection, id: &Id, view: &View) -> Result<Vec<Edge>
     Ok(out)
 }
 
-pub(crate) fn feed(conn: &Connection, after: u64, limit: u32) -> Result<(Vec<ClaimView>, u64)> {
-    let limit = check_limit(limit)?;
-    let mut stmt = conn
-        .prepare_cached("SELECT n, json, status, stale FROM claims WHERE n > ?1 ORDER BY n LIMIT ?2")
-        .map_err(db)?;
-    let mut rows = stmt.query([i64_of(after, "feed position")?, limit]).map_err(db)?;
-    let mut out = Vec::new();
-    let mut last = after;
-    while let Some(row) = rows.next().map_err(db)? {
-        last = u64_of(row.get(0).map_err(db)?, "arrival number")?;
-        out.push(claim_view_at(row, 1)?);
+/// The actors that have claims here, ascending: a skip scan of `claims_actor`, one seek
+/// per actor, never a pass over every claim.
+pub(crate) const FEED_ACTORS_SQL: &str = "WITH RECURSIVE a(actor) AS (
+       SELECT MIN(actor) FROM claims
+       UNION ALL
+       SELECT (SELECT MIN(actor) FROM claims WHERE actor > a.actor) FROM a WHERE a.actor IS NOT NULL
+     ) SELECT actor FROM a WHERE actor IS NOT NULL";
+
+/// Arrival number and seq of an actor's first claim above a seq: one seek in
+/// `claims_actor`, which covers the query (`n` is the rowid).
+pub(crate) const FEED_NEXT_SQL: &str = "SELECT n, seq FROM claims WHERE actor = ?1 AND seq > ?2 ORDER BY seq LIMIT 1";
+
+/// DESIGN §6 feed: the claims that no entry of `delivered` (actor → highest seq already
+/// delivered) covers, i.e. a seq above the actor's entry, or any seq of an actor without
+/// one, in local arrival order, at most `limit`.
+///
+/// This relies on one invariant: **within one actor, arrival order (`n`) is seq order.**
+/// Arrival numbers are assigned by `apply::apply` in the order it is handed claims, and
+/// every path that hands it claims gives each actor's in ascending seq, above every seq
+/// of that actor already indexed:
+/// - catch-up reads an actor's log in ascending seq (`Replica::read_log` checks that
+///   order) and applies, under the index lock, only the claims above the actor's
+///   indexed head as it is then (`Index::apply_above_head`), so claims read twice by
+///   racing processes are applied once and in order;
+/// - a rebuild is a reset followed by that same catch-up from seq 1;
+/// - a writer applies the batch it appended, numbered upwards from the actor's log
+///   head, while still holding the actor's exclusive lock, under which it first caught
+///   the actor up: the indexed head then equals the log head, and no other process can
+///   read the batch, let alone apply it, before the writer has.
+///
+/// Claims that fill a gap below an indexed head are never applied by catch-up. The
+/// merge that brings them changes the replica's rebuild generation, which makes the
+/// index rebuild and expires every cursor issued before (checked by the caller), so a
+/// cursor never steps over a claim that arrives later below it.
+///
+/// An actor's undelivered claims are therefore a suffix of its claims by seq and by
+/// arrival alike, and a page is a k-way merge, by arrival number, of one such stream
+/// per actor. Each step of a stream is one seek in `claims_actor` (`FEED_NEXT_SQL`), so
+/// a page costs O((actors + limit) · log claims) however long the log is and however
+/// far behind the cursor is. Everything is read in one transaction, one snapshot.
+pub(crate) fn feed(conn: &Connection, delivered: &BTreeMap<Id, u64>, limit: u32) -> Result<Vec<ClaimView>> {
+    check_limit(limit)?;
+    // u32 → usize widens on every target this builds for.
+    let limit = limit as usize;
+    let tx = conn.unchecked_transaction().map_err(db)?;
+    let actors = rows(&tx, &Sql::new(FEED_ACTORS_SQL), |row| id_from(&row.get::<_, String>(0).map_err(db)?))?;
+    let mut next_stmt = tx.prepare_cached(FEED_NEXT_SQL).map_err(db)?;
+    let mut next = |actor: &Id, after: u64| -> Result<Option<(i64, u64)>> {
+        let mut rows = next_stmt.query(rusqlite::params![actor.as_str(), i64_of(after, "feed cursor seq")?]).map_err(db)?;
+        match rows.next().map_err(db)? {
+            Some(row) => Ok(Some((row.get(0).map_err(db)?, u64_of(row.get(1).map_err(db)?, "seq")?))),
+            None => Ok(None),
+        }
+    };
+    // (arrival number, index into `actors`, seq) of each actor's next undelivered claim
+    let mut heads = BinaryHeap::new();
+    for (i, actor) in actors.iter().enumerate() {
+        // No entry: nothing of this actor was delivered, and every seq is above 0.
+        let after = delivered.get(actor).copied().unwrap_or(0);
+        if let Some((n, seq)) = next(actor, after)? {
+            heads.push(Reverse((n, i, seq)));
+        }
     }
-    Ok((out, last))
+    let mut picked = Vec::with_capacity(limit);
+    while picked.len() < limit {
+        let Some(Reverse((n, i, seq))) = heads.pop() else { break };
+        picked.push(n);
+        if let Some((n, seq)) = next(&actors[i], seq)? {
+            heads.push(Reverse((n, i, seq)));
+        }
+    }
+    let mut by_n = tx.prepare_cached("SELECT json, status, stale FROM claims WHERE n = ?1").map_err(db)?;
+    picked
+        .iter()
+        .map(|n| {
+            let mut rows = by_n.query([n]).map_err(db)?;
+            match rows.next().map_err(db)? {
+                Some(row) => claim_view_at(row, 0),
+                None => Err(corrupt(format_args!("arrival number {n} vanished within one read transaction"))),
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn log(conn: &Connection, actors: &[Id], since_ms: Option<i64>, limit: u32, cursor: Option<&str>) -> Result<Page<ClaimView>> {

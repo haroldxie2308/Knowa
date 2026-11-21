@@ -233,7 +233,10 @@ impl Knowa {
         query::query(&self.home, sel, doc)
     }
 
-    /// `cursor` = `<epoch>:<n>`; epoch mismatch → `cursor_expired`. None = from start.
+    /// DESIGN §6 feed. `cursor` is one a previous call returned (malformed → `invalid`),
+    /// None = from the beginning. It holds across a reindex and on every machine reading
+    /// the replica; issued at another rebuild generation than the replica's now →
+    /// `cursor_expired`.
     pub fn feed(&self, sel: &Sel, cursor: Option<&str>, limit: u32) -> Result<FeedResult> {
         feed::feed(&select::current(&self.home, sel)?, cursor, limit)
     }
@@ -304,8 +307,8 @@ impl Knowa {
         admin::verify(&self.home, sel)
     }
 
-    /// Rebuilds the current space's index; returns the new epoch (feed cursors from the
-    /// old epoch now fail with `cursor_expired`).
+    /// Rebuilds the current space's index; returns its new epoch. Feed cursors stay
+    /// valid: they record per-actor seqs, not positions in this index.
     pub fn reindex(&self, sel: &Sel) -> Result<String> {
         admin::reindex(&self.home, sel)
     }

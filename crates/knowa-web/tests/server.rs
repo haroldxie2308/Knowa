@@ -237,7 +237,8 @@ fn query_passes_documents_through_and_errors_map_to_statuses() {
     let feed = r.get("/api/feed?limit=5");
     assert_eq!(feed.status, 200);
     assert_eq!(feed.json()["claims"].as_array().unwrap().len(), 5);
-    let expired = r.get("/api/feed?cursor=gone%3A3");
+    // a well-formed cursor from a rebuild generation this replica never had
+    let expired = r.get("/api/feed?cursor=fc1.00000000000000000000000000");
     assert_eq!((expired.status, expired.error_code().as_str()), (410, "cursor_expired"));
     let bad = r.get("/api/feed?cursor=nonsense");
     assert_eq!((bad.status, bad.error_code().as_str()), (400, "invalid"));

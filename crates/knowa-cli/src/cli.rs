@@ -174,7 +174,7 @@ pub struct QueryArgs {
 
 #[derive(Debug, Args)]
 pub struct FeedArgs {
-    /// Continue after this cursor (`<epoch>:<n>`) [default: from the start]
+    /// Continue after this cursor, as a previous feed returned it [default: from the start]
     #[arg(long)]
     pub cursor: Option<String>,
     /// Claims per batch

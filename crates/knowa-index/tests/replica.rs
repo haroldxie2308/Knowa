@@ -94,7 +94,7 @@ fn append(r: &Replica, claims: &[&Claim]) {
 }
 
 fn feed_ids(idx: &Index) -> Vec<Id> {
-    idx.feed(0, 1000).unwrap().0.into_iter().map(|c| c.claim.id).collect()
+    idx.feed(&BTreeMap::new(), 1000).unwrap().into_iter().map(|c| c.claim.id).collect()
 }
 
 fn search(idx: &Index, q: &str) -> Vec<Id> {

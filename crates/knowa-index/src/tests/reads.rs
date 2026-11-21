@@ -1,6 +1,8 @@
 //! View filtering, entity matching, display values, paging, feed, equivalence keys,
 //! edges and export selection.
 
+use std::collections::BTreeMap;
+
 use knowa_model::query::{Order, View, Where};
 use knowa_model::{ActorKind, Dec, Dir, ErrorCode, Id, Status, Term, Value, Visibility, vocab};
 
@@ -200,54 +202,146 @@ fn paging_covers_every_item_once_and_rejects_bad_cursors() {
     }
 }
 
+fn delivered(entries: &[(Id, u64)]) -> BTreeMap<Id, u64> {
+    entries.iter().cloned().collect()
+}
+
+fn feed_ids(idx: &crate::Index, done: &BTreeMap<Id, u64>, limit: u32) -> Vec<Id> {
+    idx.feed(done, limit).unwrap().into_iter().map(|c| c.claim.id).collect()
+}
+
+/// DESIGN §6 feed: what the per-actor map does not cover, in arrival order.
 #[test]
-fn feed_is_arrival_order_and_persists_across_reopen() {
-    let mut w = World::new(2);
+fn feed_returns_what_no_entry_covers_in_arrival_order() {
+    let mut w = World::new(3);
     let dir = TempDir::new();
-    let path = dir.path().join("index.sqlite");
     let mut idx = w.index(&dir);
-    idx.mark_complete().unwrap();
+    let (g_, a_, b_) = (w.actor(G), w.actor(1), w.actor(2));
     let g = w.genesis();
     let e = ent();
-    let c1 = w.label(G, &e, "one");
-    let c2 = w.label(G, &e, "two");
-    let c3 = w.label(A, &e, "three");
+    // recorded before a1, but arrives after it
+    let g2 = w.label(G, &e, "g2");
+    let a1 = w.label(1, &e, "a1");
+    let g3 = w.label(G, &e, "g3");
+    let b1 = w.label(2, &e, "b1");
+    let a2 = w.label(1, &e, "a2");
     apply(&mut idx, &[&g]);
-    apply(&mut idx, &[&c3, &c1]);
-    apply(&mut idx, &[&c2, &c1]); // c1 again: already indexed, no new number
-    let (items, last) = idx.feed(0, 10).unwrap();
-    let order: Vec<_> = items.iter().map(|c| c.claim.id.clone()).collect();
-    assert_eq!(order, vec![g.id.clone(), c3.id.clone(), c1.id.clone(), c2.id.clone()], "arrival, not record time");
-    assert_eq!(last, 4);
-    let (items, last) = idx.feed(2, 1).unwrap();
-    assert_eq!((items[0].claim.id.clone(), last), (c1.id.clone(), 3));
-    assert_eq!(idx.feed(4, 10).unwrap(), (vec![], 4));
+    apply(&mut idx, &[&a1, &g2]);
+    apply(&mut idx, &[&g3, &b1, &g2, &a2]); // g2 again: already indexed, no new arrival
+    let arrival = vec![g.id.clone(), a1.id.clone(), g2.id.clone(), g3.id.clone(), b1.id.clone(), a2.id.clone()];
+
+    assert_eq!(feed_ids(&idx, &delivered(&[]), 10), arrival, "arrival order, not record time");
+    assert_eq!(feed_ids(&idx, &delivered(&[]), 2), arrival[..2]);
+    assert_eq!(feed_ids(&idx, &delivered(&[(g_.clone(), 3)]), 10), vec![a1.id.clone(), b1.id.clone(), a2.id.clone()]);
+    assert_eq!(
+        feed_ids(&idx, &delivered(&[(g_.clone(), 1), (a_.clone(), 1)]), 10),
+        vec![g2.id.clone(), g3.id.clone(), b1.id.clone(), a2.id.clone()],
+        "an actor without an entry has had nothing delivered"
+    );
+    assert_eq!(feed_ids(&idx, &delivered(&[(g_.clone(), 1), (a_.clone(), 1)]), 3), vec![g2.id.clone(), g3.id.clone(), b1.id.clone()]);
+    // seed [5; 32]: an actor with no claim in this index
+    let elsewhere = World::new(5).actor(4);
+    let past_every_head = delivered(&[(g_, 99), (a_, 2), (b_, 1), (elsewhere, 5)]);
+    assert!(feed_ids(&idx, &past_every_head, 10).is_empty(), "entries past the heads, or for actors not here, cover nothing more");
+    for bad in [0, knowa_model::query::MAX_LIMIT + 1] {
+        assert_eq!(idx.feed(&delivered(&[]), bad).unwrap_err().code, ErrorCode::Invalid);
+    }
+}
+
+/// Paging by the highest seq delivered per actor, with actors interleaved, delivers
+/// every claim once, in arrival order, whatever the page size.
+#[test]
+fn paging_by_highest_delivered_seq_delivers_each_claim_once() {
+    let mut w = World::new(3);
+    let dir = TempDir::new();
+    let mut idx = w.index(&dir);
+    let g = w.genesis();
+    apply(&mut idx, &[&g]);
+    let e = ent();
+    let mut arrival = vec![g.id.clone()];
+    for i in 0..7 {
+        let batch: Vec<_> = [1, G, 2, 1].iter().map(|&who| w.label(who, &e, &format!("{who}-{i}"))).collect();
+        apply(&mut idx, &batch.iter().collect::<Vec<_>>());
+        arrival.extend(batch.iter().map(|c| c.id.clone()));
+    }
+    for limit in [1, 2, 3, 5] {
+        let mut done = BTreeMap::new();
+        let mut got = Vec::new();
+        loop {
+            let page = idx.feed(&done, limit).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            assert!(page.len() <= limit as usize);
+            for c in page {
+                let seq = done.entry(c.claim.body.actor.clone()).or_insert(0);
+                *seq = (*seq).max(c.claim.body.seq);
+                got.push(c.claim.id);
+            }
+            assert!(got.len() <= arrival.len(), "limit {limit}: more deliveries than claims");
+        }
+        assert_eq!(got, arrival, "limit {limit}");
+    }
+}
+
+#[test]
+fn reopening_keeps_the_build_and_another_space_or_an_unfinished_build_is_rebuilt() {
+    let mut w = World::new(1);
+    let dir = TempDir::new();
+    let path = dir.path().join("index.sqlite");
+    let generation = "01jd5k8v0m3q7x9yz2c4b6n8pr";
+    let mut idx = crate::Index::create(&path, dir.path(), &w.space, &w.owner(), Some(generation)).unwrap();
+    idx.mark_complete().unwrap();
+    let g = w.genesis();
+    apply(&mut idx, &[&g]);
     let epoch = idx.epoch().to_string();
     assert_eq!(epoch.len(), 32);
+    assert_eq!(idx.generation(), Some(generation));
     drop(idx);
 
     let other_space = Id::new_space().unwrap();
     assert!(
-        crate::Index::open_existing(&path, dir.path(), &other_space, &w.owner(), None).unwrap().is_none(),
+        crate::Index::open_existing(&path, dir.path(), &other_space, &w.owner(), Some(generation)).unwrap().is_none(),
         "an index of another space must be rebuilt"
     );
-    let mut idx = crate::Index::open_existing(&path, dir.path(), &w.space, &w.owner(), None).unwrap().unwrap();
-    assert_eq!(idx.epoch(), epoch, "reopening keeps the epoch");
-    let c4 = w.label(G, &e, "four");
-    apply(&mut idx, &[&c4]);
-    assert_eq!(idx.feed(4, 10).unwrap().1, 5, "numbering continues");
-    assert_eq!(idx.actor_heads().unwrap(), {
-        let mut v = vec![(w.actor(G), 4), (w.actor(A), 1)];
-        v.sort();
-        v
-    });
+    assert!(
+        crate::Index::open_existing(&path, dir.path(), &w.space, &w.owner(), None).unwrap().is_none(),
+        "an index of another generation must be rebuilt"
+    );
+    let mut idx = crate::Index::open_existing(&path, dir.path(), &w.space, &w.owner(), Some(generation)).unwrap().unwrap();
+    assert_eq!((idx.epoch(), idx.generation()), (epoch.as_str(), Some(generation)), "reopening keeps the build");
+    let e = ent();
+    let c2 = w.label(G, &e, "two");
+    apply(&mut idx, &[&c2]);
+    assert_eq!(feed_ids(&idx, &delivered(&[]), 10), vec![g.id.clone(), c2.id.clone()], "arrivals continue after the reopen");
     drop(idx);
 
     let fresh = w.index(&dir);
     assert_ne!(fresh.epoch(), epoch, "a rebuilt index gets a new epoch");
-    assert!(fresh.feed(0, 10).unwrap().0.is_empty());
+    assert!(feed_ids(&fresh, &delivered(&[]), 10).is_empty());
     drop(fresh);
     assert!(crate::Index::open_existing(&path, dir.path(), &w.space, &w.owner(), None).unwrap().is_none(), "an unfinished build must be rebuilt");
+}
+
+/// The feed's per-actor reads must seek `claims_actor`, never scan every claim.
+#[test]
+fn the_feed_seeks_the_actor_index() {
+    let (_w, _dir, idx) = setup();
+    let plan = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> Vec<String> {
+        idx.conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(params, |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+    let next = plan(crate::read::FEED_NEXT_SQL, &[&"a", &0]);
+    assert_eq!(next, vec!["SEARCH claims USING COVERING INDEX claims_actor (actor=? AND seq>?)".to_string()], "{next:?}");
+    let actors = plan(crate::read::FEED_ACTORS_SQL, &[]);
+    let on_claims: Vec<&String> = actors.iter().filter(|l| l.contains("claims")).collect();
+    assert!(!on_claims.is_empty(), "{actors:?}");
+    assert!(on_claims.iter().all(|l| l.starts_with("SEARCH claims USING COVERING INDEX claims_actor")), "{actors:?}");
 }
 
 #[test]

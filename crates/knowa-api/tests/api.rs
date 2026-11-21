@@ -636,3 +636,186 @@ fn a_repeated_review_is_not_written_again() {
     assert_eq!((&again.items[0].id, again.items[0].created), (&first.items[0].id, false));
     assert_eq!(reviews_of(&r.k, &r.alice, &r.b[0]), 1);
 }
+
+// ---------- feed cursors and workers (DESIGN §6 feed, §5.4, §7.1) ----------
+
+fn label(k: &Knowa, who: &str, text: &str) {
+    let sel = Sel { space: None, actor: Some(who.into()) };
+    k.write(&sel, vec![Draft::new(Id::new_entity().unwrap(), term("knowa:label"), Value::text(text))]).unwrap();
+}
+
+fn ids(r: &knowa_model::query::FeedResult) -> Vec<Id> {
+    r.claims.iter().map(|c| c.claim.id.clone()).collect()
+}
+
+/// Every claim id in the replica, sorted.
+fn every_claim(k: &Knowa, sel: &Sel) -> Vec<Id> {
+    let all = k.feed(sel, None, MAX_LIMIT).unwrap();
+    assert!(all.claims.len() < MAX_LIMIT as usize, "the test space outgrew one page");
+    sorted(ids(&all))
+}
+
+/// A cursor is per-actor seqs at a rebuild generation, so pages served by different
+/// indexes of one replica (this home's, the same after `reindex`, another home's, each
+/// with its own arrival order) together deliver every claim exactly once.
+#[test]
+fn a_cursor_pages_through_any_index_of_the_replica_exactly_once() {
+    let s = Scratch::new("feed-portable");
+    let (k, alice_sel, _) = alice(&s);
+    for name in ["bot", "carol"] {
+        k.home().new_actor(name, ActorKind::Agent).unwrap();
+    }
+    let write_round = |round: &str| {
+        for who in ["bot", "alice", "carol", "bot"] {
+            label(&k, who, &format!("{who} {round}"));
+        }
+    };
+    write_round("one");
+    write_round("two");
+
+    // Another machine reading the same replica, with its own home and index.
+    let other = Knowa::new(Home::open(Some(&s.path("home-b"))).unwrap());
+    other.space_add(&s.path("alice-space"), Some("shared"), true).unwrap();
+    let other_sel = Sel { space: Some("shared".into()), actor: None };
+
+    let mut cursor: Option<String> = None;
+    let mut delivered = Vec::new();
+    let mut page = |api: &Knowa, sel: &Sel| -> usize {
+        let r = api.feed(sel, cursor.as_deref(), 3).unwrap();
+        assert!(r.claims.len() <= 3);
+        if r.claims.is_empty() {
+            assert_eq!(cursor.as_deref(), Some(r.cursor.as_str()), "nothing new: the cursor stays");
+        }
+        delivered.extend(ids(&r));
+        cursor = Some(r.cursor);
+        r.claims.len()
+    };
+    // Alternate the index serving each page, and keep changing what is there.
+    for n in 0..12 {
+        match n % 4 {
+            1 => write_round(&format!("page {n}")),
+            3 => {
+                k.reindex(&alice_sel).unwrap();
+            }
+            _ => {}
+        }
+        if n % 2 == 0 { page(&k, &alice_sel) } else { page(&other, &other_sel) };
+    }
+    assert!((0..50).any(|_| page(&other, &other_sel) == 0), "the feed never ran dry");
+    assert_eq!(page(&k, &alice_sel), 0);
+    let unique: std::collections::BTreeSet<&Id> = delivered.iter().collect();
+    assert_eq!(unique.len(), delivered.len(), "a claim was delivered twice");
+    assert_eq!(sorted(delivered.clone()), every_claim(&k, &alice_sel), "a claim was never delivered");
+    assert_eq!(sorted(delivered), every_claim(&other, &other_sel));
+}
+
+#[test]
+fn a_cursor_survives_reindex_and_continues_with_new_claims() {
+    let s = Scratch::new("feed-reindex");
+    let (k, sel, _) = alice(&s);
+    let start = k.feed(&sel, None, MAX_LIMIT).unwrap();
+    k.reindex(&sel).unwrap();
+    let after = k.feed(&sel, Some(&start.cursor), MAX_LIMIT).unwrap();
+    assert!(after.claims.is_empty(), "{:?}", ids(&after));
+    assert_eq!(after.cursor, start.cursor);
+    label(&k, "alice", "after the reindex");
+    let next = k.feed(&sel, Some(&start.cursor), MAX_LIMIT).unwrap();
+    assert_eq!(next.claims.len(), 1);
+    assert_eq!(next.claims[0].claim.body.p.as_str(), "knowa:label");
+}
+
+#[test]
+fn a_malformed_feed_cursor_is_invalid() {
+    let s = Scratch::new("feed-malformed");
+    let (k, sel, _) = alice(&s);
+    let good = k.feed(&sel, None, 1).unwrap().cursor;
+    for bad in ["nonsense".to_string(), "7f3a9c0e1d2b4a5f8e9d0c1b2a3f4e5d:3".into(), format!("{good}.7"), good.to_uppercase()] {
+        let err = k.feed(&sel, Some(&bad), 10).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Invalid, "{bad:?}: {err:?}");
+    }
+}
+
+/// A stranger's chain of `n` claims for `space`.
+fn chain(space: &Id, n: u64) -> Vec<knowa_model::Claim> {
+    let dave = Signer::generate().unwrap();
+    let mut out: Vec<knowa_model::Claim> = Vec::new();
+    for seq in 1..=n {
+        let d = Draft::new(Id::new_entity().unwrap(), term("knowa:label"), Value::text(format!("dave {seq}")));
+        let body = ClaimBody::from_draft(d, space.clone(), dave.actor_id(), seq, out.last().map(|c| c.id.clone()), Timestamp::now());
+        out.push(dave.seal(body).unwrap());
+    }
+    out
+}
+
+/// DESIGN §5.4 / §6 feed: a merge that fills a gap below seqs a cursor has passed gives
+/// the replica a new rebuild generation, which expires the cursor instead of letting it
+/// step over the claims that filled the gap.
+#[test]
+fn a_merge_that_fills_a_gap_expires_feed_cursors() {
+    let s = Scratch::new("feed-gap");
+    let (k, sel, space) = alice(&s);
+    let replica = Replica::open(&s.path("alice-space")).unwrap();
+    let dave = chain(&space, 3);
+    replica.merge(&[dave[0].clone(), dave[2].clone()]).unwrap();
+    let page = k.feed(&sel, None, MAX_LIMIT).unwrap();
+    assert!(ids(&page).contains(&dave[2].id) && !ids(&page).contains(&dave[1].id));
+    k.reindex(&sel).unwrap();
+    assert!(k.feed(&sel, Some(&page.cursor), MAX_LIMIT).unwrap().claims.is_empty(), "a reindex alone does not expire it");
+
+    replica.merge(std::slice::from_ref(&dave[1])).unwrap();
+    let err = k.feed(&sel, Some(&page.cursor), MAX_LIMIT).unwrap_err();
+    assert_eq!(err.code, ErrorCode::CursorExpired, "{err:?}");
+    assert!(err.message.contains("restart the feed from the beginning"), "{}", err.message);
+    let generation = replica.generation().unwrap().unwrap();
+    assert_eq!(err.detail.as_ref().unwrap()["generation"], generation.as_str());
+    assert!(ids(&k.feed(&sel, None, MAX_LIMIT).unwrap()).contains(&dave[1].id), "from the beginning, the filled gap is there");
+}
+
+/// A command that appends each batch it gets, one JSON line per batch, to `log`.
+fn recording_worker(log: &Path) -> Vec<String> {
+    vec!["sh".into(), "-c".into(), format!("cat >> '{0}' && echo >> '{0}'", log.display())]
+}
+
+/// Claim ids of every batch recorded so far, in order.
+fn recorded(log: &Path) -> Vec<Id> {
+    fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .flat_map(|line| {
+            let batch: serde_json::Value = serde_json::from_str(line).unwrap();
+            batch["claims"].as_array().unwrap().iter().map(|c| Id::parse(c["id"].as_str().unwrap()).unwrap()).collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// DESIGN §7.1: the worker resumes from its stored cursor, also after a reindex, and a
+/// failing command does not advance it.
+#[test]
+fn a_worker_resumes_from_its_stored_cursor() {
+    let s = Scratch::new("worker-resume");
+    let (k, sel, _) = alice(&s);
+    k.home().new_actor("tally", ActorKind::Worker).unwrap();
+    label(&k, "alice", "one");
+    let log = s.path("batches.jsonl");
+    let first = k.worker_run(&sel, "tally", &recording_worker(&log), 2, false).unwrap();
+    let seen = recorded(&log);
+    assert_eq!(sorted(seen.clone()), every_claim(&k, &sel));
+    assert!(first.batches >= 2, "batches of 2: {}", first.batches);
+
+    label(&k, "alice", "two");
+    label(&k, "alice", "three");
+    k.reindex(&sel).unwrap();
+    k.worker_run(&sel, "tally", &recording_worker(&log), 2, false).unwrap();
+    let all = recorded(&log);
+    assert_eq!(all.len(), seen.len() + 2, "only the two new claims, once each");
+    assert_eq!(sorted(all.clone()), every_claim(&k, &sel));
+
+    label(&k, "alice", "four");
+    let failing = vec!["sh".to_string(), "-c".into(), "cat > /dev/null; exit 3".into()];
+    let err = k.worker_run(&sel, "tally", &failing, 2, false).unwrap_err();
+    assert!(err.message.contains("cursor not advanced"), "{err:?}");
+    k.worker_run(&sel, "tally", &recording_worker(&log), 2, false).unwrap();
+    let after = recorded(&log);
+    assert_eq!(after.len(), all.len() + 1, "the batch the failed command got comes again");
+    assert_eq!(sorted(after), every_claim(&k, &sel));
+}

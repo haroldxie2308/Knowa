@@ -367,7 +367,7 @@ pub struct WriteResult {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FeedResult {
     pub claims: Vec<ClaimView>,
-    /// `<epoch>:<n>`; pass back to continue
+    /// opaque (DESIGN §6 feed); pass back to continue
     pub cursor: String,
 }
 

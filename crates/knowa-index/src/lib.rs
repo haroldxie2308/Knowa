@@ -16,7 +16,7 @@ mod rules;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -75,6 +75,8 @@ pub struct Page<T> {
 pub struct Index {
     conn: Connection,
     epoch: String,
+    /// the replica's rebuild generation this index was built against (DESIGN §5.4)
+    generation: Option<String>,
     space: Id,
     /// genesis owner, from the manifest
     owner: Id,
@@ -190,12 +192,17 @@ impl Index {
         Ok(())
     }
 
-    /// Incrementally applies claims just appended/merged into `replica` (any order),
-    /// assigns arrival numbers, recomputes status/stale for every affected claim
-    /// (targets of review/retract/replaces, dependents via src, and — on policy
-    /// changes — all claims of the affected actor), refreshes affected entity rows,
-    /// per-claim FTS docs (incl. text blobs read from `replica`) and geo. Under the
-    /// index lock.
+    /// Incrementally applies claims just appended into `replica`, assigns arrival
+    /// numbers, recomputes status/stale for every affected claim (targets of
+    /// review/retract/replaces, dependents via src, and — on policy changes — all
+    /// claims of the affected actor), refreshes affected entity rows, per-claim FTS docs
+    /// (incl. text blobs read from `replica`) and geo. Under the index lock.
+    ///
+    /// Each actor's claims must come in ascending seq, above every seq of that actor
+    /// already indexed, so that its arrival order is its seq order, which the feed
+    /// relies on (`read::feed`). A writer meets this by applying the batch it appended
+    /// while still holding the actor's exclusive lock, under which it caught the actor
+    /// up first.
     pub fn apply(&mut self, replica: &Replica, claims: &[Claim]) -> Result<()> {
         let _lock = IndexLock::take(&self.dir)?;
         self.apply_with(replica, claims)
@@ -215,6 +222,12 @@ impl Index {
     /// Random token chosen at (re)build time.
     pub fn epoch(&self) -> &str {
         &self.epoch
+    }
+
+    /// The replica's rebuild generation this index was built against (DESIGN §5.4);
+    /// `None` for a replica that has none. Feed cursors record it.
+    pub fn generation(&self) -> Option<&str> {
+        self.generation.as_deref()
     }
 
     /// Highest indexed seq per actor (for catch-up / diagnostics).
@@ -265,10 +278,13 @@ impl Index {
         read::edges(&self.conn, id, view)
     }
 
-    /// Claims in local arrival order after `after` (arrival number), up to `limit`.
-    /// Returns (claims, last arrival number). Caller formats `<epoch>:<n>`.
-    pub fn feed(&self, after: u64, limit: u32) -> Result<(Vec<ClaimView>, u64)> {
-        read::feed(&self.conn, after, limit)
+    /// DESIGN §6 feed: the claims not yet delivered according to `delivered`, the
+    /// highest seq already delivered per actor (an actor without an entry has had
+    /// nothing delivered), in local arrival order, at most `limit`. The map is only
+    /// meaningful at the `generation` it was built against, which the caller checks;
+    /// `read::feed` says why a page then never steps over a claim.
+    pub fn feed(&self, delivered: &BTreeMap<Id, u64>, limit: u32) -> Result<Vec<ClaimView>> {
+        read::feed(&self.conn, delivered, limit)
     }
 
     /// Raw audit log by record time ascending, regardless of status.
@@ -370,7 +386,14 @@ impl Index {
         let conn = Index::connect(path)?;
         conn.execute_batch(db::SCHEMA).map_err(db)?;
         let epoch: String = conn.query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0)).map_err(db)?;
-        let index = Index { conn, epoch, space: space.clone(), owner: owner.clone(), dir: dir.to_path_buf() };
+        let index = Index {
+            conn,
+            epoch,
+            generation: generation.map(str::to_string),
+            space: space.clone(),
+            owner: owner.clone(),
+            dir: dir.to_path_buf(),
+        };
         index.set_meta(META_EPOCH, &index.epoch)?;
         index.set_meta(META_SPACE, space.as_str())?;
         if let Some(g) = generation {
@@ -408,7 +431,14 @@ impl Index {
             return Ok(None);
         }
         let epoch = get(META_EPOCH)?.ok_or_else(|| db::corrupt("complete index without an epoch"))?;
-        Ok(Some(Index { conn, epoch, space: space.clone(), owner: owner.clone(), dir: dir.to_path_buf() }))
+        Ok(Some(Index {
+            conn,
+            epoch,
+            generation: generation.map(str::to_string),
+            space: space.clone(),
+            owner: owner.clone(),
+            dir: dir.to_path_buf(),
+        }))
     }
 
     /// Written by `create`'s caller, before the catch-up that fills the index: from

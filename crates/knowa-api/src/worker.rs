@@ -10,7 +10,7 @@ use knowa_config::{Actor, Home};
 use knowa_model::{ActorKind, ClaimView, Draft, Error, ErrorCode, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::feed::{check_limit, feed, parse_cursor};
+use crate::feed::{Cursor, check_limit, feed};
 use crate::select::{Space, current};
 use crate::write::{Txn, stamp_worker};
 use crate::{Sel, WorkerRunResult};
@@ -49,7 +49,8 @@ pub(crate) fn worker_run(
     }
     let space = current(home, sel)?;
     space.ensure_writable()?;
-    // Machine-local, next to the index whose epoch it names (DESIGN §7.1).
+    // Machine-local, next to the index (DESIGN §7.1), although the cursor itself would
+    // hold on any machine reading the replica.
     let cursor_file = space.index_dir.join("cursors").join(format!("{actor_name}.json"));
     let mut cursor = load_cursor(&cursor_file)?;
     let mut run = WorkerRunResult { batches: 0, claims_in: 0, claims_out: 0, cursor: String::new() };
@@ -170,7 +171,7 @@ fn load_cursor(path: &Path) -> Result<Option<String>> {
         ))
     };
     let f: CursorFile = serde_json::from_slice(&bytes).map_err(|e| bad(e.to_string()))?;
-    parse_cursor(&f.cursor).map_err(|e| bad(e.message))?;
+    Cursor::parse(&f.cursor).map_err(|e| bad(e.message))?;
     Ok(Some(f.cursor))
 }
 
@@ -184,13 +185,13 @@ fn save_cursor(path: &Path, cursor: &str) -> Result<()> {
     Ok(())
 }
 
-/// The persisted cursor outlived an index rebuild.
+/// The persisted cursor predates a new rebuild generation of the replica.
 fn expired(e: Error, cursor_file: &Path) -> Error {
     if e.code != ErrorCode::CursorExpired {
         return e;
     }
     Error::cursor_expired(format!(
-        "worker cursor is from an earlier index epoch (the index was rebuilt); delete {} to restart the worker from the beginning. The whole feed is then replayed through the command: a draft equal to an active, non-stale claim the worker already wrote is a no-op, but a draft using placeholders (_:x) mints new entities and is written again, duplicating its earlier output",
+        "worker cursor is from an earlier rebuild generation of the replica (a merge has filled gaps in its logs since, possibly below seqs the worker has passed); delete {} to restart the worker from the beginning. The whole feed is then replayed through the command: a draft equal to an active, non-stale claim the worker already wrote is a no-op, but a draft using placeholders (_:x) mints new entities and is written again, duplicating its earlier output",
         cursor_file.display()
     ))
     .with_detail(serde_json::json!({ "cursorFile": cursor_file }))
@@ -237,12 +238,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("knowa-api-cursor-{}", std::process::id()));
         let file = dir.join("cursors").join("w.json");
         assert_eq!(load_cursor(&file).unwrap(), None);
-        save_cursor(&file, "ep:12").unwrap();
-        assert_eq!(load_cursor(&file).unwrap().as_deref(), Some("ep:12"));
-        fs::write(&file, br#"{"cursor":"nonsense"}"#).unwrap();
-        let e = load_cursor(&file).unwrap_err();
-        assert_eq!(e.code, ErrorCode::Invalid);
-        assert!(e.message.contains("delete it"), "{}", e.message);
+        let actor = knowa_model::Signer::from_seed([7; 32]).actor_id();
+        let cursor = format!("fc1.01jd5k8v0m3q7x9yz2c4b6n8pr.{actor}.12");
+        save_cursor(&file, &cursor).unwrap();
+        assert_eq!(load_cursor(&file).unwrap(), Some(cursor));
+        // The retired `<epoch>:<n>` form is malformed like any other text.
+        for stale in [r#"{"cursor":"7f3a9c0e1d2b4a5f8e9d0c1b2a3f4e5d:12"}"#, r#"{"cursor":"nonsense"}"#] {
+            fs::write(&file, stale).unwrap();
+            let e = load_cursor(&file).unwrap_err();
+            assert_eq!(e.code, ErrorCode::Invalid, "{stale}");
+            assert!(e.message.contains("delete it"), "{}", e.message);
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 

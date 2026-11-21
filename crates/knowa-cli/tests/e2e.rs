@@ -566,9 +566,18 @@ fn feed_and_log_list_claims() {
 
     let feed = alice.ok(&["feed", "--limit", "1000"]);
     assert!(!feed["claims"].as_array().unwrap().is_empty());
-    assert!(feed["cursor"].as_str().unwrap().contains(':'));
-    let rest = alice.ok(&["feed", "--cursor", feed["cursor"].as_str().unwrap()]);
+    let cursor = feed["cursor"].as_str().unwrap();
+    // A cursor records per-actor seqs, not positions in this index: reindex keeps it.
+    alice.ok(&["reindex"]);
+    let rest = alice.ok(&["feed", "--cursor", cursor]);
     assert!(rest["claims"].as_array().unwrap().is_empty(), "{rest}");
+    assert_eq!(rest["cursor"], cursor);
+    note(&alice, &["after the reindex"]);
+    let next = alice.ok(&["feed", "--cursor", cursor]);
+    let fresh = next["claims"].as_array().unwrap();
+    assert!(!fresh.is_empty() && fresh.iter().all(|c| c["actor"] == me.as_str()), "{next}");
+    let (code, err) = alice.fail(&["feed", "--cursor", "not-a-cursor"]);
+    assert_eq!(code, 4, "a malformed cursor is invalid: {err}");
 
     let log = alice.ok(&["log", "--actor", &me]);
     let items = log["items"].as_array().unwrap();
