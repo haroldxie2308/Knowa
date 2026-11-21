@@ -439,7 +439,7 @@ Text blobs (`text/*`, ≤ 1 MiB) are indexed for full-text search directly from 
 - **Local only.**
   - The server binds `127.0.0.1`. The default port is 4747; `--port 0` picks a free one.
   - It prints its URL with a random 256-bit token in the fragment: `http://127.0.0.1:<port>/#k=<token>`. The app sends the token as `Authorization: Bearer <token>` on every API call. A fragment is never sent to a server, so the token does not appear in request logs.
-  - An `/api/` request without the right token gets 401.
+  - An `/api/` request without the right token gets 401. The body of a 401 or 403 is the §6.3 error object with code `usage`; the status says which check failed.
   - A request whose `Host` is not `127.0.0.1:<port>` or `localhost:<port>` gets 403, which defeats DNS rebinding.
   - The server sends no CORS headers.
   - It serves nothing from disk except its embedded assets and blob bytes by id.
@@ -460,7 +460,7 @@ Text blobs (`text/*`, ≤ 1 MiB) are indexed for full-text search directly from 
   | `GET /api/spaces` | the registry: `[{alias, space, readonly, current}]` |
   | `POST /api/query` | **query** (a query document) |
   | `GET /api/feed?space=&cursor=&limit=` | **feed** |
-  | `GET /api/blob/<b_…>` | **blob.get** |
+  | `GET /api/blob/<b_…>?spaces=` | **blob.get**. `spaces` is a comma-separated selection, as a query document's `spaces` (`*` for all); absent, the server's space |
   | `POST /api/review` `{"space"?, "decision":"accept"\|"reject", "claims":["c_…"], "note"?}` | `review` with explicit claims only: the UI reviews exactly the claims it shows. It is the only write, and it is signed by the serving actor (`--actor` / `KNOWA_ACTOR`). Without one, the UI is read-only, and this endpoint is a `usage` error naming the variable to set |
 
 - **Blob bytes are untrusted content**, because a blob can be HTML or SVG with scripts. Every blob response carries:
