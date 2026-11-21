@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 
 use knowa_model::query::{Order, View, Where};
 use knowa_model::{ActorInfo, ActorKind, Claim, EntityView, Id, Status, Value, Visibility, vocab};
+use unicode_normalization::UnicodeNormalization;
 
 use super::evidence::{assert_routes_agree, route_queries};
 use super::kit::*;
@@ -49,7 +50,8 @@ fn scenario(seed: u64, n: usize) -> (World, Vec<Claim>, MemBlobs) {
     out.push(w.kind(4, vocab::KIND_HUMAN));
     // actor 5 never declares a kind first; it may later
     let mut blobs = MemBlobs::default();
-    let blob = blobs.put(format!("blob {seed} alpha gamma 東京タワー").as_bytes());
+    // NFD Hangul, which the composed query word 서울특별시 matches (DESIGN §4.7)
+    let blob = blobs.put(format!("blob {seed} alpha gamma 東京タワー {}", "서울특별시".nfd().collect::<String>()).as_bytes());
     let region = Id::parse(&format!("{}#xywh=1,2,3,4", blob.as_str())).unwrap();
     let mut subjects: Vec<Id> = (0..8).map(|_| ent()).collect();
     subjects.push(blob.clone());

@@ -10,3 +10,4 @@ knowa-model = { version = "0.1.0", path = "../knowa-model" }
 knowa-store = { version = "0.1.0", path = "../knowa-store" }
 rusqlite = { version = "0.43.0", features = ["bundled"] }
 serde_json = "1.0.154"
+unicode-normalization = "0.1.26"

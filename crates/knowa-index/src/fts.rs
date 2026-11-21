@@ -1,11 +1,18 @@
 //! Full-text documents and queries over FTS5 with the `unicode61` tokenizer.
 //!
+//! Document and query text are both brought to NFKC first (DESIGN §4.7: text matching
+//! is normalization-insensitive), here and nowhere else, so equivalent spellings
+//! become the same tokens: decomposed (NFD) Hangul from macOS file names and composed
+//! Hangul, full-width and half-width forms, ligatures, `Ⅱ` and `II`. Only the derived
+//! FTS text is normalized; claims and display fields keep the bytes as written.
+//!
 //! `unicode61` does not segment CJK text, so documents get a space between CJK
 //! characters (each becomes a token) and CJK runs in queries become phrase queries:
 //! any substring of a CJK run then matches. User input never reaches FTS syntax:
 //! the query is split into words, each word is quoted.
 
 use knowa_model::{Error, Result};
+use unicode_normalization::UnicodeNormalization;
 
 /// Han, Hiragana, Katakana and Hangul (incl. their extension and half-width blocks).
 pub(crate) fn is_cjk(c: char) -> bool {
@@ -31,10 +38,12 @@ pub(crate) fn is_cjk(c: char) -> bool {
     )
 }
 
-/// Document text with every CJK character surrounded by spaces.
+/// Document text, NFKC-normalized, with every CJK character surrounded by spaces.
+/// Normalizing comes first so that NFD Hangul composes into syllables before they
+/// are split.
 pub(crate) fn document(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + text.len() / 2);
-    for c in text.chars() {
+    for c in text.nfkc() {
         if is_cjk(c) {
             out.push(' ');
             out.push(c);
@@ -50,9 +59,14 @@ pub(crate) fn document(text: &str) -> String {
 /// phrase of single characters; the last one is a prefix. A query matches when every
 /// token matches (DESIGN §4.7: each in some claim passing the view). `invalid` when
 /// the text has no word characters at all.
+///
+/// The text is NFKC-normalized before it is split, as documents are, and so that the
+/// words are alphanumeric after normalization too (NFKC can expand a character into
+/// punctuation, e.g. `⑴` into `(1)`).
 pub(crate) fn match_terms(text: &str) -> Result<Vec<String>> {
+    let normalized: String = text.nfkc().collect();
     let mut terms: Vec<String> = Vec::new();
-    for word in text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()) {
+    for word in normalized.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()) {
         let mut run = String::new();
         let mut run_cjk = false;
         for c in word.chars() {

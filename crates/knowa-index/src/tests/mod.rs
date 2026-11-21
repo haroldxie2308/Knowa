@@ -1,6 +1,7 @@
 mod equivalence;
 mod evidence;
 mod kit;
+mod normalization;
 mod place_time;
 mod reads;
 mod search;
