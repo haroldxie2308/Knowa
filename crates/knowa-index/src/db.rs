@@ -47,7 +47,7 @@ CREATE INDEX claims_s ON claims(s, p);
 CREATE INDEX claims_p ON claims(p);
 CREATE INDEX claims_oref ON claims(o_ref_base) WHERE o_ref_base IS NOT NULL;
 CREATE INDEX claims_at ON claims(at, id);
-CREATE INDEX claims_equiv ON claims(equiv);
+CREATE INDEX claims_equiv ON claims(equiv, actor, seq);
 CREATE INDEX claims_worker ON claims(worker) WHERE worker IS NOT NULL;
 -- `where.type`; queries must spell out this partial index's condition literally
 CREATE INDEX claims_type ON claims(o, s) WHERE p = 'knowa:type' AND ent = 1;

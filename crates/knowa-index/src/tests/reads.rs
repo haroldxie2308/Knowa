@@ -393,3 +393,21 @@ fn actors_lists_authors_and_role_holders() {
     assert_eq!(find(A).kind, Some(ActorKind::Agent));
     assert_eq!(find(A).role, None);
 }
+
+/// Regression: without stats, SQLite answered the duplicate check (DESIGN §4.4) from
+/// `claims_actor` because it also satisfies `ORDER BY seq`, scanning every claim of
+/// the writing actor for each draft, which made ingest quadratic. The check must seek
+/// on the equivalence index.
+#[test]
+fn the_duplicate_check_seeks_the_equivalence_index() {
+    let (_w, _dir, idx) = setup();
+    let plan: Vec<String> = idx
+        .conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {}", crate::read::EQUIVALENT_SQL))
+        .unwrap()
+        .query_map(["k", "a", "accepted", "proposed"], |r| r.get::<_, String>(3))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(plan, vec!["SEARCH claims USING INDEX claims_equiv (equiv=? AND actor=?)".to_string()], "{plan:?}");
+}

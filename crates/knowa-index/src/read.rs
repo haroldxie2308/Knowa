@@ -739,13 +739,12 @@ pub(crate) fn claims(conn: &Connection, ids: &[Id]) -> Result<Vec<ClaimView>> {
 
 /// DESIGN §4.4: only an active (accepted|proposed), non-stale equivalent blocks a
 /// write; the earliest by seq if there are several.
+/// The duplicate check of DESIGN §4.4; it must seek `claims_equiv` (tested).
+pub(crate) const EQUIVALENT_SQL: &str = "SELECT json, status, stale FROM claims
+     WHERE equiv = ?1 AND actor = ?2 AND status IN (?3, ?4) AND stale = 0 ORDER BY seq LIMIT 1";
+
 pub(crate) fn equivalent(conn: &Connection, actor: &Id, equiv_key: &str) -> Result<Option<ClaimView>> {
-    let mut stmt = conn
-        .prepare_cached(
-            "SELECT json, status, stale FROM claims
-             WHERE equiv = ?1 AND actor = ?2 AND status IN (?3, ?4) AND stale = 0 ORDER BY seq LIMIT 1",
-        )
-        .map_err(db)?;
+    let mut stmt = conn.prepare_cached(EQUIVALENT_SQL).map_err(db)?;
     let mut rows = stmt.query([equiv_key, actor.as_str(), Status::Accepted.as_str(), Status::Proposed.as_str()]).map_err(db)?;
     match rows.next().map_err(db)? {
         Some(row) => Ok(Some(claim_view_at(row, 0)?)),
