@@ -318,10 +318,10 @@ fn results() -> Value {
     json!({
         "EntityView": {
             "id": "id", "spaces": "s_…[] that describe it", "label": "display label: the display-chosen knowa:label, else the display-chosen knowa:name (omitted if neither)", "types": "term[]",
-            "when": "{value: EDTF as written or the record timestamp, from: timestamp|null, to: timestamp|null (half-open, null = open), source: claim|file|recorded}; file means no knowa:when exists and the display-chosen knowa:modified stands in; recorded means neither exists, the entity is a knowa:Note and the earliest record time of its claims stands in. Any other entity without a knowa:when or knowa:modified has no when: it is not on the timeline and matches no when filter",
+            "when": "{value: EDTF as written or the record timestamp, from: timestamp|null, to: timestamp|null (half-open, null = open), source: claim|file|recorded}; file means no knowa:when exists and the chosen knowa:modified stands in (accepted before proposed, then the earliest start, then claim id); recorded means neither exists, the entity is a knowa:Note and the earliest record time of its claims stands in. Any other entity without a knowa:when or knowa:modified has no when: it is not on the timeline and matches no when filter",
             "where": "{lat, lon, r?} numbers", "score": "text relevance (find with text)", "distanceKm": "distance (near queries)",
             "claims": "ids of the claims that supplied label, types, when and where",
-            "displayRule": "Display fields use claims with status accepted or proposed regardless of the query view (accepted before proposed, then latest at); the view decides which entities match."
+            "displayRule": "Views apply to evidence: display fields come only from claims that pass the query view, and so does matching. Among them a single shown value is accepted before proposed, then latest at."
         },
         "ClaimView": "the full claim JSON plus status and stale",
         "BlobView": {"id": "b_…", "size": "bytes", "mediaType": "if known", "spaces": "s_…[] storing the bytes"},
