@@ -144,3 +144,111 @@ fn recorded_fallback_when_and_ordering() {
     assert_eq!(ids(&idx, &Where::default(), Order::WhenDesc), vec![new.clone(), note.clone(), old.clone()]);
     assert_eq!(ids(&idx, &Where::default(), Order::Relevance), vec![new, note, old], "relevance without text = -when");
 }
+
+// ---- §4.8 rule 2: the file time (knowa:modified) ----
+
+#[test]
+fn a_when_claim_beats_a_file_time_which_beats_record_time() {
+    let mut w = World::new(1);
+    let dir = TempDir::new();
+    let mut idx = w.index(&dir);
+    let g = w.genesis();
+    let blob = MemBlobs::default().put(b"report.pdf bytes");
+    let name = w.say(G, &blob, vocab::NAME, text("report.pdf"));
+    apply(&mut idx, &[&g, &name]);
+    let shown = |idx: &crate::Index, id: &Id| idx.entity(id, &View::default()).unwrap().unwrap();
+    assert_eq!(shown(&idx, &blob).when.unwrap().source, WhenSource::Recorded);
+
+    let modified = w.say(G, &blob, vocab::MODIFIED, when("2014-05-13T16:53:20Z"));
+    apply(&mut idx, &[&modified]);
+    let e = shown(&idx, &blob);
+    let file = e.when.unwrap();
+    assert_eq!((file.source, file.value.as_str()), (WhenSource::File, "2014-05-13T16:53:20Z"));
+    assert_eq!(file.from.as_deref(), Some("2014-05-13T16:53:20.000Z"));
+    assert_eq!(file.to.as_deref(), Some("2014-05-13T16:53:20.001Z"));
+    assert!(e.claims.contains(&modified.id), "the chosen knowa:modified supports when");
+
+    let claimed = w.say(G, &blob, vocab::WHEN, when("2019-06"));
+    apply(&mut idx, &[&claimed]);
+    let e = shown(&idx, &blob);
+    let both = e.when.unwrap();
+    assert_eq!((both.source, both.value.as_str()), (WhenSource::Claim, "2019-06"));
+    assert!(!e.claims.contains(&modified.id), "an unused knowa:modified supports nothing");
+
+    // knowa:created never dates an entity
+    let other = MemBlobs::default().put(b"other bytes");
+    let created = w.say(G, &other, vocab::CREATED, when("2001-01-01T00:00:00Z"));
+    apply(&mut idx, &[&created]);
+    assert_eq!(shown(&idx, &other).when.unwrap().source, WhenSource::Recorded);
+}
+
+#[test]
+fn the_earliest_of_several_file_times_dates_the_entity_and_orders_it() {
+    let mut w = World::new(1);
+    let dir = TempDir::new();
+    let mut idx = w.index(&dir);
+    let g = w.genesis();
+    let blob = MemBlobs::default().put(b"same bytes, three paths");
+    let middle = w.say(G, &blob, vocab::MODIFIED, when("2016-01-01T00:00:00Z"));
+    let earliest = w.say(G, &blob, vocab::MODIFIED, when("2014-01-01T00:00:00Z"));
+    let latest = w.say(G, &blob, vocab::MODIFIED, when("2020-01-01T00:00:00Z"));
+    let between = ent();
+    let between_when = w.say(G, &between, vocab::WHEN, when("2015"));
+    apply(&mut idx, &[&g, &middle, &earliest, &latest, &between_when]);
+
+    let e = idx.entity(&blob, &View::default()).unwrap().unwrap();
+    let file = e.when.unwrap();
+    assert_eq!((file.source, file.value.as_str()), (WhenSource::File, "2014-01-01T00:00:00Z"));
+    assert!(e.claims.contains(&earliest.id) && !e.claims.contains(&middle.id) && !e.claims.contains(&latest.id));
+    assert_eq!(ids(&idx, &Where::default(), Order::When), vec![blob.clone(), between.clone()]);
+    assert_eq!(ids(&idx, &when_filter(Some("2014"), Some("2014")), Order::When), vec![blob.clone()]);
+    assert!(ids(&idx, &when_filter(Some("2016"), Some("2020")), Order::When).is_empty(), "only the chosen file time places the entity");
+    super::evidence::assert_routes_agree(&idx, &[Where::default(), when_filter(Some("2014"), Some("2016"))], "file times");
+}
+
+#[test]
+fn an_accepted_file_time_beats_an_earlier_proposed_one() {
+    const STRANGER: usize = 1; // no role: its claims are proposed
+    let mut w = World::new(2);
+    let dir = TempDir::new();
+    let mut idx = w.index(&dir);
+    let g = w.genesis();
+    let blob = MemBlobs::default().put(b"contested bytes");
+    let proposed = w.say(STRANGER, &blob, vocab::MODIFIED, when("1990-01-01T00:00:00Z"));
+    let accepted = w.say(G, &blob, vocab::MODIFIED, when("2010-01-01T00:00:00Z"));
+    apply(&mut idx, &[&g, &proposed, &accepted]);
+    assert_eq!(status(&idx, &proposed), knowa_model::Status::Proposed);
+
+    let file = idx.entity(&blob, &View::default()).unwrap().unwrap().when.unwrap();
+    assert_eq!((file.source, file.value.as_str()), (WhenSource::File, "2010-01-01T00:00:00Z"));
+    super::evidence::assert_routes_agree(&idx, &[Where::default()], "accepted file time");
+
+    // with the accepted one retracted, the proposed one is the only candidate left
+    let gone = w.retract(G, &accepted);
+    apply(&mut idx, &[&gone]);
+    let file = idx.entity(&blob, &View::default()).unwrap().unwrap().when.unwrap();
+    assert_eq!((file.source, file.value.as_str()), (WhenSource::File, "1990-01-01T00:00:00Z"));
+}
+
+#[test]
+fn a_view_excluding_the_file_times_author_falls_back_to_record_time() {
+    const AGENT: usize = 1;
+    let mut w = World::new(2);
+    let dir = TempDir::new();
+    let mut idx = w.index(&dir);
+    let g = w.genesis();
+    let blob = MemBlobs::default().put(b"agent-dated bytes");
+    let name = w.say(G, &blob, vocab::NAME, text("scan.tiff"));
+    let modified = w.say(AGENT, &blob, vocab::MODIFIED, when("2001-01-01T00:00:00Z"));
+    apply(&mut idx, &[&g, &name, &modified]);
+
+    assert_eq!(idx.entity(&blob, &View::default()).unwrap().unwrap().when.unwrap().source, WhenSource::File);
+    let owner_only = View { actors: vec![w.owner()], ..View::default() };
+    let e = idx.entity(&blob, &owner_only).unwrap().unwrap();
+    let when = e.when.unwrap();
+    assert_eq!((when.source, when.value), (WhenSource::Recorded, name.body.at.format()));
+    assert_eq!(e.claims, vec![name.id.clone()]);
+    let in_2001 = when_filter(Some("2001"), Some("2001"));
+    assert!(idx.find_entities(&in_2001, &owner_only, Order::When, 10, None).unwrap().items.is_empty());
+    assert_eq!(ids(&idx, &in_2001, Order::When), vec![blob]);
+}

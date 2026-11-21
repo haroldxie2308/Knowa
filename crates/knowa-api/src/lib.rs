@@ -52,7 +52,8 @@ pub struct PutItem {
     pub size: u64,
     /// ids of claims written for this file (by the actor and by the extract worker)
     pub claims: Vec<Id>,
-    /// "<worker>: <message>" for extractor failures on this file
+    /// per-file problems that did not stop the run: "<worker>: <message>" for a failed
+    /// extractor, or a file time with no EDTF form (its claim is left out)
     pub errors: Vec<String>,
 }
 
@@ -163,8 +164,8 @@ impl Knowa {
     /// `unsupported`, `nearId` resolution, `order: distance` without near → `invalid`),
     /// fans out to each selected replica's index, and merges:
     /// - find: entities merged by id (spaces unioned, types unioned, display fields from
-    ///   the first space in selection order, except that a `knowa:when` beats another
-    ///   space's record-time fallback), then ordered by the requested order.
+    ///   the first space in selection order, except `when`, where a `knowa:when` beats a
+    ///   file time, which beats a record time, DESIGN §4.8), then ordered by the requested order.
     /// - get / context / path / log as documented in DESIGN §6.2.
     pub fn query(&self, sel: &Sel, doc: QueryDoc) -> Result<QueryResult> {
         query::query(&self.home, sel, doc)
@@ -187,8 +188,10 @@ impl Knowa {
 
     /// Ingests files/directories (recursive; hidden files skipped and NOT silently:
     /// they are simply not walked, as documented in CLI help). Per file: blob_put,
-    /// `knowa:name` + `knowa:source` (absolute path) by the actor, then (unless
-    /// `no_extract`) extractors written as the extract actor. Nonexistent path → `not_found`.
+    /// `knowa:name` + `knowa:source` (absolute path) + `knowa:modified` + `knowa:created`
+    /// (when the OS reports one) by the actor, then (unless `no_extract`) extractors
+    /// written as the extract actor. Nonexistent path → `not_found`; a file whose size or
+    /// modification time changed while being stored → `conflict` (DESIGN §7).
     pub fn put(&self, sel: &Sel, paths: &[PathBuf], no_extract: bool) -> Result<PutResult> {
         ingest::put(&self.home, sel, paths, no_extract)
     }

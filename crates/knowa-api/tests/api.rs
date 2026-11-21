@@ -5,13 +5,14 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use knowa_api::{Knowa, Sel};
 use knowa_config::Home;
-use knowa_model::query::QueryDoc;
-use knowa_model::vocab::{ACTOR_KIND, OWNER};
-use knowa_model::{ActorKind, ClaimBody, Draft, ErrorCode, Id, Signer, Term, Timestamp, Value};
+use knowa_model::query::{FindItems, MAX_LIMIT, QueryDoc, QueryResult};
+use knowa_model::view::{EntityWhen, WhenSource};
+use knowa_model::vocab::{ACTOR_KIND, CREATED, MODIFIED, OWNER};
+use knowa_model::{ActorKind, ClaimBody, Draft, ErrorCode, Id, Signer, Term, Timestamp, Value, When};
 use knowa_store::{BundleMeta, Replica, write_bundle};
 
 struct Scratch(PathBuf);
@@ -185,4 +186,103 @@ fn a_rejected_actor_kind_is_not_redeclared() {
     k.write(&owner, vec![Draft::new(first[0].clone(), term("knowa:review"), Value::Term(term("knowa:Reject")))]).unwrap();
     k.write(&bot, vec![Draft::new(e, term("knowa:label"), Value::text("two"))]).unwrap();
     assert_eq!(kind_claims(&k), first, "only the first actorKind is effective, so none is written after it");
+}
+
+// ---------- put: file times (DESIGN §4.6, §4.8, §7) ----------
+
+/// Writes `bytes` to `<scratch>/<rel>` with modification time `mtime`.
+fn file_at(s: &Scratch, rel: &str, bytes: &[u8], mtime: SystemTime) -> PathBuf {
+    let p = s.path(rel);
+    fs::write(&p, bytes).unwrap();
+    fs::File::options().write(true).open(&p).unwrap().set_modified(mtime).unwrap();
+    p
+}
+
+fn find(k: &Knowa, sel: &Sel, doc: serde_json::Value) -> FindItems {
+    match k.query(sel, serde_json::from_value(doc).unwrap()).unwrap() {
+        QueryResult::Find(f) => f.items,
+        other => panic!("find returned {other:?}"),
+    }
+}
+
+fn entity_when(k: &Knowa, sel: &Sel, id: &Id) -> EntityWhen {
+    match find(k, sel, serde_json::json!({"op": "find", "where": {"ids": [id]}})) {
+        FindItems::Entities(mut e) if e.len() == 1 => e.remove(0).when.unwrap(),
+        other => panic!("expected one entity, got {other:?}"),
+    }
+}
+
+/// `(value, actor)` of each `p` claim about `s`, oldest first.
+fn when_claims(k: &Knowa, sel: &Sel, s: &Id, p: &str) -> Vec<(When, Id)> {
+    let doc = serde_json::json!({"op": "find", "target": "claims", "where": {"s": [s], "p": [p]}, "order": "recorded"});
+    match find(k, sel, doc) {
+        FindItems::Claims(c) => c
+            .into_iter()
+            .map(|c| match c.claim.body.o {
+                Value::When(w) => (w, c.claim.body.actor),
+                other => panic!("{p} with a non-when value {other:?}"),
+            })
+            .collect(),
+        FindItems::Entities(_) => panic!("target is claims"),
+    }
+}
+
+fn claim_count(k: &Knowa, sel: &Sel) -> usize {
+    k.feed(sel, None, MAX_LIMIT).unwrap().claims.len()
+}
+
+#[test]
+fn put_records_the_file_times_and_dates_the_blob_by_its_mtime() {
+    let s = Scratch::new("put-mtime");
+    let (k, sel, _) = alice(&s);
+    let me = k.home().actor("alice").unwrap().id;
+    // half a second past a whole second: the claim floors it
+    let mtime = UNIX_EPOCH + Duration::from_millis(1_400_000_000_500);
+    let path = file_at(&s, "report.txt", b"quarterly numbers\n", mtime);
+
+    let put = k.put(&sel, std::slice::from_ref(&path), false).unwrap();
+    let item = &put.items[0];
+    assert!(item.errors.is_empty(), "{:?}", item.errors);
+    let modified = when_claims(&k, &sel, &item.blob, MODIFIED);
+    assert_eq!(modified.len(), 1);
+    assert_eq!((modified[0].0.raw.as_str(), &modified[0].1), ("2014-05-13T16:53:20Z", &me), "written by the putting actor");
+    let when = entity_when(&k, &sel, &item.blob);
+    assert_eq!((when.source, when.value.as_str()), (WhenSource::File, "2014-05-13T16:53:20Z"));
+
+    if cfg!(target_os = "macos") {
+        let birth = fs::metadata(&path).unwrap().created().unwrap();
+        let secs = i64::try_from(birth.duration_since(UNIX_EPOCH).unwrap().as_secs()).unwrap();
+        let created = when_claims(&k, &sel, &item.blob, CREATED);
+        assert_eq!(created.len(), 1, "macOS reports a birth time");
+        assert_eq!((created[0].0.lo, &created[0].1), (Some(secs * 1000), &me));
+    }
+}
+
+#[test]
+fn a_later_copy_of_the_same_bytes_does_not_move_when() {
+    let s = Scratch::new("put-copy");
+    let (k, sel, _) = alice(&s);
+    let bytes = b"the same photo, twice";
+    let original = file_at(&s, "original.jpg", bytes, UNIX_EPOCH + Duration::from_secs(1_400_000_000));
+    let copy = file_at(&s, "copy.jpg", bytes, UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+
+    let first = k.put(&sel, &[original], false).unwrap().items.remove(0);
+    let second = k.put(&sel, &[copy], false).unwrap().items.remove(0);
+    assert_eq!(first.blob, second.blob);
+    let raw: Vec<String> = when_claims(&k, &sel, &first.blob, MODIFIED).into_iter().map(|(w, _)| w.raw).collect();
+    assert_eq!(raw, vec!["2014-05-13T16:53:20Z", "2023-11-14T22:13:20Z"], "both observations are kept");
+    let when = entity_when(&k, &sel, &first.blob);
+    assert_eq!((when.source, when.value.as_str()), (WhenSource::File, "2014-05-13T16:53:20Z"));
+}
+
+#[test]
+fn re_putting_an_untouched_file_creates_no_claims() {
+    let s = Scratch::new("put-again");
+    let (k, sel, _) = alice(&s);
+    let path = file_at(&s, "notes.txt", b"unchanged\n", UNIX_EPOCH + Duration::from_secs(1_500_000_000));
+    let first = k.put(&sel, std::slice::from_ref(&path), false).unwrap().items.remove(0);
+    let before = claim_count(&k, &sel);
+    let again = k.put(&sel, &[path], false).unwrap().items.remove(0);
+    assert_eq!(claim_count(&k, &sel), before);
+    assert_eq!(again.claims, first.claims, "the existing claims are returned");
 }

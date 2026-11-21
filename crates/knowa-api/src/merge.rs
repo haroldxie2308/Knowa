@@ -50,18 +50,26 @@ fn absorb(into: &mut EntityView, e: EntityView) -> Result<()> {
     Ok(())
 }
 
-/// `first` is from an earlier space in selection order than `later`. A `knowa:when`
-/// (`source: claim`) is evidence and `source: recorded` only the DESIGN §4.8 fallback,
-/// so evidence wins whatever the order. Between two `knowa:when`s the first space wins,
-/// as for the other display fields. Between two fallbacks the earlier time wins: the
-/// fallback is the earliest record time of the entity's claims, and the merged entity
-/// has the claims of both spaces.
+/// `first` is from an earlier space in selection order than `later`. The sources rank
+/// as DESIGN §4.8 orders its rules, whatever the space order: `claim` (a `knowa:when`)
+/// beats `file` (a `knowa:modified`), which beats `recorded` (the record-time
+/// fallback). Between two `claim`s the first space wins, as for the other display
+/// fields. Between two `file`s or two `recorded`s the earlier start wins: each space
+/// reports the earliest of its own observations, and the merged entity has those of
+/// both spaces.
 fn merge_when(first: Option<EntityWhen>, later: Option<EntityWhen>) -> Result<Option<EntityWhen>> {
+    use WhenSource::{Claim, File, Recorded};
     Ok(match (first, later) {
         (Some(a), Some(b)) => Some(match (a.source, b.source) {
-            (WhenSource::Recorded, WhenSource::Claim) => b,
-            (WhenSource::Recorded, WhenSource::Recorded) if when_bounds(&b)?.0 < when_bounds(&a)?.0 => b,
-            _ => a,
+            (Claim, _) | (File, Recorded) => a,
+            (_, Claim) | (Recorded, File) => b,
+            (File, File) | (Recorded, Recorded) => {
+                if when_bounds(&b)?.0 < when_bounds(&a)?.0 {
+                    b
+                } else {
+                    a
+                }
+            }
         }),
         (a, b) => a.or(b),
     })
@@ -294,6 +302,30 @@ mod tests {
         assert_eq!(merged_when(Some(recorded(9_000)), Some(recorded(5_000))), Some(recorded(5_000)));
         assert_eq!(merged_when(Some(recorded(5_000)), Some(recorded(9_000))), Some(recorded(5_000)));
         assert_eq!(merged_when(None, Some(recorded(5_000))), Some(recorded(5_000)));
+    }
+
+    fn file(from: Option<i64>, to: Option<i64>) -> EntityWhen {
+        EntityWhen { source: WhenSource::File, ..when(from, to) }
+    }
+
+    #[test]
+    fn a_file_time_ranks_between_a_when_claim_and_a_record_time_in_any_space_order() {
+        let claimed = when(Some(9_000), Some(9_001));
+        let modified = file(Some(1_000), Some(1_001));
+        // claim beats file even when the file time is earlier
+        assert_eq!(merged_when(Some(modified.clone()), Some(claimed.clone())), Some(claimed.clone()));
+        assert_eq!(merged_when(Some(claimed.clone()), Some(modified.clone())), Some(claimed));
+        // file beats recorded even when the record time is earlier
+        assert_eq!(merged_when(Some(recorded(500)), Some(modified.clone())), Some(modified.clone()));
+        assert_eq!(merged_when(Some(modified.clone()), Some(recorded(500))), Some(modified.clone()));
+        // two file times: the earlier start, whichever space it is from
+        let later = file(Some(3_000), Some(3_001));
+        assert_eq!(merged_when(Some(later.clone()), Some(modified.clone())), Some(modified.clone()));
+        assert_eq!(merged_when(Some(modified.clone()), Some(later.clone())), Some(modified.clone()));
+        // an open start is the earliest start
+        let open = file(None, Some(5_000));
+        assert_eq!(merged_when(Some(modified.clone()), Some(open.clone())), Some(open));
+        assert_eq!(merged_when(None, Some(later.clone())), Some(later));
     }
 
     #[test]

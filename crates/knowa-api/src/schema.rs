@@ -84,8 +84,8 @@ fn admin() -> Value {
         },
         "put": {
             "args": {"paths": "files or directories", "noExtract": "skip extractors"},
-            "does": "Directories are walked recursively; names starting with . are not walked and symlinks met during a walk are not followed (explicitly named paths are). Per file: blob.put, then knowa:name and knowa:source (absolute path) on the blob by the selected actor, then the built-in extractors, written by the extract actor with via.worker = <extractor>. Extractor failures are reported per file and do not stop the run.",
-            "out": {"items": [{"path": "absolute path", "blob": "b_…", "created": "bool", "size": "bytes", "claims": "ids of the claims recording this file (including existing ones matched idempotently)", "errors": "\"<worker>: <message>\" per failed extractor"}]}
+            "does": "Directories are walked recursively; names starting with . are not walked and symlinks met during a walk are not followed (explicitly named paths are). Per file: blob.put, then knowa:name, knowa:source (absolute path), knowa:modified and knowa:created (when the OS reports one; whole seconds UTC) on the blob by the selected actor, then the built-in extractors, written by the extract actor with via.worker = <extractor>. A file whose size or modification time changed while being stored stops the run with conflict; files already stored stay, and a rerun is idempotent. Extractor failures, and file times with no EDTF form, are reported per file and do not stop the run.",
+            "out": {"items": [{"path": "absolute path", "blob": "b_…", "created": "bool", "size": "bytes", "claims": "ids of the claims recording this file (including existing ones matched idempotently)", "errors": "per-file problems that did not stop the run: \"<worker>: <message>\" per failed extractor, or a file time with no EDTF form"}]}
         },
         "extract": {
             "args": {"all": "re-run every extractor on every blob (idempotent)"},

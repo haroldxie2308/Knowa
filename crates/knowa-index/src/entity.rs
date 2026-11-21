@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 
 use knowa_model::view::{EntityWhen, EntityWhere, WhenSource};
-use knowa_model::{EntityView, Id, IdKind, Result, Status, Timestamp, Value, vocab};
+use knowa_model::{EntityView, Id, IdKind, Result, Status, Timestamp, Value, When, vocab};
 use rusqlite::Connection;
 
 use crate::blobs::{self, BlobSource};
@@ -94,17 +94,28 @@ pub(crate) fn summarize(mut evidence: Vec<Evidence>) -> Summary {
         }
     }
 
-    // when: the display-chosen knowa:when, else the earliest record time (§4.8)
+    // when, first match wins (§4.8): the display-chosen knowa:when; else the chosen
+    // knowa:modified; else the earliest record time.
     let earliest = evidence.iter().min_by(|a, b| a.at.cmp(&b.at).then(a.id.cmp(&b.id)));
     let claimed = evidence.iter().find_map(|a| match &a.o {
         Value::When(w) if a.p == vocab::WHEN => Some((w, a.id.as_str())),
         _ => None,
     });
+    // Not the display order: accepted before proposed, then the earliest range start
+    // (an open start is the earliest), then the claim id.
+    let modified = evidence
+        .iter()
+        .filter_map(|a| match &a.o {
+            Value::When(w) if a.p == vocab::MODIFIED => Some((a, w)),
+            _ => None,
+        })
+        .min_by(|(a, aw), (b, bw)| b.accepted.cmp(&a.accepted).then(aw.lo.cmp(&bw.lo)).then(a.id.cmp(&b.id)));
     let when = if let Some((w, id)) = claimed {
         supporting.push(id);
-        // Open-ended ranges have no midpoint; they sort by their finite end.
-        let key = w.center().or(w.lo).or(w.hi);
-        Some(WhenSummary { value: w.raw.clone(), lo: w.lo, hi: w.hi, source: WhenSource::Claim, key })
+        Some(WhenSummary { value: w.raw.clone(), lo: w.lo, hi: w.hi, source: WhenSource::Claim, key: when_key(w) })
+    } else if let Some((a, w)) = modified {
+        supporting.push(&a.id);
+        Some(WhenSummary { value: w.raw.clone(), lo: w.lo, hi: w.hi, source: WhenSource::File, key: when_key(w) })
     } else if let Some(e) = earliest {
         supporting.push(&e.id);
         Some(WhenSummary { value: Timestamp(e.at).format(), lo: Some(e.at), hi: Some(e.at + 1), source: WhenSource::Recorded, key: Some(e.at) })
@@ -131,6 +142,12 @@ pub(crate) fn summarize(mut evidence: Vec<Evidence>) -> Summary {
         point,
         claims: supporting.into_iter().map(String::from).collect(),
     }
+}
+
+/// Ordering key of an EDTF range for `when` / `-when`. Open-ended ranges have no
+/// midpoint; they sort by their finite end.
+fn when_key(w: &When) -> Option<i64> {
+    w.center().or(w.lo).or(w.hi)
 }
 
 impl Summary {
