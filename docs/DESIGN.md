@@ -225,7 +225,8 @@ Every location kind uses the same relative layout:
 knowa.json
 log/<actor-id>/<000000000001>.jsonl   a segment: name = its first seq (12 digits); lines in seq order
 blobs/<id[6:8]>/<blob-id>             raw bytes (id[2:5] is always "ciq", the multihash header)
-generation                            rebuild generation (§5.4); absent until the first merge
+generation                            rebuild generation (§5.4); absent until a merge first needs one
+gaps                                  gap generation (§5.4); absent until a merge first fills a gap
 ```
 
 Directory locations add `log/<actor-id>/.lock`, the actor's advisory lock (§5.3). Segment names sort by seq, so a reader can list one actor's segments starting after a known one.
@@ -281,9 +282,12 @@ Directory locations add `log/<actor-id>/.lock`, the actor's advisory lock (§5.3
 ### 5.4 Reading and the local index
 
 - **Catch-up.** On open, a machine brings its index up to date actor by actor, from that actor's last indexed seq, reading only the segments after it. It takes no replica-wide lock, only the index's own. Processes on one machine therefore serialize their catch-up, and nothing else.
-- **Rebuild generation.** Catch-up cannot see segments that fill gaps below an indexed head.
-  - `merge` (bundle import) writes a fresh `generation` (a new ULID) before its first segment and again after its last.
-  - An index records the generation it was built against. It rebuilds when the replica's generation differs.
+- **Rebuild and gap generations.** Catch-up reads each actor's log above its indexed head, so it sees a merge's claims only when they land above that head. A merge classifies what it writes:
+  - a claim at or below its actor's current log head **fills a gap**: catch-up cannot see it, and a feed cursor may already have passed its seq;
+  - an **added blob** may carry text for claims already indexed, which catch-up does not revisit (§7.2);
+  - claims above every head need nothing: catch-up sees them.
+
+  A merge that fills a gap writes a fresh `gaps` value (a new ULID). A merge that fills a gap or adds a blob writes a fresh `generation`. Each is written before the merge's first write and again after its last. An index records the `generation` it was built against and rebuilds when the replica's differs; a feed cursor records `gaps` and expires when it differs (§6). So importing new claims and new bytes rebuilds indexes but keeps every cursor valid, and only a gap fill makes consumers start over.
   - This replaces v0's `.index/needs-rebuild` marker, which only the importing machine could see.
 - **Rebuild on mismatch.** An index that is missing or has the wrong schema version is rebuilt and gets a new epoch. A rebuild resets the index under the index lock, then fills it by ordinary catch-up without holding that lock, so a crash part-way is finished by the next catch-up.
 - **`verify`** reads every blob in full. On an object store, that downloads the whole store.
@@ -298,7 +302,7 @@ Five primitives. Everything else is sugar.
 | **blob.put** | bytes | `{id, created, size}`. The media type is not part of the bytes: it arrives as a `knowa:mediaType` claim from the `media` extractor |
 | **blob.get** | `{id}` (in any selected space) | bytes |
 | **query** | a query document (6.1) | the op's result (6.2) |
-| **feed** | `{space, cursor?, limit}` | `{claims:[ClaimView], cursor}` in local arrival order. The cursor is opaque. It records the replica's rebuild generation and, per actor, the highest seq already delivered, so it stays valid across a reindex and on every machine that reads the replica *(experimental, §5)*. If the replica's generation has changed since (a merge filled gaps), the call fails with `cursor_expired` |
+| **feed** | `{space, cursor?, limit}` | `{claims:[ClaimView], cursor}` in local arrival order. The cursor is opaque. It records the replica's gap generation (§5.4) and, per actor, the highest seq already delivered, so it stays valid across a reindex and on every machine that reads the replica *(experimental, §5)*. If the replica's gap generation has changed since (a merge filled gaps), the call fails with `cursor_expired` |
 
 Admin ops are `init, verify, reindex, export, import`. They are part of the CLI but not the query contract.
 
