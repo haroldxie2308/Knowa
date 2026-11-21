@@ -196,7 +196,10 @@ pub enum BlobCmd {
 
 #[derive(Debug, Args)]
 #[command(after_help = "Directories are walked recursively. Hidden files and directories \
-                        (names starting with '.') are skipped and not ingested.")]
+                        (names starting with '.') are skipped and not ingested. A file that \
+                        fails on its own (changed while being added, vanished, unreadable, \
+                        evicted) is listed under `skipped` and the others are still added; \
+                        the exit status is then 9.")]
 pub struct PutArgs {
     /// Files or directories (hidden files are skipped)
     #[arg(required = true)]
@@ -207,6 +210,10 @@ pub struct PutArgs {
     /// Record the files without copying their bytes into the replica (catalog only)
     #[arg(long)]
     pub no_store: bool,
+    /// Download evicted files (contents left in the cloud, e.g. iCloud "Optimize Mac
+    /// Storage") and add them; without it they are skipped
+    #[arg(long)]
+    pub download_evicted: bool,
 }
 
 #[derive(Debug, Args)]

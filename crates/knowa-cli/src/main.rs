@@ -20,7 +20,7 @@ fn main() {
     };
     let json = cli.json;
     let code = match run::run(cli) {
-        Ok(()) => 0,
+        Ok(finished) => finished.exit_code(),
         Err(e) => {
             report(&e, json);
             e.code.exit_code()

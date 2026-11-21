@@ -4,6 +4,7 @@
 
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -353,6 +354,7 @@ fn put_text_file_is_searchable_and_hidden_files_are_skipped() {
     let r = alice.ok(&["put", s(&dir)]);
     let items = r["items"].as_array().unwrap();
     assert_eq!(items.len(), 1, "{r}");
+    assert_eq!(r["skipped"], json!([]), "always present");
     let blob = items[0]["blob"].as_str().unwrap().to_string();
     assert!(blob.starts_with("b_"));
 
@@ -379,6 +381,43 @@ fn put_no_store_records_files_whose_bytes_blob_cat_cannot_find() {
     let blob = item["blob"].as_str().unwrap();
     let (_, err) = alice.fail(&["blob", "cat", blob]);
     assert_eq!(err["error"]["code"], "not_found", "{err}");
+}
+
+#[test]
+fn put_skips_an_unreadable_file_prints_the_result_and_exits_9() {
+    let sb = Sandbox::new("put-skip");
+    let alice = setup(&sb);
+    let dir = sb.path("files");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.txt"), "aardvark at noon\n").unwrap();
+    fs::write(dir.join("b.txt"), "badger at dusk\n").unwrap();
+    let locked = dir.join("c.txt");
+    fs::write(&locked, "capybara never\n").unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::File::open(&locked).is_ok() {
+        eprintln!("skipped: a mode 000 file is readable here (root?)");
+        return;
+    }
+
+    let out = alice.run(&["--json", "put", s(&dir)], None);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(9), "stderr: {stderr}");
+    assert!(stderr.is_empty(), "exit 9 is not an error: no envelope, got {stderr}");
+    let r: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let paths: Vec<&str> = r["items"].as_array().unwrap().iter().map(|i| i["path"].as_str().unwrap()).collect();
+    assert_eq!(paths, vec![s(&dir.join("a.txt")), s(&dir.join("b.txt"))], "{r}");
+    let skipped = r["skipped"].as_array().unwrap();
+    assert_eq!(skipped.len(), 1, "{r}");
+    assert_eq!((&skipped[0]["path"], &skipped[0]["code"]), (&json!(s(&locked)), &json!("internal")), "{r}");
+    assert!(skipped[0]["message"].as_str().unwrap().contains(s(&locked)), "{r}");
+
+    // The other two were recorded.
+    for (item, word) in r["items"].as_array().unwrap().iter().zip(["aardvark", "badger"]) {
+        let hits = alice.ok(&["search", word]);
+        assert!(ids(&hits["items"]).contains(&item["blob"].as_str().unwrap().to_string()), "{hits}");
+        let claim = item["claims"][0].as_str().unwrap();
+        assert_eq!(show_claim(&alice, claim)["id"], claim);
+    }
 }
 
 #[test]

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use knowa_config::Home;
 use knowa_model::query::{BlobPutResult, FeedResult, QueryDoc, QueryResult, WriteResult};
-use knowa_model::{Draft, Error, Id, IdKind, Result, Visibility};
+use knowa_model::{Draft, Error, ErrorCode, Id, IdKind, Result, Visibility};
 use serde::Serialize;
 
 mod admin;
@@ -50,6 +50,9 @@ pub struct PutOptions {
     /// catalog only: hash each file in place and write its claims without copying its
     /// bytes into the replica (DESIGN §5 Catalog-only blobs)
     pub no_store: bool,
+    /// read evicted files (macOS dataless), which makes the OS download them first;
+    /// without it each is skipped as `unsupported` (DESIGN §7, `put`)
+    pub download_evicted: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -73,6 +76,30 @@ pub struct PutItem {
 #[serde(rename_all = "camelCase")]
 pub struct PutResult {
     pub items: Vec<PutItem>,
+    /// files that failed on their own and were not added; the run went on without them
+    pub skipped: Vec<PutSkip>,
+}
+
+/// A file `put` did not add because of a failure of that file alone: it changed while
+/// being added, vanished, could not be read, has a non-UTF-8 name, is no longer a
+/// regular file, or is evicted (DESIGN §7, `put`). `code` and `message` are that
+/// failure's own.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PutSkip {
+    pub path: PathBuf,
+    #[serde(serialize_with = "error_code")]
+    pub code: ErrorCode,
+    pub message: String,
+}
+
+/// Exit status of a command that finished but skipped some of its inputs, which its
+/// result lists in `skipped` (DESIGN §6.3). Not an error and not an `ErrorCode`.
+pub const SKIPPED_EXIT: i32 = 9;
+
+/// An error code in a result document as its contract string (DESIGN §6.3).
+fn error_code<S: serde::Serializer>(code: &ErrorCode, s: S) -> std::result::Result<S::Ok, S::Error> {
+    s.serialize_str(code.as_str())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -209,8 +236,12 @@ impl Knowa {
     /// (when the OS reports one) by the actor, then (unless `no_extract`) extractors
     /// written as the extract actor. With `no_store` each file is hashed in place
     /// instead of stored, and extractors read the source (DESIGN §5 Catalog-only blobs).
-    /// Nonexistent path → `not_found`; a file whose size or modification time changed
-    /// while being stored (or hashed and extracted) → `conflict` (DESIGN §7).
+    /// A named path that does not exist → `not_found`, before anything is written. A
+    /// file's own failure goes to `skipped` and the run continues (DESIGN §7): it
+    /// changed while being stored, or hashed and extracted (`conflict`), vanished
+    /// (`not_found`), could not be read, has a non-UTF-8 name or is no longer a regular
+    /// file (`invalid`), or is evicted and `download_evicted` is off (`unsupported`).
+    /// Failures of the replica, the lock, the index or the claim writes stop the run.
     pub fn put(&self, sel: &Sel, paths: &[PathBuf], opts: PutOptions) -> Result<PutResult> {
         ingest::put(&self.home, sel, paths, opts)
     }

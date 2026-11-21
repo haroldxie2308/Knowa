@@ -18,7 +18,7 @@ use serde_json::json;
 
 use crate::cli::{
     ActorCmd, AssertArgs, BlobCmd, Cli, Cmd, ContextArgs, DEFAULT_NEAR_KM, FeedArgs, GrantArgs, LogArgs, NearArgs,
-    NoteArgs, PathArgs, PendingArgs, ReviewArgs, SearchArgs, ShareArgs, SpaceCmd, TimelineArgs, WorkerCmd,
+    NoteArgs, PathArgs, PendingArgs, PutArgs, ReviewArgs, SearchArgs, ShareArgs, SpaceCmd, TimelineArgs, WorkerCmd,
 };
 use crate::parse::{self, NearTarget};
 use crate::render::{self, Out, json_of};
@@ -45,15 +45,34 @@ impl Globals {
     }
 }
 
-pub fn run(cli: Cli) -> Result<()> {
-    let g = Globals { home: cli.home, sel: Sel { space: cli.space, actor: cli.actor } };
-    let mut out = Out::new(cli.json);
-    dispatch(cli.cmd, &g, &mut out)?;
-    out.flush()
+/// How a command that did not fail ended (DESIGN §6.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Finished {
+    Complete,
+    /// It finished but skipped some of its inputs; the printed result lists them.
+    Skipped,
 }
 
-fn dispatch(cmd: Cmd, g: &Globals, out: &mut Out) -> Result<()> {
-    match cmd {
+impl Finished {
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Finished::Complete => 0,
+            Finished::Skipped => knowa_api::SKIPPED_EXIT,
+        }
+    }
+}
+
+pub fn run(cli: Cli) -> Result<Finished> {
+    let g = Globals { home: cli.home, sel: Sel { space: cli.space, actor: cli.actor } };
+    let mut out = Out::new(cli.json);
+    let finished = dispatch(cli.cmd, &g, &mut out)?;
+    out.flush()?;
+    Ok(finished)
+}
+
+fn dispatch(cmd: Cmd, g: &Globals, out: &mut Out) -> Result<Finished> {
+    // Every verb but `put` either completes or fails.
+    let completed = match cmd {
         Cmd::Init(a) => {
             let r = g.knowa()?.init(&g.sel, &a.dir, &a.name, a.alias.as_deref())?;
             out.result(|| json_of!(&r), || Ok(render::fields(&json_of!(&r)?)))
@@ -85,11 +104,7 @@ fn dispatch(cmd: Cmd, g: &Globals, out: &mut Out) -> Result<()> {
             io::copy(&mut f, out.raw())?;
             Ok(())
         }
-        Cmd::Put(a) => {
-            let opts = PutOptions { no_extract: a.no_extract, no_store: a.no_store };
-            let r = g.knowa()?.put(&g.sel, &a.paths, opts)?;
-            out.result(|| json_of!(&r), || Ok(render::put(&r)))
-        }
+        Cmd::Put(a) => return put(a, g, out),
         Cmd::Note(a) => note(a, g, out),
         Cmd::Assert(a) => assert(a, g, out),
         Cmd::Retract(a) => {
@@ -148,7 +163,16 @@ fn dispatch(cmd: Cmd, g: &Globals, out: &mut Out) -> Result<()> {
                 },
             )
         }
-    }
+    };
+    completed.map(|()| Finished::Complete)
+}
+
+/// The result is printed whether or not files were skipped: exit 9 is not an error.
+fn put(a: PutArgs, g: &Globals, out: &mut Out) -> Result<Finished> {
+    let opts = PutOptions { no_extract: a.no_extract, no_store: a.no_store, download_evicted: a.download_evicted };
+    let r = g.knowa()?.put(&g.sel, &a.paths, opts)?;
+    out.result(|| json_of!(&r), || Ok(render::put(&r)))?;
+    Ok(if r.skipped.is_empty() { Finished::Complete } else { Finished::Skipped })
 }
 
 // ---------- primitives ----------

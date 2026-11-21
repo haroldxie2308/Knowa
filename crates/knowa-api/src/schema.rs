@@ -6,6 +6,7 @@ use knowa_model::value::{MAX_SAFE_INT, MAX_TEXT_BYTES};
 use knowa_model::{ErrorCode, vocab};
 use serde_json::{Value, json};
 
+use crate::SKIPPED_EXIT;
 use crate::context::MAX_TEMPORAL_SCAN;
 use crate::path::{MAX_SEARCH_STEPS, MAX_VISITED};
 
@@ -83,9 +84,9 @@ fn admin() -> Value {
             "out": {"space": "s_…", "path": "absolute path", "alias": "string", "owner": "a_…", "extractActor": "a_…", "claims": "ids of every claim written"}
         },
         "put": {
-            "args": {"paths": "files or directories", "noExtract": "skip extractors", "noStore": "catalog only: record the files without copying their bytes into the replica"},
-            "does": "Directories are walked recursively; names starting with . are not walked and symlinks met during a walk are not followed (explicitly named paths are). Per file: blob.put, then knowa:name, knowa:source (absolute path), knowa:modified and knowa:created (when the OS reports one; whole seconds UTC) on the blob by the selected actor, then the built-in extractors, written by the extract actor with via.worker = <extractor>. A file whose size or modification time changed while being stored stops the run with conflict; files already stored stay, and a rerun is idempotent. Extractor failures, and file times with no EDTF form, are reported per file and do not stop the run. With noStore each file is hashed in place and gets the same claims, extractors included (they read the source file, and the size and modification time check runs after them), but its bytes are not copied: blob.get is not_found for it, extract skips it, and a later put without noStore stores the bytes under the same id.",
-            "out": {"items": [{"path": "absolute path", "blob": "b_…", "created": "bool", "stored": "bool: the replica holds the file's bytes after this item (always true without noStore; with noStore true only if an earlier put stored them)", "size": "bytes", "claims": "ids of the claims recording this file (including existing ones matched idempotently)", "errors": "per-file problems that did not stop the run: \"<worker>: <message>\" per failed extractor, or a file time with no EDTF form"}]}
+            "args": {"paths": "files or directories", "noExtract": "skip extractors", "noStore": "catalog only: record the files without copying their bytes into the replica", "downloadEvicted": "read evicted files (macOS dataless, e.g. iCloud Optimize Mac Storage) so the OS downloads them first; without it they are skipped"},
+            "does": "Directories are walked recursively; names starting with . are not walked and symlinks met during a walk are not followed (explicitly named paths are). Per file: blob.put, then knowa:name, knowa:source (absolute path), knowa:modified and knowa:created (when the OS reports one; whole seconds UTC) on the blob by the selected actor, then the built-in extractors, written by the extract actor with via.worker = <extractor>. A file's own failure skips that file, not the run: one whose size or modification time changed while being stored (conflict), that vanished (not_found), that cannot be read, or whose name is not UTF-8 or that is no longer a regular file (invalid) goes to skipped, the other files are still added, and the process exits 9. Failures of the replica itself (integrity, the lock, writing the space) stop the run; files already added stay, and a rerun is idempotent. Evicted files (macOS dataless: contents left in the cloud) are not read, because reading one downloads it: each is skipped as unsupported, unless downloadEvicted is set, which reads it so the OS downloads it and then takes its times. Extractor failures, and file times with no EDTF form, are reported per file and do not stop the run. With noStore each file is hashed in place and gets the same claims, extractors included (they read the source file, and the size and modification time check runs after them), but its bytes are not copied: blob.get is not_found for it, extract skips it, and a later put without noStore stores the bytes under the same id.",
+            "out": {"items": [{"path": "absolute path", "blob": "b_…", "created": "bool", "stored": "bool: the replica holds the file's bytes after this item (always true without noStore; with noStore true only if an earlier put stored them)", "size": "bytes", "claims": "ids of the claims recording this file (including existing ones matched idempotently)", "errors": "per-file problems that did not stop the run: \"<worker>: <message>\" per failed extractor, or a file time with no EDTF form"}], "skipped": [{"path": "absolute path", "code": "error code of the file's own failure: conflict, not_found, invalid, unsupported (evicted), internal (another I/O failure reading it)", "message": "that failure's message"}]}
         },
         "extract": {
             "args": {"all": "re-run every extractor on every blob (idempotent)"},
@@ -391,7 +392,8 @@ fn errors() -> Value {
     ];
     json!({
         "envelope": "With --json, errors go to stderr as {\"error\": {\"code\", \"message\", \"detail\"?}} and the process exits with the code's exit status.",
-        "codes": codes.iter().map(|(c, m)| json!({"code": c.as_str(), "exit": c.exit_code(), "meaning": m})).collect::<Vec<_>>()
+        "codes": codes.iter().map(|(c, m)| json!({"code": c.as_str(), "exit": c.exit_code(), "meaning": m})).collect::<Vec<_>>(),
+        "skipped": {"exit": SKIPPED_EXIT, "meaning": "not an error and not an error code: the command finished but skipped some of its inputs; its result, printed as usual, lists them in skipped. Only put uses it."}
     })
 }
 
@@ -418,6 +420,7 @@ mod tests {
                 ("cursor_expired".into(), 8)
             ]
         );
+        assert_eq!(s["errors"]["skipped"]["exit"], 9, "exit 9 is listed apart from the error codes");
     }
 
     #[test]

@@ -2,7 +2,8 @@
 //! §7.3), the actorKind prelude (§4.6) and verify under the write lock (§5).
 
 use std::fs;
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -398,4 +399,44 @@ fn blob_put_of_bytes_already_described_as_text_is_searchable_without_a_reindex()
 
     assert!(k.blob_put(&sel, &mut &bytes[..]).unwrap().created);
     assert_eq!(text_hits(&k, &sel, "okapi"), vec![blob]);
+}
+
+// ---------- put: a file's own failure skips that file, not the run (DESIGN §7) ----------
+
+/// Makes `p` mode 000. False if it can still be opened (running as root), which leaves
+/// nothing to test.
+fn make_unreadable(p: &Path) -> bool {
+    fs::set_permissions(p, fs::Permissions::from_mode(0o000)).unwrap();
+    fs::File::open(p).is_err()
+}
+
+#[test]
+fn put_skips_an_unreadable_file_and_adds_the_others() {
+    // Stored and catalog-only files reach the source by different paths (a copy into
+    // the replica, a hash in place): both must tell the file's failure from the run's.
+    for opts in [PutOptions::default(), catalog_only()] {
+        let s = Scratch::new("put-unreadable");
+        let (k, sel, _) = alice(&s);
+        fs::create_dir_all(s.path("files")).unwrap();
+        let t = UNIX_EPOCH + Duration::from_secs(1_500_000_000);
+        let a = file_at(&s, "files/a.txt", b"first\n", t);
+        let b = file_at(&s, "files/b.txt", b"second\n", t);
+        let locked = file_at(&s, "files/c.txt", b"third\n", t);
+        if !make_unreadable(&locked) {
+            eprintln!("skipped: a mode 000 file is readable here (root?)");
+            return;
+        }
+
+        let put = k.put(&sel, &[s.path("files")], opts).unwrap();
+        let ingested: Vec<&PathBuf> = put.items.iter().map(|i| &i.path).collect();
+        assert_eq!(ingested, vec![&a, &b], "{opts:?}");
+        assert_eq!(put.skipped.len(), 1, "{opts:?}: {:?}", put.skipped);
+        let skip = &put.skipped[0];
+        assert_eq!((&skip.path, skip.code), (&locked, ErrorCode::Internal), "{opts:?}: {}", skip.message);
+        assert!(skip.message.contains(locked.to_str().unwrap()), "{opts:?}: {}", skip.message);
+        for (item, name) in put.items.iter().zip(["a.txt", "b.txt"]) {
+            assert!(!item.claims.is_empty(), "{opts:?}");
+            assert_eq!(objects(&k, &sel, &item.blob, NAME), vec![Value::text(name)], "{opts:?}");
+        }
+    }
 }

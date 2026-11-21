@@ -299,6 +299,7 @@ pub fn put(r: &knowa_api::PutResult) -> Vec<String> {
         ));
         out.extend(i.errors.iter().map(|e| format!("  error: {e}")));
     }
+    out.extend(r.skipped.iter().map(|s| format!("{}  skipped  {}: {}", s.path.display(), s.code.as_str(), s.message)));
     out
 }
 
