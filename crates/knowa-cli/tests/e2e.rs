@@ -147,6 +147,20 @@ fn note(kn: &Kn, args: &[&str]) -> String {
     id
 }
 
+#[test]
+fn the_timeline_holds_only_dated_entities() {
+    let sb = Sandbox::new("timeline-dated");
+    let alice = setup(&sb);
+    let dated = note(&alice, &["met the reading group", "--title", "Reading group"]);
+    // a concept with no stated time, as an agent creates one while reading
+    let w = alice.ok_stdin(&["write"], Some(br#"{"s":"_:c","p":"knowa:label","o":{"text":"Undated concept"}}"#));
+    let undated = w["placeholders"]["_:c"].as_str().unwrap().to_string();
+    let on_timeline = ids(&alice.ok(&["timeline"])["items"]);
+    assert!(on_timeline.contains(&dated), "{on_timeline:?}");
+    assert!(!on_timeline.contains(&undated), "an entity without a when is not on the timeline: {on_timeline:?}");
+    assert!(ids(&alice.ok(&["search", "undated"])["items"]).contains(&undated), "it is still found by search");
+}
+
 /// The id of the claim a single-draft write produced. The api may prepend the actor's
 /// `knowa:actorKind` claim on its first write, so the drafted claim is the last item.
 fn last_id(write: &Value) -> String {

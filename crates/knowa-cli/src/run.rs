@@ -344,7 +344,9 @@ fn timeline(a: TimelineArgs, g: &Globals, out: &mut Out) -> Result<()> {
         where_: Where {
             type_: terms(&a.types)?,
             not_type: terms(&a.not_types)?,
-            when: when_range(a.from, a.to),
+            // Always a `when` filter, open-ended unless --from/--to bound it: an entity
+            // without a `when` is not on the timeline (DESIGN §4.8 rule 4).
+            when: Some(WhenRange { from: a.from, to: a.to }),
             ..Where::default()
         },
         order: Some(Order::When),
