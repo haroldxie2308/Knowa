@@ -1,30 +1,25 @@
-//! Per-actor append-only logs (DESIGN §5): `log/<actor>/<first-seq>.jsonl`.
+//! Per-actor append-only logs (DESIGN §5.1): `log/<actor>/<first-seq>.jsonl`, written
+//! once against the `Logs` store.
 //!
 //! Layout invariant: every segment holds a contiguous run of seqs and is named by
-//! its first seq; no seq appears twice. Local appends extend the newest segment
-//! (rotating at `SEGMENT_LINES`); merges write each contiguous run of new claims as
-//! a new segment, so a partial replica may have gaps that a later merge fills with
-//! a segment whose name sorts between existing ones. Because the segments of one
-//! actor are disjoint contiguous ranges, ordering them by first seq and reading
-//! them in turn yields ascending seq. Readers check that order as they go, so a
-//! broken invariant surfaces as an `integrity` error, never as out-of-order output.
+//! its first seq; no seq appears twice. Local appends hand one batch to the store
+//! (a directory extends the newest segment, rotating at `SEGMENT_LINES`); merges write
+//! each contiguous run of new claims as new segments, so a partial replica may have
+//! gaps that a later merge fills with a segment whose name sorts between existing
+//! ones. Because the segments of one actor are disjoint contiguous ranges, ordering
+//! them by first seq and reading them in turn yields ascending seq. Readers check that
+//! order as they go, so a broken invariant surfaces as an `integrity` error, never as
+//! out-of-order output.
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::io::BufRead;
 
 use knowa_model::{Claim, Error, ErrorCode, Id, IdKind, Result};
 use serde_json::json;
 
-use crate::fsutil::{self, TempFile, io_err};
+use crate::backend::{Guard, Logs, Segment};
 use crate::{Head, ImportReport, LOG_DIR, SEGMENT_LINES};
-
-pub(crate) struct Segment {
-    pub(crate) first: u64,
-    pub(crate) path: PathBuf,
-}
 
 /// `SEGMENT_LINES` as a slice length (10 000 fits every usize).
 pub(crate) const SEGMENT_LIMIT: usize = SEGMENT_LINES as usize;
@@ -33,7 +28,7 @@ pub(crate) fn segment_name(first: u64) -> String {
     format!("{first:012}.jsonl")
 }
 
-fn parse_segment_name(name: &str) -> Option<u64> {
+pub(crate) fn parse_segment_name(name: &str) -> Option<u64> {
     let digits = name.strip_suffix(".jsonl")?;
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -56,10 +51,6 @@ pub(crate) fn segment_rel_path(actor: &Id, first: u64) -> String {
     format!("{LOG_DIR}/{actor}/{}", segment_name(first))
 }
 
-fn actor_dir(root: &Path, actor: &Id) -> PathBuf {
-    root.join(LOG_DIR).join(actor.as_str())
-}
-
 /// Turns scan problems into one `integrity` error (for callers that cannot proceed).
 pub(crate) fn fail_on(problems: Vec<String>) -> Result<()> {
     match problems.first() {
@@ -68,66 +59,8 @@ pub(crate) fn fail_on(problems: Vec<String>) -> Result<()> {
     }
 }
 
-/// Actor directories under `log/`, plus anything there that does not belong.
-pub(crate) fn scan_actors(root: &Path) -> Result<(Vec<Id>, Vec<String>)> {
-    let dir = root.join(LOG_DIR);
-    let (mut actors, mut problems) = (Vec::new(), Vec::new());
-    // `log/` absent: tools such as git drop empty directories, and no directory
-    // means no claims — the same thing an empty one means.
-    let Some(entries) = fsutil::read_dir_if_exists(&dir)? else {
-        return Ok((actors, problems));
-    };
-    for entry in entries {
-        let entry = entry.map_err(|e| io_err(&dir, e))?;
-        let name = match fsutil::entry_name(&entry) {
-            Ok(n) => n,
-            Err(p) => {
-                problems.push(p);
-                continue;
-            }
-        };
-        if fsutil::is_hidden(&name) {
-            continue;
-        }
-        match Id::parse(&name) {
-            Ok(id) if id.kind() == IdKind::Actor && entry.path().is_dir() => actors.push(id),
-            _ => problems.push(format!("{}: not an actor log directory", entry.path().display())),
-        }
-    }
-    actors.sort();
-    Ok((actors, problems))
-}
-
-/// Segments of `actor`, ascending by first seq, plus misnamed entries.
-pub(crate) fn scan_segments(root: &Path, actor: &Id) -> Result<(Vec<Segment>, Vec<String>)> {
-    let dir = actor_dir(root, actor);
-    let (mut segments, mut problems) = (Vec::new(), Vec::new());
-    let Some(entries) = fsutil::read_dir_if_exists(&dir)? else {
-        return Ok((segments, problems));
-    };
-    for entry in entries {
-        let entry = entry.map_err(|e| io_err(&dir, e))?;
-        let name = match fsutil::entry_name(&entry) {
-            Ok(n) => n,
-            Err(p) => {
-                problems.push(p);
-                continue;
-            }
-        };
-        if fsutil::is_hidden(&name) {
-            continue;
-        }
-        match parse_segment_name(&name) {
-            Some(first) => segments.push(Segment { first, path: entry.path() }),
-            None => problems.push(format!("{}: not a segment file (<12-digit first seq>.jsonl)", entry.path().display())),
-        }
-    }
-    segments.sort_by_key(|s| s.first);
-    Ok((segments, problems))
-}
-
-fn segments(root: &Path, actor: &Id) -> Result<Vec<Segment>> {
-    let (segments, problems) = scan_segments(root, actor)?;
+fn segments(logs: &dyn Logs, actor: &Id) -> Result<Vec<Segment>> {
+    let (segments, problems) = logs.segments(actor)?;
     fail_on(problems)?;
     Ok(segments)
 }
@@ -177,119 +110,70 @@ pub(crate) fn check_claim(c: &Claim, space: &Id, wrong_space: ErrorCode) -> Resu
     Ok(())
 }
 
-/// The newest claim of an actor and the segment holding it.
-pub(crate) struct Tail {
-    pub(crate) head: Head,
-    pub(crate) segment: Segment,
-    /// lines in `segment` (contiguity: last seq − first seq + 1)
-    pub(crate) lines: u64,
-}
-
-/// Reads only the last line of the newest segment. The head is signature-checked
-/// because new claims chain onto its id.
-pub(crate) fn tail(root: &Path, space: &Id, actor: &Id) -> Result<Option<Tail>> {
-    let Some(segment) = segments(root, actor)?.pop() else {
+/// The newest claim of `actor` (highest seq). Read under the actor's exclusive lock,
+/// after torn-tail repair, from the last line of the newest segment only. The head is
+/// signature-checked because new claims chain onto its id.
+pub(crate) fn tail(logs: &dyn Logs, space: &Id, actor: &Id) -> Result<Option<Head>> {
+    let Some(segment) = segments(logs, actor)?.pop() else {
         return Ok(None);
     };
-    let line = read_last_line(&segment.path)?;
-    let claim = parse_line(&line, &|| format!("{}: last line", segment.path.display()))?;
+    let last = logs.last_line(actor, &segment)?;
+    let line = match last.line {
+        Some(line) if last.trailing == 0 => line,
+        Some(_) => return Err(Error::integrity(format!("{}: torn last line (no trailing newline)", segment.name))),
+        None if last.trailing == 0 => return Err(Error::integrity(format!("{}: empty segment", segment.name))),
+        None => return Err(Error::integrity(format!("{}: no complete line", segment.name))),
+    };
+    let claim = parse_line(&line, &|| format!("{}: last line", segment.name))?;
     if let Some(p) = ownership_problem(&claim, space, actor) {
-        return Err(Error::integrity(format!("{}: {p}", segment.path.display())));
+        return Err(Error::integrity(format!("{}: {p}", segment.name)));
     }
     if claim.body.seq < segment.first {
         return Err(Error::integrity(format!(
             "{}: last seq {} is below the segment's first seq {}",
-            segment.path.display(),
-            claim.body.seq,
-            segment.first
+            segment.name, claim.body.seq, segment.first
         )));
     }
-    verify_logged(&claim, &|| format!("{}: last line", segment.path.display()))?;
-    let lines = claim.body.seq - segment.first + 1;
-    Ok(Some(Tail { head: Head { seq: claim.body.seq, id: claim.id }, segment, lines }))
+    verify_logged(&claim, &|| format!("{}: last line", segment.name))?;
+    Ok(Some(Head { seq: claim.body.seq, id: claim.id }))
 }
 
-fn read_last_line(path: &Path) -> Result<Vec<u8>> {
-    let mut f = File::open(path).map_err(|e| io_err(path, e))?;
-    let len = f.metadata().map_err(|e| io_err(path, e))?.len();
-    if len == 0 {
-        return Err(Error::integrity(format!("{}: empty segment", path.display())));
-    }
-    if read_byte(&mut f, len - 1, path)? != b'\n' {
-        return Err(Error::integrity(format!("{}: torn last line (no trailing newline)", path.display())));
-    }
-    let start = last_newline_before(&mut f, len - 1, path)?.map_or(0, |nl| nl + 1);
-    let mut line = vec![0u8; (len - start) as usize];
-    f.seek(SeekFrom::Start(start)).map_err(|e| io_err(path, e))?;
-    f.read_exact(&mut line).map_err(|e| io_err(path, e))?;
-    Ok(line)
-}
-
-fn read_byte(f: &mut File, at: u64, path: &Path) -> Result<u8> {
-    let mut b = [0u8; 1];
-    f.seek(SeekFrom::Start(at)).map_err(|e| io_err(path, e))?;
-    f.read_exact(&mut b).map_err(|e| io_err(path, e))?;
-    Ok(b[0])
-}
-
-/// Offset of the last `\n` among the first `end` bytes of `f`, scanning backwards.
-fn last_newline_before(f: &mut File, end: u64, path: &Path) -> Result<Option<u64>> {
-    const CHUNK: u64 = 8 * 1024;
-    let mut hi = end;
-    while hi > 0 {
-        let lo = hi.saturating_sub(CHUNK);
-        let mut chunk = vec![0u8; (hi - lo) as usize];
-        f.seek(SeekFrom::Start(lo)).map_err(|e| io_err(path, e))?;
-        f.read_exact(&mut chunk).map_err(|e| io_err(path, e))?;
-        if let Some(i) = chunk.iter().rposition(|&b| b == b'\n') {
-            return Ok(Some(lo + i as u64));
-        }
-        hi = lo;
-    }
-    Ok(None)
-}
-
-/// Torn tail recovery (DESIGN §5). The caller holds the write lock.
-///
-/// Why truncating is safe: `append` is the only writer that extends an existing
-/// segment, it always extends the actor's newest one, and it writes whole lines and
-/// fsyncs them before returning, all under the write lock. With the lock held here no
-/// append is in flight, so an unterminated final line in a newest segment is what is
-/// left of an append that never returned success: no caller was given its id, the
-/// index never applied it (that happens after append returns), and no bundle holds it
-/// (reading a torn line fails). Removing it loses nothing that was acknowledged.
-///
-/// Everything else is left for readers and `verify` to report rather than repaired:
-/// stray or misnamed entries (the scans' problem lists), and segments with no complete
-/// line, which no crash can produce because new segments are published whole by rename.
-pub(crate) fn repair_torn_tails(root: &Path) -> Result<()> {
-    let (actors, _) = scan_actors(root)?;
-    for actor in &actors {
-        let (segments, _) = scan_segments(root, actor)?;
-        if let Some(newest) = segments.last() {
-            truncate_torn_tail(&newest.path)?;
-        }
-    }
-    Ok(())
-}
-
-fn truncate_torn_tail(path: &Path) -> Result<()> {
-    let mut f = OpenOptions::new().read(true).write(true).open(path).map_err(|e| io_err(path, e))?;
-    let len = f.metadata().map_err(|e| io_err(path, e))?.len();
-    if len == 0 || read_byte(&mut f, len - 1, path)? == b'\n' {
-        return Ok(());
-    }
-    let Some(last_complete) = last_newline_before(&mut f, len, path)? else {
-        return Ok(());
+/// Whether `actor`'s log may hold a claim with seq above `seq`, judged without any lock
+/// from the last complete line of the newest segment (DESIGN §5.4 catch-up). An
+/// unterminated final line is a batch still being written, or one a crash left for the
+/// next writer to truncate, and is ignored. `true` whenever it cannot tell, so that the
+/// caller reads the log under the actor's lock and gets the authoritative answer.
+pub(crate) fn may_have_after(logs: &dyn Logs, actor: &Id, seq: u64) -> Result<bool> {
+    let (segments, problems) = logs.segments(actor)?;
+    let Some(newest) = segments.last() else {
+        // Misnamed entries and nothing else: the locked read reports them.
+        return Ok(!problems.is_empty());
     };
-    f.set_len(last_complete + 1).map_err(|e| io_err(path, e))?;
-    f.sync_all().map_err(|e| io_err(path, e))
+    let Some(line) = logs.last_line(actor, newest)?.line else {
+        // A newest segment without a complete line, which no append leaves behind: the
+        // locked read reports it.
+        return Ok(true);
+    };
+    match parse_line(&line, &|| format!("{}: last line", newest.name)) {
+        Ok(claim) => Ok(claim.body.seq > seq),
+        // Fallback: an unlocked peek cannot tell a corrupt line from one a shared
+        // filesystem has not yet shown in full. The locked read decides, and reports
+        // corruption as `integrity`.
+        Err(_) => Ok(true),
+    }
 }
 
 /// Streams one actor's claims with seq ≥ `from_seq`, ascending. Checks structure,
 /// ownership and ordering, and verifies (id + signature) every claim it yields: logs
-/// are never trusted (DESIGN §5). Lines below `from_seq` are only parsed for ordering.
-pub(crate) struct LogIter {
+/// are never trusted (DESIGN §5.3). Lines below `from_seq` are only parsed for ordering.
+///
+/// The actor's lock is held for as long as the iterator lives: exclusively by the
+/// caller, or as `guard`, a shared lock the iterator releases when dropped. Under it,
+/// an unterminated final line of the newest segment after at least one complete line
+/// is an append that never returned, which the next exclusive lock truncates: the
+/// iteration ends before it instead of failing.
+pub(crate) struct LogIter<'a> {
+    logs: &'a dyn Logs,
     space: Id,
     actor: Id,
     from_seq: u64,
@@ -297,22 +181,26 @@ pub(crate) struct LogIter {
     current: Option<Open>,
     last_seq: u64,
     done: bool,
+    _guard: Option<Guard>,
 }
 
 struct Open {
-    path: PathBuf,
-    reader: BufReader<File>,
+    name: String,
+    reader: Box<dyn BufRead + Send>,
     first: u64,
     next_seq: u64,
+    /// the actor's newest segment, the only one an append extends
+    newest: bool,
 }
 
-impl LogIter {
-    pub(crate) fn new(root: &Path, space: &Id, actor: &Id, from_seq: u64) -> Result<LogIter> {
-        let all = segments(root, actor)?;
+impl<'a> LogIter<'a> {
+    pub(crate) fn new(logs: &'a dyn Logs, space: &Id, actor: &Id, from_seq: u64, guard: Option<Guard>) -> Result<LogIter<'a>> {
+        let all = segments(logs, actor)?;
         // Segment i covers at most [first_i, first_{i+1}); skip those entirely below from_seq.
         let skip = all.windows(2).take_while(|w| w[1].first <= from_seq).count();
         let segments: Vec<Segment> = all.into_iter().skip(skip).collect();
         Ok(LogIter {
+            logs,
             space: space.clone(),
             actor: actor.clone(),
             from_seq,
@@ -320,6 +208,7 @@ impl LogIter {
             current: None,
             last_seq: 0,
             done: false,
+            _guard: guard,
         })
     }
 
@@ -331,32 +220,38 @@ impl LogIter {
                     let Some(seg) = self.segments.next() else {
                         return Ok(None);
                     };
-                    let file = File::open(&seg.path).map_err(|e| io_err(&seg.path, e))?;
-                    Open { path: seg.path, reader: BufReader::new(file), first: seg.first, next_seq: seg.first }
+                    let reader = self.logs.open_segment(&self.actor, &seg)?;
+                    let newest = self.segments.len() == 0;
+                    Open { name: seg.name, reader, first: seg.first, next_seq: seg.first, newest }
                 }
             };
             let mut line = Vec::new();
-            let n = open.reader.read_until(b'\n', &mut line).map_err(|e| io_err(&open.path, e))?;
+            let n = open
+                .reader
+                .read_until(b'\n', &mut line)
+                .map_err(|e| Error::internal(format!("io: {}: {e}", open.name)))?;
             if n == 0 {
                 if open.next_seq == open.first {
-                    return Err(Error::integrity(format!("{}: empty segment", open.path.display())));
+                    return Err(Error::integrity(format!("{}: empty segment", open.name)));
                 }
                 continue;
             }
+            if open.newest && open.next_seq > open.first && !line.ends_with(b"\n") {
+                return Ok(None);
+            }
             let expected = open.next_seq;
-            let claim = parse_line(&line, &|| format!("{}: seq {expected}", open.path.display()))?;
+            let claim = parse_line(&line, &|| format!("{}: seq {expected}", open.name))?;
             if let Some(p) = ownership_problem(&claim, &self.space, &self.actor) {
-                return Err(Error::integrity(format!("{}: {p}", open.path.display())));
+                return Err(Error::integrity(format!("{}: {p}", open.name)));
             }
             if claim.body.seq != expected || claim.body.seq <= self.last_seq {
                 return Err(Error::integrity(format!(
                     "{}: found seq {} where seq {expected} was expected (segments must be contiguous, disjoint, and named by their first seq)",
-                    open.path.display(),
-                    claim.body.seq
+                    open.name, claim.body.seq
                 )));
             }
             if claim.body.seq >= self.from_seq {
-                verify_logged(&claim, &|| format!("{}: seq {expected}", open.path.display()))?;
+                verify_logged(&claim, &|| format!("{}: seq {expected}", open.name))?;
             }
             open.next_seq += 1;
             self.current = Some(open);
@@ -368,7 +263,7 @@ impl LogIter {
     }
 }
 
-impl Iterator for LogIter {
+impl Iterator for LogIter<'_> {
     type Item = Result<Claim>;
 
     fn next(&mut self) -> Option<Result<Claim>> {
@@ -392,9 +287,10 @@ impl Iterator for LogIter {
 /// seq → (id, prev) for one actor's existing claims.
 pub(crate) type Chain = BTreeMap<u64, (Id, Option<Id>)>;
 
-pub(crate) fn chain(root: &Path, space: &Id, actor: &Id) -> Result<Chain> {
+/// The caller holds `actor`'s exclusive lock.
+pub(crate) fn chain(logs: &dyn Logs, space: &Id, actor: &Id) -> Result<Chain> {
     let mut out = Chain::new();
-    for claim in LogIter::new(root, space, actor, 1)? {
+    for claim in LogIter::new(logs, space, actor, 1, None)? {
         let claim = claim?;
         out.insert(claim.body.seq, (claim.id, claim.body.prev));
     }
@@ -414,173 +310,39 @@ pub(crate) fn gaps(seqs: &BTreeSet<u64>) -> Vec<(u64, u64)> {
     out
 }
 
-/// Appends locally-authored claims: all are checked before any byte is written.
-pub(crate) fn append(root: &Path, space: &Id, claims: &[Claim]) -> Result<()> {
-    struct Pending {
-        tail: Option<Tail>,
-        first_new: u64,
-        next_seq: u64,
-        prev: Option<Id>,
-        lines: Vec<Vec<u8>>,
+/// Appends locally-authored claims of `actor`, whose exclusive lock the caller holds:
+/// all are checked against the head before any byte is written, then handed to the
+/// store as one batch.
+pub(crate) fn append(logs: &dyn Logs, space: &Id, actor: &Id, claims: &[Claim]) -> Result<()> {
+    if claims.is_empty() {
+        return Ok(());
     }
-    let mut per_actor: BTreeMap<Id, Pending> = BTreeMap::new();
+    let (first_new, mut prev) = match tail(logs, space, actor)? {
+        Some(head) => (head.seq + 1, Some(head.id)),
+        None => (1, None),
+    };
+    let mut next_seq = first_new;
+    let mut lines = Vec::with_capacity(claims.len());
     for c in claims {
         check_claim(c, space, ErrorCode::Invalid)?;
-        let pending = match per_actor.entry(c.body.actor.clone()) {
-            Entry::Occupied(o) => o.into_mut(),
-            Entry::Vacant(v) => {
-                let tail = tail(root, space, v.key())?;
-                let (next_seq, prev) = match &tail {
-                    Some(t) => (t.head.seq + 1, Some(t.head.id.clone())),
-                    None => (1, None),
-                };
-                v.insert(Pending { tail, first_new: next_seq, next_seq, prev, lines: Vec::new() })
-            }
-        };
-        if c.body.seq != pending.next_seq || c.body.prev != pending.prev {
+        if c.body.seq != next_seq || c.body.prev != prev {
             return Err(Error::conflict(format!(
                 "claim {} does not continue the chain of {}: expected seq {}, got seq {}",
-                c.id, c.body.actor, pending.next_seq, c.body.seq
+                c.id, c.body.actor, next_seq, c.body.seq
             ))
             .with_detail(json!({
                 "actor": c.body.actor,
-                "expectedSeq": pending.next_seq,
-                "expectedPrev": pending.prev,
+                "expectedSeq": next_seq,
+                "expectedPrev": prev,
                 "seq": c.body.seq,
                 "prev": c.body.prev,
             })));
         }
-        pending.lines.push(c.to_line()?);
-        pending.next_seq += 1;
-        pending.prev = Some(c.id.clone());
+        lines.push(c.to_line()?);
+        next_seq += 1;
+        prev = Some(c.id.clone());
     }
-    // Several actors, or a rotation, mean several files: a failure after the first has
-    // been written is undone, so the append still writes nothing on error.
-    let mut changes = Vec::new();
-    for (actor, p) in &per_actor {
-        let tail = p.tail.as_ref().map(|t| (&t.segment, t.lines));
-        if let Err(e) = write_run(&actor_dir(root, actor), tail, p.first_new, &p.lines, SEGMENT_LIMIT, &mut changes) {
-            return Err(undo(changes, e));
-        }
-    }
-    Ok(())
-}
-
-/// One change `write_run` makes to the log, recorded *before* it is attempted, so a
-/// write that fails part-way is still covered.
-pub(crate) enum Change {
-    /// lines are appended to `path`, which was `len` bytes long
-    Extended { path: PathBuf, len: u64 },
-    /// a new segment is published at `path`
-    Created(PathBuf),
-    /// a new actor directory
-    CreatedDir(PathBuf),
-}
-
-/// Reverts `changes` (newest first) after `err` and returns `err`, extended with any
-/// step of the undo that failed. The caller holds the write lock, so nothing else has
-/// touched these files since. Each step is independent, so one failing does not stop
-/// the others.
-fn undo(changes: Vec<Change>, mut err: Error) -> Error {
-    let failed: Vec<String> = changes.into_iter().rev().filter_map(|c| revert(c).err()).map(|e| e.message).collect();
-    if !failed.is_empty() {
-        err.message = format!(
-            "{}; undoing the partial append also failed, so the log may keep part of it: {}",
-            err.message,
-            failed.join("; ")
-        );
-    }
-    err
-}
-
-fn revert(change: Change) -> Result<()> {
-    match change {
-        Change::Extended { path, len } => {
-            let f = OpenOptions::new().write(true).open(&path).map_err(|e| io_err(&path, e))?;
-            f.set_len(len).map_err(|e| io_err(&path, e))?;
-            f.sync_all().map_err(|e| io_err(&path, e))
-        }
-        Change::Created(path) => match fs::remove_file(&path) {
-            Ok(()) => sync_parent(&path),
-            // The publish failed before its rename: there is nothing to remove.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(io_err(&path, e)),
-        },
-        Change::CreatedDir(dir) => match fs::remove_dir(&dir) {
-            Ok(()) => sync_parent(&dir),
-            // Creating it is what failed: there is nothing to remove.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(io_err(&dir, e)),
-        },
-    }
-}
-
-fn sync_parent(path: &Path) -> Result<()> {
-    match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => fsutil::sync_dir(parent),
-        _ => fsutil::sync_dir(Path::new(".")),
-    }
-}
-
-/// Writes `lines` (consecutive seqs from `first_seq`): first into the open `tail`
-/// segment while it has room under `limit`, then into new segments of ≤ `limit`
-/// lines, each named by its first seq. Every change is recorded in `changes`.
-pub(crate) fn write_run(
-    dir: &Path,
-    tail: Option<(&Segment, u64)>,
-    first_seq: u64,
-    lines: &[Vec<u8>],
-    limit: usize,
-    changes: &mut Vec<Change>,
-) -> Result<()> {
-    let mut rest = lines;
-    let mut seq = first_seq;
-    if let Some((segment, count)) = tail {
-        // ≤ rest.len(), so the cast back to usize is lossless.
-        let room = (limit as u64).saturating_sub(count).min(rest.len() as u64) as usize;
-        if room > 0 {
-            append_to_segment(&segment.path, &rest[..room], changes)?;
-            rest = &rest[room..];
-            seq += room as u64;
-        }
-    }
-    for part in rest.chunks(limit.max(1)) {
-        write_new_segment(dir, seq, part, changes)?;
-        seq += part.len() as u64;
-    }
-    Ok(())
-}
-
-fn append_to_segment(path: &Path, lines: &[Vec<u8>], changes: &mut Vec<Change>) -> Result<()> {
-    let mut f = OpenOptions::new().append(true).open(path).map_err(|e| io_err(path, e))?;
-    let len = f.metadata().map_err(|e| io_err(path, e))?.len();
-    changes.push(Change::Extended { path: path.to_path_buf(), len });
-    f.write_all(&lines.concat()).map_err(|e| io_err(path, e))?;
-    f.sync_all().map_err(|e| io_err(path, e))
-}
-
-fn write_new_segment(dir: &Path, first: u64, lines: &[Vec<u8>], changes: &mut Vec<Change>) -> Result<()> {
-    // `symlink_metadata`: whatever occupies the name (even a dangling link) is not ours
-    // to remove on undo.
-    match fs::symlink_metadata(dir) {
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => changes.push(Change::CreatedDir(dir.to_path_buf())),
-        Err(e) => return Err(io_err(dir, e)),
-    }
-    fsutil::ensure_dir(dir)?;
-    let dest = dir.join(segment_name(first));
-    // Callers hold the write lock, so no other Knowa writer can race this check.
-    if dest.try_exists().map_err(|e| io_err(&dest, e))? {
-        return Err(Error::integrity(format!(
-            "{}: segment already exists but does not contain seq {first}",
-            dest.display()
-        )));
-    }
-    let mut tmp = TempFile::create_in(dir)?;
-    let tmp_path = tmp.path().to_path_buf();
-    tmp.file().write_all(&lines.concat()).map_err(|e| io_err(&tmp_path, e))?;
-    changes.push(Change::Created(dest.clone()));
-    tmp.commit(&dest)
+    logs.append(actor, first_new, &lines)
 }
 
 fn equivocation(actor: &Id, seq: u64, have: &Id, got: &Id) -> Error {
@@ -665,18 +427,12 @@ impl MergePlan {
         !self.runs.is_empty()
     }
 
-    /// Writes every planned run as new segments. The caller must already have written
-    /// the rebuild marker (`crate::mark_rebuild`): index catch-up cannot see a run that
-    /// fills a gap below an indexed head (DESIGN §5).
-    pub(crate) fn apply(self, root: &Path) -> Result<ImportReport> {
-        if self.writes_segments() && !crate::rebuild_marker(root).is_file() {
-            return Err(Error::internal("merge: segments would be written before the index rebuild marker"));
-        }
-        // A merge that fails part-way keeps the runs already written: each is a
-        // verified, chain-checked run, and the marker makes the index rebuild over it.
-        let mut changes = Vec::new();
+    /// Writes every planned run as new segments. The caller holds every planned actor's
+    /// exclusive lock and has already written a fresh rebuild generation: index catch-up
+    /// cannot see a run that fills a gap below an indexed head (DESIGN §5.4).
+    pub(crate) fn apply(self, logs: &dyn Logs) -> Result<ImportReport> {
         for (actor, first, lines) in &self.runs {
-            write_run(&actor_dir(root, actor), None, *first, lines, SEGMENT_LIMIT, &mut changes)?;
+            logs.write_run(actor, *first, lines)?;
         }
         Ok(self.report)
     }
@@ -698,47 +454,7 @@ pub(crate) fn line_runs<'a>(claims: impl IntoIterator<Item = (u64, &'a Claim)>) 
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use super::*;
-
-    fn lines(range: std::ops::RangeInclusive<u64>) -> Vec<Vec<u8>> {
-        range.map(|n| format!("{n}\n").into_bytes()).collect()
-    }
-
-    fn layout(dir: &Path) -> Vec<(String, String)> {
-        let mut out: Vec<(String, String)> = fs::read_dir(dir)
-            .unwrap()
-            .map(|e| {
-                let e = e.unwrap();
-                (e.file_name().into_string().unwrap(), fs::read_to_string(e.path()).unwrap())
-            })
-            .collect();
-        out.sort();
-        out
-    }
-
-    #[test]
-    fn write_run_fills_the_tail_then_rotates() {
-        let dir = std::env::temp_dir().join(format!("knowa-store-rotate-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        write_run(&dir, None, 1, &lines(1..=7), 3, &mut Vec::new()).unwrap();
-        assert_eq!(
-            layout(&dir),
-            [
-                (segment_name(1), "1\n2\n3\n".to_string()),
-                (segment_name(4), "4\n5\n6\n".to_string()),
-                (segment_name(7), "7\n".to_string()),
-            ]
-        );
-        let tail = Segment { first: 7, path: dir.join(segment_name(7)) };
-        write_run(&dir, Some((&tail, 1)), 8, &lines(8..=11), 3, &mut Vec::new()).unwrap();
-        let after = layout(&dir);
-        assert_eq!(after.len(), 4);
-        assert_eq!(after[2], (segment_name(7), "7\n8\n9\n".to_string()));
-        assert_eq!(after[3], (segment_name(10), "10\n11\n".to_string()));
-        fs::remove_dir_all(&dir).unwrap();
-    }
 
     #[test]
     fn segment_names_are_canonical() {

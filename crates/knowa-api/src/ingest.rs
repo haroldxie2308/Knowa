@@ -24,12 +24,15 @@ pub(crate) fn put(home: &Home, sel: &Sel, paths: &[PathBuf], opts: PutOptions) -
     space.ensure_writable()?;
     let actor = home.resolve_actor(sel.actor.as_deref())?;
     let extractor = if opts.no_extract { None } else { Some(home.extract_actor()?) };
+    // Every file's claims are written by the put actor and, unless extraction is off,
+    // the extract worker: both are locked up front for each file's transaction.
+    let writers: Vec<&Actor> = std::iter::once(&actor).chain(extractor.as_ref()).collect();
     // The whole file list is gathered (and every named path checked) before anything
     // is written.
     let files = collect_files(paths)?;
     let (mut items, mut skipped) = (Vec::with_capacity(files.len()), Vec::new());
     for f in &files {
-        match put_file(&space, &actor, extractor.as_ref(), opts, f) {
+        match put_file(&space, &actor, extractor.as_ref(), &writers, opts, f) {
             Ok(item) => items.push(item),
             // Source errors carry no `detail`; code and message are the whole failure.
             Err(Failure::File(e)) => skipped.push(PutSkip { path: f.clone(), code: e.code, message: e.message }),
@@ -110,6 +113,7 @@ fn put_file(
     space: &Space,
     actor: &Actor,
     extractor: Option<&Actor>,
+    writers: &[&Actor],
     opts: PutOptions,
     path: &Path,
 ) -> std::result::Result<PutItem, Failure> {
@@ -120,7 +124,7 @@ fn put_file(
     let name = utf8(path.file_name().and_then(|n| n.to_str()), "file name")?;
     let source = utf8(path.to_str(), "path")?;
     let stat = || fs::metadata(path).map_err(|e| source_err(path, e));
-    // Extraction is pure and may be slow: it runs before the write lock is taken.
+    // Extraction is pure and may be slow: it runs before any actor lock is taken.
     let extract = |blob: &Id, bytes: &Path| -> Result<Option<Extracted>> {
         extractor.map(|_| knowa_extract::run(blob, bytes, Some(&name), None)).transpose()
     };
@@ -166,7 +170,7 @@ fn put_file(
         // worker name, and `put` passes neither, so its errors here are the source's.
         let extracted = extract(&blob, path).map_err(Failure::File)?;
         after().map_err(Failure::File)?;
-        let stored = space.replica.has_blob(&blob);
+        let stored = space.replica.has_blob(&blob)?;
         (blob, false, stored, size, extracted)
     } else {
         // The store reports a source it cannot open as `internal`, the code its own I/O
@@ -178,7 +182,7 @@ fn put_file(
         let (blob, created, size) = space.replica.put_blob_file(path).map_err(copy_failure)?;
         after().map_err(Failure::File)?;
         // Extractors read the stored blob, which is immutable.
-        let extracted = extract(&blob, &space.replica.blob_path(&blob)?)?;
+        let extracted = extract(&blob, &space.replica.blob_file(&blob)?)?;
         (blob, created, true, size, extracted)
     };
 
@@ -203,7 +207,7 @@ fn put_file(
         }
     }
 
-    let mut txn = Txn::begin(space)?;
+    let mut txn = Txn::begin(space, writers)?;
     let described = txn.write(actor, drafts)?;
     let mut claims: Vec<Id> = described.result.items.into_iter().map(|i| i.id).collect();
     if let (Some(x), Some((extractions, failures))) = (extractor, extracted) {
@@ -364,7 +368,7 @@ pub(crate) fn extract(home: &Home, sel: &Sel, all: bool) -> Result<ExtractResult
         }
     } else {
         for &w in WORKERS {
-            for b in index.blobs_without_worker(w)? {
+            for b in index.blobs_without_worker(&space.replica, w)? {
                 todo.entry(b).or_default().push(w);
             }
         }
@@ -374,14 +378,14 @@ pub(crate) fn extract(home: &Home, sel: &Sel, all: bool) -> Result<ExtractResult
     let mut result = ExtractResult { blobs: todo.len() as u64, claims: 0, errors: Vec::new() };
     for (blob, workers) in todo {
         let hint = name_hint(&index, &blob, &name_pred)?;
-        let path = space.replica.blob_path(&blob)?;
+        let path = space.replica.blob_file(&blob)?;
         let (extractions, failures) = knowa_extract::run(&blob, &path, hint.as_deref(), Some(&workers))?;
         result.errors.extend(failures.iter().map(|f| format!("{blob}: {}", describe_failure(f))));
         let drafts = stamped(extractions)?;
         if drafts.is_empty() {
             continue;
         }
-        let mut txn = Txn::begin(&space)?;
+        let mut txn = Txn::begin(&space, &[&extractor])?;
         result.claims += txn.write(&extractor, drafts)?.created;
     }
     Ok(result)

@@ -182,7 +182,7 @@ impl Knowa {
 
     // ---------- primitives ----------
 
-    /// DESIGN §4.4 / §6. Under the replica lock: refuse readonly spaces (`usage`);
+    /// DESIGN §4.4 / §6. Under the actor's lock: refuse readonly spaces (`usage`);
     /// mint ids for placeholders; validate drafts (a `knowa:actorKind` draft →
     /// `invalid`: only the system writes it); if this is the actor's first claim in
     /// the space, prepend a `knowa:actorKind` claim; dedupe via equivalence key (same
@@ -191,31 +191,32 @@ impl Knowa {
     pub fn write(&self, sel: &Sel, drafts: Vec<Draft>) -> Result<WriteResult> {
         let space = select::current(&self.home, sel)?;
         let actor = self.home.resolve_actor(sel.actor.as_deref())?;
-        Ok(write::Txn::begin(&space)?.write(&actor, drafts)?.result)
+        Ok(write::Txn::begin(&space, &[&actor])?.write(&actor, drafts)?.result)
     }
 
     pub fn blob_put(&self, sel: &Sel, r: &mut dyn Read) -> Result<BlobPutResult> {
         let space = select::current(&self.home, sel)?;
         space.ensure_writable()?;
         let (id, created, size) = space.replica.put_blob(r)?;
-        // Claims about these bytes may already be indexed (DESIGN §5 Catalog-only
+        // Claims about these bytes may already be indexed (DESIGN §5.3 Catalog-only
         // blobs); storing them writes no claim, so the index must be told. Also when
         // the bytes were already present: an earlier blob put may have crashed between
-        // storing them and this refresh.
-        write::Txn::begin(&space)?.refresh_blob(&id)?;
+        // storing them and this refresh. Writing no claim, it takes no actor lock.
+        space.index()?.refresh_blob(&space.replica, &id)?;
         Ok(BlobPutResult { id, created, size })
     }
 
-    /// Finds the blob in the selected spaces (`spaces` as in a query doc; empty =
-    /// current space). Absent everywhere → `not_found`.
-    pub fn blob_path(&self, sel: &Sel, spaces: &[String], id: &Id) -> Result<PathBuf> {
+    /// blob.get: the bytes of the blob, from the first selected space that stores it
+    /// (`spaces` as in a query doc; empty = current space). Absent everywhere →
+    /// `not_found`.
+    pub fn blob_open(&self, sel: &Sel, spaces: &[String], id: &Id) -> Result<Box<dyn Read + Send>> {
         if id.kind() != IdKind::Blob {
             return Err(Error::invalid(format!("blob.get: {id} is not a blob id")));
         }
         let base = id.base();
         for space in select::select(&self.home, sel, spaces)? {
-            if space.replica.has_blob(&base) {
-                return space.replica.blob_path(&base);
+            if space.replica.has_blob(&base)? {
+                return space.replica.open_blob(&base);
             }
         }
         Err(Error::not_found(format!("blob.get: no selected space stores {base}")))

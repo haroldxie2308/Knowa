@@ -1,8 +1,6 @@
 //! The query primitive (DESIGN §6.1, §6.2): validation, fan-out to each selected
 //! replica's index, and merging. `context` and `path` live in their own modules.
 
-use std::fs;
-
 use knowa_config::Home;
 use knowa_model::query::{
     DEFAULT_LIMIT, FindDoc, FindItems, FindResult, GetDoc, GetItem, GetResult, LogDoc, LogResult, MAX_LIMIT, Near,
@@ -212,13 +210,13 @@ fn blob_view(opened: &[Opened], id: &Id) -> Result<Option<BlobView>> {
     let base = id.base();
     let mut view: Option<BlobView> = None;
     for o in opened {
-        if !o.space.replica.has_blob(&base) {
+        if !o.space.replica.has_blob(&base)? {
             continue;
         }
         match &mut view {
             Some(v) => v.spaces.push(o.space.id().clone()),
             None => {
-                let size = fs::metadata(o.space.replica.blob_path(&base)?)?.len();
+                let size = o.space.replica.blob_len(&base)?;
                 view = Some(BlobView { id: id.clone(), size, media_type: None, spaces: vec![o.space.id().clone()] });
             }
         }

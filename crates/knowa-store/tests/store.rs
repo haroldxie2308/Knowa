@@ -1,9 +1,11 @@
-//! Replica integrity: chain/append/merge (gaps, equivocation), blobs, verify,
-//! bundle round-trips and tamper rejection.
+//! Replica integrity: chain/append/merge (gaps, equivocation), per-actor locks, the
+//! rebuild generation, blobs, verify, bundle round-trips and tamper rejection.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use knowa_model::vocab::OWNER;
 use knowa_model::{Claim, ClaimBody, Draft, ErrorCode, Id, Signer, Term, Timestamp, Value};
@@ -86,10 +88,12 @@ fn seqs(claims: &[Claim]) -> Vec<u64> {
     claims.iter().map(|c| c.body.seq).collect()
 }
 
+/// Segment file names; dot-names (the actor's `.lock`, temp files) are not segments.
 fn segment_files(r: &Replica, actor: &Id) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(r.root().join("log").join(actor.as_str()))
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| !n.starts_with('.'))
         .collect();
     names.sort();
     names
@@ -128,10 +132,6 @@ fn author_after(space: &Id, than: &Id) -> Author {
     }
 }
 
-fn marker(dir: &Path) -> PathBuf {
-    dir.join(".index").join(knowa_store::REBUILD_MARKER)
-}
-
 fn replace_once(haystack: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
     assert_eq!(needle.len(), with.len());
     let at = haystack.windows(needle.len()).position(|w| w == needle).expect("needle present");
@@ -149,8 +149,8 @@ fn create_then_open_and_verify() {
     assert_eq!(r.manifest(), &expected);
     assert_eq!(Replica::open(&s.0).unwrap().manifest(), &expected);
 
-    let lock = r.lock().unwrap();
-    assert_eq!(r.head(&lock, &owner.id).unwrap(), Some(Head { seq: 1, id: genesis.id.clone() }));
+    let lock = r.lock_actor(&owner.id).unwrap();
+    assert_eq!(r.head(&lock).unwrap(), Some(Head { seq: 1, id: genesis.id.clone() }));
     let line = fs::read(s.path(&format!("log/{}/000000000001.jsonl", owner.id))).unwrap();
     assert_eq!(line, genesis.to_line().unwrap());
 
@@ -178,7 +178,7 @@ fn create_and_open_fail_fast() {
 fn append_continues_the_chain_and_writes_nothing_on_error() {
     let s = Scratch::new("append");
     let (r, mut owner, _) = new_space(&s.0);
-    let lock = r.lock().unwrap();
+    let lock = r.lock_actor(&owner.id).unwrap();
     let c2 = owner.note("two");
     let c3 = owner.note("three");
     r.append(&lock, &[c2.clone(), c3.clone()]).unwrap();
@@ -189,22 +189,29 @@ fn append_continues_the_chain_and_writes_nothing_on_error() {
     let _c5 = owner.note("five");
     let c6 = owner.note("six");
     assert_eq!(r.append(&lock, &[c4.clone(), c6]).unwrap_err().code, ErrorCode::Conflict);
-    assert_eq!(r.head(&lock, &owner.id).unwrap().unwrap().seq, 3);
+    assert_eq!(r.head(&lock).unwrap().unwrap().seq, 3);
 
     // A forged claim fails verification; again nothing is written.
     let mut forged = c4.clone();
     forged.body.note = Some("forged".into());
     assert_eq!(r.append(&lock, &[forged]).unwrap_err().code, ErrorCode::Integrity);
-    assert_eq!(r.head(&lock, &owner.id).unwrap().unwrap().seq, 3);
+    assert_eq!(r.head(&lock).unwrap().unwrap().seq, 3);
 
-    // A new actor's first claim must be seq 1.
+    // A lock covers its own actor's claims only.
     let mut other = Author::new(&owner.space);
     let o1 = other.note("hello");
     let o2 = other.note("again");
-    assert_eq!(r.append(&lock, std::slice::from_ref(&o2)).unwrap_err().code, ErrorCode::Conflict);
-    r.append(&lock, &[c4, o1, o2]).unwrap();
-    assert_eq!(r.head(&lock, &owner.id).unwrap().unwrap().seq, 4);
-    assert_eq!(r.head(&lock, &other.id).unwrap().unwrap().seq, 2);
+    assert_eq!(r.append(&lock, &[c4.clone(), o1.clone()]).unwrap_err().code, ErrorCode::Internal);
+    assert_eq!(r.head(&lock).unwrap().unwrap().seq, 3);
+
+    // A new actor's first claim must be seq 1.
+    let other_lock = r.lock_actor(&other.id).unwrap();
+    assert_eq!(r.head(&other_lock).unwrap(), None);
+    assert_eq!(r.append(&other_lock, std::slice::from_ref(&o2)).unwrap_err().code, ErrorCode::Conflict);
+    r.append(&lock, &[c4]).unwrap();
+    r.append(&other_lock, &[o1, o2]).unwrap();
+    assert_eq!(r.head(&lock).unwrap().unwrap().seq, 4);
+    assert_eq!(r.head(&other_lock).unwrap().unwrap().seq, 2);
     let mut actors = vec![owner.id.clone(), other.id.clone()];
     actors.sort();
     assert_eq!(r.actors().unwrap(), actors);
@@ -215,24 +222,22 @@ fn append_continues_the_chain_and_writes_nothing_on_error() {
 fn merge_tolerates_gaps_fills_them_and_appends_after() {
     let sa = Scratch::new("merge-src");
     let (a, mut owner, _) = new_space(&sa.0);
-    let la = a.lock().unwrap();
     let more: Vec<Claim> = (2..=6).map(|i| owner.note(&format!("n{i}"))).collect();
-    a.append(&la, &more).unwrap();
+    a.append(&a.lock_actor(&owner.id).unwrap(), &more).unwrap();
     let all = log_of(&a, &owner.id, 1);
     assert_eq!(seqs(&all), [1, 2, 3, 4, 5, 6]);
 
     let sb = Scratch::new("merge-dst");
     let b = Replica::create_replica(&sb.0, a.manifest()).unwrap();
-    let lb = b.lock().unwrap();
     let partial = [all[0].clone(), all[1].clone(), all[4].clone(), all[5].clone()];
-    let rep = b.merge(&lb, &partial).unwrap();
+    let rep = b.merge(&partial).unwrap();
     assert_eq!((rep.added, rep.skipped_existing), (4, 0));
     assert_eq!(rep.gaps, vec![(owner.id.clone(), 3, 4)]);
     assert_eq!(seqs(&log_of(&b, &owner.id, 1)), [1, 2, 5, 6]);
     assert_eq!(b.verify().unwrap().gaps, vec![(owner.id.clone(), 3, 4)]);
 
     // Fill the gap: its run becomes its own segment, and reads stay in seq order.
-    let rep = b.merge(&lb, &[all[3].clone(), all[2].clone()]).unwrap();
+    let rep = b.merge(&[all[3].clone(), all[2].clone()]).unwrap();
     assert_eq!(rep.added, 2);
     assert!(rep.gaps.is_empty());
     assert_eq!(log_of(&b, &owner.id, 1), all);
@@ -242,12 +247,12 @@ fn merge_tolerates_gaps_fills_them_and_appends_after() {
         ["000000000001.jsonl", "000000000003.jsonl", "000000000005.jsonl"]
     );
 
-    let rep = b.merge(&lb, &all).unwrap();
+    let rep = b.merge(&all).unwrap();
     assert_eq!((rep.added, rep.skipped_existing), (0, 6));
 
     // A local append continues from the highest seq.
     let c7 = owner.note("seven");
-    b.append(&lb, std::slice::from_ref(&c7)).unwrap();
+    b.append(&b.lock_actor(&owner.id).unwrap(), std::slice::from_ref(&c7)).unwrap();
     assert_eq!(seqs(&log_of(&b, &owner.id, 6)), [6, 7]);
     let report = b.verify().unwrap();
     assert_eq!(report.claims, 7);
@@ -258,24 +263,21 @@ fn merge_tolerates_gaps_fills_them_and_appends_after() {
 fn merge_rejects_equivocation() {
     let sa = Scratch::new("equiv-src");
     let (a, mut owner, genesis) = new_space(&sa.0);
-    let la = a.lock().unwrap();
     let c2 = owner.note("honest");
-    a.append(&la, std::slice::from_ref(&c2)).unwrap();
+    a.append(&a.lock_actor(&owner.id).unwrap(), std::slice::from_ref(&c2)).unwrap();
     let fork = owner.seal_at(2, Some(genesis.id.clone()), note("fork"));
     assert_ne!(fork.id, c2.id);
 
     let sb = Scratch::new("equiv-dst");
     let b = Replica::create_replica(&sb.0, a.manifest()).unwrap();
-    let lb = b.lock().unwrap();
-    b.merge(&lb, &[genesis.clone(), c2.clone()]).unwrap();
-    assert_eq!(b.merge(&lb, std::slice::from_ref(&fork)).unwrap_err().code, ErrorCode::Integrity);
+    b.merge(&[genesis.clone(), c2.clone()]).unwrap();
+    assert_eq!(b.merge(std::slice::from_ref(&fork)).unwrap_err().code, ErrorCode::Integrity);
     assert_eq!(log_of(&b, &owner.id, 1), vec![genesis.clone(), c2.clone()]);
 
     // Both branches in one batch: refused before anything is written.
     let sc = Scratch::new("equiv-batch");
     let c = Replica::create_replica(&sc.0, a.manifest()).unwrap();
-    let lc = c.lock().unwrap();
-    assert_eq!(c.merge(&lc, &[genesis, c2, fork]).unwrap_err().code, ErrorCode::Integrity);
+    assert_eq!(c.merge(&[genesis, c2, fork]).unwrap_err().code, ErrorCode::Integrity);
     assert!(log_of(&c, &owner.id, 1).is_empty());
 }
 
@@ -283,26 +285,24 @@ fn merge_rejects_equivocation() {
 fn merge_rejects_claims_that_do_not_link() {
     let sa = Scratch::new("link-src");
     let (a, mut owner, genesis) = new_space(&sa.0);
-    let la = a.lock().unwrap();
     let c2 = owner.note("two");
     let c3 = owner.note("three");
-    a.append(&la, &[c2.clone(), c3.clone()]).unwrap();
+    a.append(&a.lock_actor(&owner.id).unwrap(), &[c2.clone(), c3.clone()]).unwrap();
 
     let sb = Scratch::new("link-dst");
     let b = Replica::create_replica(&sb.0, a.manifest()).unwrap();
-    let lb = b.lock().unwrap();
-    b.merge(&lb, &[genesis.clone(), c3.clone()]).unwrap();
+    b.merge(&[genesis.clone(), c3.clone()]).unwrap();
 
     // A different seq-2 claim chains onto genesis but not into the existing seq 3.
     let impostor = owner.seal_at(2, Some(genesis.id.clone()), note("impostor"));
-    assert_eq!(b.merge(&lb, &[impostor]).unwrap_err().code, ErrorCode::Integrity);
+    assert_eq!(b.merge(&[impostor]).unwrap_err().code, ErrorCode::Integrity);
     // A seq-4 claim whose prev is not seq 3.
     let stray = owner.seal_at(4, Some(genesis.id.clone()), note("stray"));
-    assert_eq!(b.merge(&lb, &[stray]).unwrap_err().code, ErrorCode::Integrity);
+    assert_eq!(b.merge(&[stray]).unwrap_err().code, ErrorCode::Integrity);
     assert_eq!(seqs(&log_of(&b, &owner.id, 1)), [1, 3]);
 
     // The genuine claim fills the gap.
-    assert_eq!(b.merge(&lb, &[c2]).unwrap().added, 1);
+    assert_eq!(b.merge(&[c2]).unwrap().added, 1);
     b.verify().unwrap();
 }
 
@@ -310,13 +310,13 @@ fn merge_rejects_claims_that_do_not_link() {
 fn merge_rejects_foreign_and_forged_claims() {
     let sa = Scratch::new("foreign");
     let (a, mut owner, _) = new_space(&sa.0);
-    let la = a.lock().unwrap();
     let mut elsewhere = Author::new(&Id::new_space().unwrap());
     let foreign = elsewhere.note("other space");
-    assert_eq!(a.merge(&la, &[foreign]).unwrap_err().code, ErrorCode::Integrity);
+    assert_eq!(a.merge(&[foreign]).unwrap_err().code, ErrorCode::Integrity);
     let mut forged = owner.note("real");
     forged.body.note = Some("edited after signing".into());
-    assert_eq!(a.merge(&la, &[forged]).unwrap_err().code, ErrorCode::Integrity);
+    assert_eq!(a.merge(&[forged]).unwrap_err().code, ErrorCode::Integrity);
+    assert_eq!(a.generation().unwrap(), None, "a refused merge writes nothing");
 }
 
 #[test]
@@ -329,8 +329,14 @@ fn blobs_are_deduplicated_and_content_addressed() {
     assert_eq!(id, Id::blob_of(data));
     let (again, created, _) = r.put_blob(&mut &data[..]).unwrap();
     assert_eq!((again, created), (id.clone(), false));
-    assert_eq!(fs::read(r.blob_path(&id).unwrap()).unwrap(), data);
-    assert!(r.has_blob(&Id::parse(&format!("{id}#page=1")).unwrap()));
+    assert_eq!(r.read_blob(&id).unwrap(), data);
+    assert_eq!(r.blob_len(&id).unwrap(), data.len() as u64);
+    let mut streamed = Vec::new();
+    std::io::Read::read_to_end(&mut r.open_blob(&id).unwrap(), &mut streamed).unwrap();
+    assert_eq!(streamed, data);
+    assert_eq!(fs::read(r.blob_file(&id).unwrap()).unwrap(), data);
+    assert!(r.has_blob(&Id::parse(&format!("{id}#page=1")).unwrap()).unwrap());
+    assert_eq!(r.has_blob(&Id::new_entity().unwrap()).unwrap_err().code, ErrorCode::Invalid);
 
     // Larger than one copy buffer.
     let big: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
@@ -343,8 +349,11 @@ fn blobs_are_deduplicated_and_content_addressed() {
     assert_no_temp_files(&r);
 
     let absent = Id::blob_of(b"never stored");
-    assert!(!r.has_blob(&absent));
-    assert_eq!(r.blob_path(&absent).unwrap_err().code, ErrorCode::NotFound);
+    assert!(!r.has_blob(&absent).unwrap());
+    for err in [r.blob_len(&absent).unwrap_err(), r.read_blob(&absent).unwrap_err(), r.blob_file(&absent).unwrap_err()] {
+        assert_eq!(err.code, ErrorCode::NotFound);
+    }
+    assert_eq!(r.open_blob(&absent).err().unwrap().code, ErrorCode::NotFound);
 }
 
 /// Every put writes its temp file directly under `blobs/`, dot-prefixed.
@@ -371,7 +380,7 @@ fn put_blob_file_stores_what_put_blob_stores() {
     let filed = by_file.put_blob_file(&src).unwrap();
     assert_eq!(filed, streamed);
     assert_eq!(filed, (Id::blob_of(&data), true, data.len() as u64));
-    assert_eq!(fs::read(by_file.blob_path(&filed.0).unwrap()).unwrap(), data);
+    assert_eq!(by_file.read_blob(&filed.0).unwrap(), data);
     assert_eq!(fs::read(&src).unwrap(), data, "the source is left as it was");
     assert_eq!(by_file.verify().unwrap().blobs, 1);
     assert_no_temp_files(&by_file);
@@ -387,7 +396,7 @@ fn put_blob_file_leaves_a_present_blob_untouched() {
     fs::write(&src, b"same bytes twice").unwrap();
     let (id, created, size) = r.put_blob_file(&src).unwrap();
     assert!(created);
-    let stored = r.blob_path(&id).unwrap();
+    let stored = r.blob_file(&id).unwrap();
     let before = fs::metadata(&stored).unwrap();
 
     assert_eq!(r.put_blob_file(&src).unwrap(), (id.clone(), false, size));
@@ -426,7 +435,7 @@ fn hash_file_gives_the_stored_id_and_size_without_storing() {
 
     let (id, size) = hash_file(&src).unwrap();
     assert_eq!(fs::read_dir(r.root().join("blobs")).unwrap().count(), 0, "hashing wrote into blobs/");
-    assert!(!r.has_blob(&id));
+    assert!(!r.has_blob(&id).unwrap());
     let (stored, _, stored_size) = r.put_blob(&mut data.as_slice()).unwrap();
     assert_eq!((id, size), (stored, stored_size));
 }
@@ -456,7 +465,7 @@ fn put_blob_file_gives_a_read_only_source_the_streamed_mode() {
 
     let (filed, _, _) = r.put_blob_file(&src).unwrap();
     let (streamed, _, _) = r.put_blob(&mut &b"streamed bytes"[..]).unwrap();
-    let mode = |id: &Id| fs::metadata(r.blob_path(id).unwrap()).unwrap().permissions().mode() & 0o7777;
+    let mode = |id: &Id| fs::metadata(r.blob_file(id).unwrap()).unwrap().permissions().mode() & 0o7777;
     assert_eq!(mode(&filed), mode(&streamed));
     r.verify().unwrap();
 }
@@ -485,7 +494,7 @@ fn put_blob_file_stores_a_locked_source_without_its_lock() {
 
     let (id, created, size) = r.put_blob_file(&src).unwrap();
     assert_eq!((id.clone(), created, size), (Id::blob_of(b"locked source"), true, 13));
-    assert_eq!(fs::metadata(r.blob_path(&id).unwrap()).unwrap().st_flags() & UF_IMMUTABLE, 0);
+    assert_eq!(fs::metadata(r.blob_file(&id).unwrap()).unwrap().st_flags() & UF_IMMUTABLE, 0);
     assert_eq!(r.put_blob_file(&src).unwrap(), (id, false, 13));
     assert_no_temp_files(&r);
     r.verify().unwrap();
@@ -495,8 +504,7 @@ fn put_blob_file_stores_a_locked_source_without_its_lock() {
 fn verify_reports_tampered_logs_and_blobs() {
     let s = Scratch::new("verify");
     let (r, mut owner, _) = new_space(&s.0);
-    let lock = r.lock().unwrap();
-    r.append(&lock, &[owner.note("original text")]).unwrap();
+    r.append(&r.lock_actor(&owner.id).unwrap(), &[owner.note("original text")]).unwrap();
     let (blob, _, _) = r.put_blob(&mut &b"blob bytes"[..]).unwrap();
     r.verify().unwrap();
 
@@ -509,14 +517,14 @@ fn verify_reports_tampered_logs_and_blobs() {
     fs::write(&segment, &pristine).unwrap();
     r.verify().unwrap();
 
-    fs::write(r.blob_path(&blob).unwrap(), b"blob bytez").unwrap();
+    fs::write(r.blob_file(&blob).unwrap(), b"blob bytez").unwrap();
     assert_eq!(r.verify().unwrap_err().code, ErrorCode::Integrity);
 }
 
 /// A replica with three claims beyond genesis, one referencing a blob, plus two blobs.
 fn populated(dir: &Path) -> (Replica, Author, Vec<Claim>, Vec<Id>) {
     let (r, mut owner, _) = new_space(dir);
-    let lock = r.lock().unwrap();
+    let lock = r.lock_actor(&owner.id).unwrap();
     let (b1, _, _) = r.put_blob(&mut &b"BLOB-PAYLOAD-ONE"[..]).unwrap();
     let (b2, _, _) = r.put_blob(&mut &b"BLOB-PAYLOAD-TWO"[..]).unwrap();
     let content = Draft::new(Id::new_entity().unwrap(), Term::parse("knowa:content").unwrap(), Value::Ref(b1.clone()));
@@ -543,7 +551,7 @@ fn bundle_round_trip_is_deterministic_and_idempotent() {
     assert!(rep.gaps.is_empty());
     assert_eq!(log_of(&b, &owner.id, 1), claims);
     for id in &blobs {
-        assert_eq!(fs::read(b.blob_path(id).unwrap()).unwrap(), fs::read(a.blob_path(id).unwrap()).unwrap());
+        assert_eq!(b.read_blob(id).unwrap(), a.read_blob(id).unwrap());
     }
     b.verify().unwrap();
 
@@ -600,19 +608,19 @@ fn import_into_a_different_space_is_a_conflict() {
 #[test]
 fn blob_fanout_spreads_by_digest_and_lock_is_bound_to_its_replica() {
     let scratch = Scratch::new("fanout");
-    let (a, _, _) = new_space(&scratch.path("a"));
+    let (a, owner, _) = new_space(&scratch.path("a"));
     let (b, _, _) = new_space(&scratch.path("b"));
     let mut dirs = std::collections::BTreeSet::new();
     for i in 0..32u32 {
         let (id, _, _) = a.put_blob(&mut i.to_le_bytes().as_slice()).unwrap();
-        let p = a.blob_path(&id).unwrap();
+        let p = a.blob_file(&id).unwrap();
         dirs.insert(p.parent().unwrap().file_name().unwrap().to_owned());
         assert_eq!(&id.as_str()[6..8], p.parent().unwrap().file_name().unwrap().to_str().unwrap());
     }
     assert!(dirs.len() > 8, "32 blobs landed in only {} fan-out dirs", dirs.len());
-    let lock_a = a.lock().unwrap();
-    let err = b.head(&lock_a, &b.manifest().owner).unwrap_err();
-    assert_eq!(err.code, knowa_model::ErrorCode::Internal);
+    let lock_a = a.lock_actor(&owner.id).unwrap();
+    assert_eq!(b.head(&lock_a).unwrap_err().code, ErrorCode::Internal);
+    assert_eq!(b.append(&lock_a, &[]).unwrap_err().code, ErrorCode::Internal);
 }
 
 // ---------- audit regressions (DESIGN §5, §7.3) ----------
@@ -623,11 +631,10 @@ fn blob_fanout_spreads_by_digest_and_lock_is_bound_to_its_replica() {
 fn read_log_rejects_forged_and_edited_lines() {
     let s = Scratch::new("forged");
     let (r, mut owner, _) = new_space(&s.0);
-    let lock = r.lock().unwrap();
     let c2 = owner.note("genuine text");
-    r.append(&lock, std::slice::from_ref(&c2)).unwrap();
-    drop(lock);
+    r.append(&r.lock_actor(&owner.id).unwrap(), std::slice::from_ref(&c2)).unwrap();
     let segment = segment_path(&r, &owner.id, 1);
+
     let pristine = fs::read(&segment).unwrap();
 
     // Well-formed, chained, with the right id; only the signature is missing.
@@ -654,11 +661,11 @@ fn read_log_rejects_forged_and_edited_lines() {
 /// A crash part-way through an append left an unterminated last line, and every later
 /// read and write failed with `integrity` forever.
 #[test]
-fn taking_the_lock_truncates_a_torn_tail() {
+fn taking_the_actor_lock_truncates_a_torn_tail() {
     let s = Scratch::new("torn");
     let (r, mut owner, _) = new_space(&s.0);
     let c2 = owner.note("two");
-    r.append(&r.lock().unwrap(), std::slice::from_ref(&c2)).unwrap();
+    r.append(&r.lock_actor(&owner.id).unwrap(), std::slice::from_ref(&c2)).unwrap();
     let segment = segment_path(&r, &owner.id, 1);
     let intact = fs::read(&segment).unwrap();
 
@@ -666,14 +673,14 @@ fn taking_the_lock_truncates_a_torn_tail() {
     let c3 = owner.note("three");
     let line = c3.to_line().unwrap();
     append_bytes(&segment, &line[..line.len() / 2]);
-    assert_eq!(r.read_log(&owner.id, 1).unwrap().last().unwrap().unwrap_err().code, ErrorCode::Integrity);
 
-    let lock = r.lock().unwrap();
+    let lock = r.lock_actor(&owner.id).unwrap();
     assert_eq!(fs::read(&segment).unwrap(), intact);
-    assert_eq!(r.head(&lock, &owner.id).unwrap(), Some(Head { seq: 2, id: c2.id.clone() }));
+    assert_eq!(r.head(&lock).unwrap(), Some(Head { seq: 2, id: c2.id.clone() }));
     r.append(&lock, std::slice::from_ref(&c3)).unwrap();
     assert_eq!(seqs(&log_of(&r, &owner.id, 1)), [1, 2, 3]);
     r.verify().unwrap();
+    drop(lock);
 
     // A segment with no complete line is no crashed append (new segments are published
     // whole), so it is left for readers to report.
@@ -683,94 +690,181 @@ fn taking_the_lock_truncates_a_torn_tail() {
     fs::create_dir_all(&dir).unwrap();
     let partial = &o1.to_line().unwrap()[..10];
     fs::write(dir.join("000000000001.jsonl"), partial).unwrap();
-    drop(lock);
-    let _lock = r.lock().unwrap();
+    drop(r.lock_actor(&other.id).unwrap());
     assert_eq!(fs::read(dir.join("000000000001.jsonl")).unwrap(), partial);
+    assert_eq!(r.read_log(&other.id, 1).unwrap().next().unwrap().unwrap_err().code, ErrorCode::Integrity);
     assert_eq!(r.verify().unwrap_err().code, ErrorCode::Integrity);
 }
 
-/// `append` writes one file per actor (and per rotation); a failure after the first
-/// was written used to leave those lines behind although the append reported failure.
-#[cfg(unix)]
+/// DESIGN §5.3: under the shared lock an unterminated final line can only be an append
+/// that never returned, which the next writer truncates; a reader stops before it
+/// instead of failing until a writer comes along.
 #[test]
-fn an_append_that_fails_part_way_is_undone() {
-    let s = Scratch::new("undo");
+fn a_reader_stops_before_an_unterminated_last_line() {
+    let s = Scratch::new("torn-read");
     let (r, mut owner, _) = new_space(&s.0);
-    // Actors are written in id order: the owner's segment is extended before the new
-    // actor's directory is attempted.
-    let mut other = author_after(&owner.space, &owner.id);
-    let segment = segment_path(&r, &owner.id, 1);
-    let before = fs::read(&segment).unwrap();
-    // A dangling symlink where the new actor's log directory goes makes creating it
-    // fail, whatever the permissions (also as root).
-    let blocker = r.root().join("log").join(other.id.as_str());
-    std::os::unix::fs::symlink(s.path("nowhere"), &blocker).unwrap();
-
-    let lock = r.lock().unwrap();
     let c2 = owner.note("two");
-    let o1 = other.note("hello");
-    r.append(&lock, &[c2.clone(), o1.clone()]).unwrap_err();
-    assert_eq!(fs::read(&segment).unwrap(), before);
-    assert_eq!(r.head(&lock, &owner.id).unwrap().unwrap().seq, 1);
+    r.append(&r.lock_actor(&owner.id).unwrap(), std::slice::from_ref(&c2)).unwrap();
+    let segment = segment_path(&r, &owner.id, 1);
+    let line = owner.note("three").to_line().unwrap();
+    append_bytes(&segment, &line[..line.len() / 2]);
 
-    fs::remove_file(&blocker).unwrap();
-    r.append(&lock, &[c2, o1]).unwrap();
-    assert_eq!(r.head(&lock, &owner.id).unwrap().unwrap().seq, 2);
-    assert_eq!(r.head(&lock, &other.id).unwrap().unwrap().seq, 1);
-    r.verify().unwrap();
+    assert_eq!(seqs(&log_of(&r, &owner.id, 1)), [1, 2]);
+    assert_eq!(seqs(&log_of(&r, &owner.id, 3)), Vec::<u64>::new());
+    // The peek ignores it too.
+    assert!(!r.may_have_after(&owner.id, 2).unwrap());
+    assert!(r.may_have_after(&owner.id, 1).unwrap());
+    // Reading took no exclusive lock, so the torn line is still there for the writer.
+    assert!(fs::read(&segment).unwrap().ends_with(&line[..line.len() / 2]));
 }
 
-/// DESIGN §5: catch-up cannot see segments that fill gaps below an indexed head, so a
-/// merge must leave the rebuild marker, durably, before it writes any segment.
-#[cfg(unix)]
+/// DESIGN §5.3: exclusivity is per actor, so writers for different actors never wait
+/// for each other.
 #[test]
-fn merge_writes_the_rebuild_marker_before_any_segment_and_only_when_it_adds() {
-    let sa = Scratch::new("marker-src");
+fn two_actors_append_to_one_replica_at_once() {
+    let s = Scratch::new("two-writers");
+    let (r, owner, _) = new_space(&s.0);
+    let other = author_after(&owner.space, &owner.id);
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let mut go = Vec::new();
+    std::thread::scope(|scope| {
+        for mut author in [owner, other] {
+            let (go_tx, go_rx) = mpsc::channel::<()>();
+            go.push(go_tx);
+            let (r, locked_tx) = (&r, locked_tx.clone());
+            scope.spawn(move || {
+                let lock = r.lock_actor(&author.id).unwrap();
+                locked_tx.send(author.id.clone()).unwrap();
+                go_rx.recv().unwrap();
+                for i in 0..20 {
+                    let batch = [author.note(&format!("{i}a")), author.note(&format!("{i}b"))];
+                    r.append(&lock, &batch).unwrap();
+                }
+            });
+        }
+        // Both locks are held at the same time, or one of these never arrives.
+        for _ in 0..2 {
+            locked_rx.recv_timeout(Duration::from_secs(10)).expect("an actor lock waited for another actor's");
+        }
+        for tx in &go {
+            tx.send(()).unwrap();
+        }
+    });
+    let actors = r.actors().unwrap();
+    assert_eq!(actors.len(), 2);
+    let owner_seqs = seqs(&log_of(&r, &r.manifest().owner, 1));
+    assert_eq!(owner_seqs, (1..=41).collect::<Vec<u64>>());
+    let other_id = actors.iter().find(|a| **a != r.manifest().owner).unwrap();
+    assert_eq!(seqs(&log_of(&r, other_id, 1)), (1..=40).collect::<Vec<u64>>());
+    let report = r.verify().unwrap();
+    assert_eq!((report.claims, report.actors), (81, 2));
+    assert!(report.gaps.is_empty());
+}
+
+/// flock is per open file: a second replica handle (another process, in effect) waits
+/// for the lock, and so does its reader of that actor; a reader of another actor does not.
+#[test]
+fn a_second_lock_on_an_actor_waits_until_the_first_is_dropped() {
+    let s = Scratch::new("lock-wait");
+    let (r1, mut owner, _) = new_space(&s.0);
+    let mut other = Author::new(&owner.space);
+    r1.append(&r1.lock_actor(&other.id).unwrap(), &[other.note("hello")]).unwrap();
+    let r2 = Replica::open(&s.0).unwrap();
+
+    let held = r1.lock_actor(&owner.id).unwrap();
+    assert_eq!(r1.lock_actor(&owner.id).err().unwrap().code, ErrorCode::Internal, "this thread already holds it");
+    let c2 = owner.note("appended, lock still held");
+    r1.append(&held, std::slice::from_ref(&c2)).unwrap();
+    // This thread holds the lock through r1, so r1 reads the actor without taking it again.
+    assert_eq!(seqs(&log_of(&r1, &owner.id, 1)), [1, 2]);
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::scope(|scope| {
+        let (r2, owner_id, other_id) = (&r2, owner.id.clone(), other.id.clone());
+        let lock_tx = tx.clone();
+        scope.spawn(move || {
+            let lock = r2.lock_actor(&owner_id).unwrap();
+            lock_tx.send(format!("locked at {}", r2.head(&lock).unwrap().unwrap().seq)).unwrap();
+        });
+        let read_tx = tx.clone();
+        let reader_owner = owner.id.clone();
+        scope.spawn(move || {
+            let n = r2.read_log(&reader_owner, 1).unwrap().count();
+            read_tx.send(format!("read {n}")).unwrap();
+        });
+        assert_eq!(r2.read_log(&other_id, 1).unwrap().count(), 1, "another actor's log is readable meanwhile");
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "a second lock or a reader did not wait");
+        drop(held);
+        let mut got = vec![rx.recv_timeout(Duration::from_secs(10)).unwrap(), rx.recv_timeout(Duration::from_secs(10)).unwrap()];
+        got.sort();
+        assert_eq!(got, ["locked at 2", "read 2"]);
+    });
+}
+
+/// DESIGN §5.4: a merge that adds claims writes a fresh generation; one that adds
+/// nothing leaves it.
+#[test]
+fn merge_writes_a_fresh_generation_only_when_it_adds() {
+    let sa = Scratch::new("gen-src");
     let (a, mut owner, genesis) = new_space(&sa.0);
     let c2 = owner.note("two");
-    a.append(&a.lock().unwrap(), std::slice::from_ref(&c2)).unwrap();
+    a.append(&a.lock_actor(&owner.id).unwrap(), std::slice::from_ref(&c2)).unwrap();
+    assert_eq!(a.generation().unwrap(), None, "appends do not touch it");
 
-    let sb = Scratch::new("marker-dst");
+    let sb = Scratch::new("gen-dst");
     let b = Replica::create_replica(&sb.0, a.manifest()).unwrap();
-    let lb = b.lock().unwrap();
-    // The segment write fails (see `an_append_that_fails_part_way_is_undone`), yet the
-    // marker is already there.
-    let blocker = b.root().join("log").join(owner.id.as_str());
-    std::os::unix::fs::symlink(sb.path("nowhere"), &blocker).unwrap();
-    b.merge(&lb, &[genesis.clone(), c2.clone()]).unwrap_err();
-    assert!(marker(&sb.0).is_file());
+    assert_eq!(b.generation().unwrap(), None);
+    b.merge(std::slice::from_ref(&genesis)).unwrap();
+    let first = b.generation().unwrap().unwrap();
+    assert_eq!(fs::read_to_string(sb.path("generation")).unwrap(), format!("{first}\n"));
 
-    fs::remove_file(&blocker).unwrap();
-    fs::remove_file(marker(&sb.0)).unwrap();
-    assert_eq!(b.merge(&lb, std::slice::from_ref(&genesis)).unwrap().added, 1);
-    assert!(marker(&sb.0).is_file());
+    assert_eq!(b.merge(std::slice::from_ref(&genesis)).unwrap().skipped_existing, 1);
+    assert_eq!(b.generation().unwrap().as_ref(), Some(&first));
 
-    // Nothing new: nothing written, no marker.
-    fs::remove_file(marker(&sb.0)).unwrap();
-    assert_eq!(b.merge(&lb, std::slice::from_ref(&genesis)).unwrap().skipped_existing, 1);
-    assert!(!marker(&sb.0).exists());
+    b.merge(std::slice::from_ref(&c2)).unwrap();
+    assert_ne!(b.generation().unwrap().unwrap(), first);
+
+    fs::write(sb.path("generation"), b"not a ulid\n").unwrap();
+    assert_eq!(b.generation().unwrap_err().code, ErrorCode::Integrity);
 }
 
 #[test]
-fn import_writes_the_rebuild_marker_when_it_adds_claims_or_blobs() {
-    let s = Scratch::new("import-marker");
+fn import_writes_a_fresh_generation_when_it_adds_claims_or_blobs() {
+    let s = Scratch::new("import-gen");
     let (a, owner, claims, blobs) = populated(&s.path("a"));
     write_bundle(&a, &s.path("claims.knowa"), &meta_for(&a, "shared", &owner.id), &claims, &[]).unwrap();
     write_bundle(&a, &s.path("all.knowa"), &meta_for(&a, "private", &owner.id), &claims, &blobs).unwrap();
 
-    import_bundle(&s.path("claims.knowa"), &s.path("b")).unwrap();
-    assert!(marker(&s.path("b")).is_file());
-    fs::remove_file(marker(&s.path("b"))).unwrap();
+    let (b, _, _) = import_bundle(&s.path("claims.knowa"), &s.path("b")).unwrap();
+    let first = b.generation().unwrap().unwrap();
 
-    let (_, _, rep) = import_bundle(&s.path("claims.knowa"), &s.path("b")).unwrap();
+    let (b, _, rep) = import_bundle(&s.path("claims.knowa"), &s.path("b")).unwrap();
     assert_eq!(rep.added, 0);
-    assert!(!marker(&s.path("b")).exists());
+    assert_eq!(b.generation().unwrap().as_ref(), Some(&first));
 
     // Only blobs are new: a text blob changes the full-text documents of claims that
     // are already indexed, which catch-up never revisits.
-    let (_, _, rep) = import_bundle(&s.path("all.knowa"), &s.path("b")).unwrap();
+    let (b, _, rep) = import_bundle(&s.path("all.knowa"), &s.path("b")).unwrap();
     assert_eq!((rep.added, rep.blobs_added), (0, 2));
-    assert!(marker(&s.path("b")).is_file());
+    assert_ne!(b.generation().unwrap().unwrap(), first);
+    assert!(!s.path("b").join(".index").exists(), "the replica holds nothing machine-local");
+}
+
+/// DESIGN §5.2: the key names one location, however the path to it is spelled.
+#[cfg(unix)]
+#[test]
+fn location_key_is_stable_and_differs_per_directory() {
+    let s = Scratch::new("location-key");
+    let (a, _, _) = new_space(&s.path("a"));
+    let (b, _, _) = new_space(&s.path("b"));
+    let key = a.location_key().unwrap();
+    assert_eq!(key.len(), 16);
+    assert!(key.bytes().all(|c| c.is_ascii_lowercase() || (b'2'..=b'7').contains(&c)), "{key}");
+    assert_eq!(Replica::open(&s.path("a")).unwrap().location_key().unwrap(), key);
+    std::os::unix::fs::symlink(s.path("a"), s.path("link")).unwrap();
+    assert_eq!(Replica::open(&s.path("link")).unwrap().location_key().unwrap(), key);
+    assert_eq!(Replica::open(&s.path("b/../a")).unwrap().location_key().unwrap(), key);
+    assert_ne!(b.location_key().unwrap(), key);
 }
 
 /// DESIGN §7.3: the manifest's owner and genesis must be backed by a real genesis
@@ -789,7 +883,7 @@ fn import_rejects_a_genesis_that_is_not_an_owner_claim() {
         let manifest =
             Manifest { format: 1, space: space.clone(), owner: first.body.actor.clone(), genesis: first.id.clone() };
         let m = Replica::create_replica(&s.path(&format!("m{i}")), &manifest).unwrap();
-        m.merge(&m.lock().unwrap(), std::slice::from_ref(&first)).unwrap();
+        m.merge(std::slice::from_ref(&first)).unwrap();
         let bundle = s.path(&format!("m{i}.knowa"));
         write_bundle(&m, &bundle, &meta_for(&m, "private", &first.body.actor), std::slice::from_ref(&first), &[]).unwrap();
         let err = import_bundle(&bundle, &s.path(&format!("dest{i}"))).err().unwrap();

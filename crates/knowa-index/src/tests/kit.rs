@@ -50,8 +50,8 @@ impl MemBlobs {
 }
 
 impl BlobSource for MemBlobs {
-    fn has_blob(&self, id: &Id) -> bool {
-        self.0.contains_key(&id.base())
+    fn has_blob(&self, id: &Id) -> Result<bool> {
+        Ok(self.0.contains_key(&id.base()))
     }
     fn blob_ids(&self) -> Result<Vec<Id>> {
         Ok(self.0.keys().cloned().collect())
@@ -176,7 +176,7 @@ impl World {
     }
 
     pub fn index(&self, dir: &TempDir) -> Index {
-        Index::create(&dir.path().join("index.sqlite"), &self.space, &self.owner(), dir.path()).unwrap()
+        Index::create(&dir.path().join("index.sqlite"), dir.path(), &self.space, &self.owner(), None).unwrap()
     }
 }
 

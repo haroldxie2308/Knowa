@@ -1,9 +1,9 @@
-//! The write primitive (DESIGN §4.4, §5 "write path", §6).
+//! The write primitive (DESIGN §4.4, §5.3 "write path", §6).
 //!
-//! `Txn` holds the replica lock and an index opened (caught up) under it. Every
-//! claim the api appends — `Knowa::write`, ingest, extractors, workers, `init` —
-//! goes through `Txn::write`, so placeholder minting, the actorKind prelude,
-//! idempotency and chaining have exactly one implementation.
+//! `Txn` holds the locks of the actors it writes as and an index caught up with
+//! their logs. Every claim the api appends — `Knowa::write`, ingest, extractors,
+//! workers, `init` — goes through `Txn::write`, so placeholder minting, the actorKind
+//! prelude, idempotency and chaining have exactly one implementation.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -11,7 +11,7 @@ use knowa_config::Actor;
 use knowa_index::Index;
 use knowa_model::query::{Order, View, Where, WriteItem, WriteResult};
 use knowa_model::{ClaimBody, Draft, Error, Id, Result, Status, Term, Timestamp, Value, vocab};
-use knowa_store::WriteLock;
+use knowa_store::ActorLock;
 
 use crate::select::Space;
 
@@ -26,17 +26,31 @@ pub(crate) struct Written {
 
 pub(crate) struct Txn<'a> {
     space: &'a Space,
-    lock: WriteLock,
+    /// ascending by actor id, one per actor
+    locks: Vec<ActorLock>,
     index: Index,
 }
 
 impl<'a> Txn<'a> {
-    /// Refuses readonly spaces, takes the replica lock, opens the index under it.
-    pub fn begin(space: &'a Space) -> Result<Txn<'a>> {
+    /// Refuses readonly spaces, then follows DESIGN §5.3:
+    /// - opens the index, rebuilding it if it must be, before any actor lock is
+    ///   taken: a rebuild reads every actor's log and may wait for other writers,
+    ///   which a writer holding its own actor lock must never do;
+    /// - takes the locks of `actors` in ascending id order, the one order every
+    ///   writer uses, so two writers cannot wait for each other;
+    /// - catches the index up with those actors' logs only (the index lock is held
+    ///   for each apply, never while waiting for an actor lock).
+    ///
+    /// The locks are held until the `Txn` is dropped.
+    pub fn begin(space: &'a Space, actors: &[&Actor]) -> Result<Txn<'a>> {
         space.ensure_writable()?;
-        let lock = space.replica.lock()?;
-        let index = Index::open(&space.replica)?;
-        Ok(Txn { space, lock, index })
+        let mut ids: Vec<Id> = actors.iter().map(|a| a.id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        let mut index = Index::load(&space.replica, &space.index_dir)?;
+        let locks = ids.iter().map(|id| space.replica.lock_actor(id)).collect::<Result<Vec<_>>>()?;
+        index.catch_up_actors(&space.replica, &ids)?;
+        Ok(Txn { space, locks, index })
     }
 
     /// All-or-nothing: every draft is validated, resolved and sealed before anything
@@ -81,8 +95,9 @@ impl<'a> Txn<'a> {
         let index = &self.index;
         let plan = plan_batch(&keys, |k| Ok(index.equivalent(&actor.id, k)?.map(|cv| cv.claim.id)))?;
 
+        let lock = lock_of(&self.locks, actor)?;
         let space_id = self.space.id().clone();
-        let (mut seq, mut prev) = match self.space.replica.head(&self.lock, &actor.id)? {
+        let (mut seq, mut prev) = match self.space.replica.head(lock)? {
             Some(h) => (h.seq, Some(h.id)),
             None => (0, None),
         };
@@ -108,9 +123,9 @@ impl<'a> Txn<'a> {
         }
 
         if !claims.is_empty() {
-            self.space.replica.append(&self.lock, &claims)?;
+            self.space.replica.append(lock, &claims)?;
             // From here the claims are durable. If apply fails the error propagates and
-            // the next `Index::open` catches up from the logs (DESIGN §5).
+            // the next catch-up applies them from the log (DESIGN §5.4).
             self.index.apply(&self.space.replica, &claims)?;
         }
 
@@ -139,7 +154,7 @@ impl<'a> Txn<'a> {
     /// (a catalog-only put, a partial import) and their full-text documents lack its
     /// text; no claim arrives to make the index revisit them (DESIGN §7.2).
     pub fn refresh_blob(&mut self, blob: &Id) -> Result<()> {
-        self.index.refresh_blob(blob)
+        self.index.refresh_blob(&self.space.replica, blob)
     }
 }
 
@@ -160,6 +175,14 @@ impl Txn<'_> {
         };
         Ok(!self.index.find_claims(&w, &every_status, Order::Recorded, 1, None)?.items.is_empty())
     }
+}
+
+/// The lock a transaction holds for `actor`; an actor it did not lock is a caller bug.
+fn lock_of<'l>(locks: &'l [ActorLock], actor: &Actor) -> Result<&'l ActorLock> {
+    locks
+        .iter()
+        .find(|l| *l.actor() == actor.id)
+        .ok_or_else(|| Error::internal(format!("write as {} in a transaction that did not lock it", actor.id)))
 }
 
 /// What to do with one batch entry.

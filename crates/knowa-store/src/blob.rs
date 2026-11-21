@@ -1,4 +1,5 @@
-//! Content-addressed blobs: `blobs/<id[6..8]>/<id>`.
+//! Content-addressed blobs: `blobs/<id[6..8]>/<id>`. Hashing and naming are shared by
+//! every store; storing, listing and paths are the directory store's (`dir::DirBlobs`).
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -256,10 +257,4 @@ pub(crate) fn scan(root: &Path) -> Result<Scan> {
     }
     blobs.sort();
     Ok((blobs, problems))
-}
-
-/// Recomputes the hash of the blob at `path` and compares it with `id`.
-pub(crate) fn check(id: &Id, path: &Path) -> Result<Option<String>> {
-    let (got, _) = hash_file(path)?;
-    Ok((got != *id).then(|| format!("{}: content hashes to {got}", path.display())))
 }

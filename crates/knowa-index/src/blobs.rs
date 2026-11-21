@@ -1,5 +1,5 @@
 //! Blob access the index needs (presence, listing, text for FTS), behind a trait so
-//! the indexing logic does not depend on a replica directory.
+//! the indexing logic does not depend on a replica.
 
 use knowa_model::{Id, Result};
 use knowa_store::Replica;
@@ -8,7 +8,7 @@ use crate::MAX_FTS_BLOB_BYTES;
 
 pub(crate) trait BlobSource {
     /// Fragment ignored.
-    fn has_blob(&self, id: &Id) -> bool;
+    fn has_blob(&self, id: &Id) -> Result<bool>;
     fn blob_ids(&self) -> Result<Vec<Id>>;
     /// Size in bytes of a blob that `has_blob`.
     fn blob_len(&self, id: &Id) -> Result<u64>;
@@ -17,17 +17,17 @@ pub(crate) trait BlobSource {
 }
 
 impl BlobSource for Replica {
-    fn has_blob(&self, id: &Id) -> bool {
+    fn has_blob(&self, id: &Id) -> Result<bool> {
         Replica::has_blob(self, id)
     }
     fn blob_ids(&self) -> Result<Vec<Id>> {
         Replica::blob_ids(self)
     }
     fn blob_len(&self, id: &Id) -> Result<u64> {
-        Ok(std::fs::metadata(self.blob_path(id)?)?.len())
+        Replica::blob_len(self, id)
     }
     fn read_blob(&self, id: &Id) -> Result<Vec<u8>> {
-        Ok(std::fs::read(self.blob_path(id)?)?)
+        Replica::read_blob(self, id)
     }
 }
 
@@ -35,7 +35,7 @@ impl BlobSource for Replica {
 /// larger than `MAX_FTS_BLOB_BYTES` or absent.
 pub(crate) fn fts_text(src: &dyn BlobSource, id: &Id) -> Result<Option<String>> {
     let id = id.base();
-    if !src.has_blob(&id) {
+    if !src.has_blob(&id)? {
         // Fallback: a partial replica (imported from a shared/public bundle) holds
         // claims about blobs whose bytes were not exported. The text is derived data,
         // so the entity is indexed from its claims alone; nothing canonical is lost.

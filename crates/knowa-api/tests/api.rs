@@ -1,5 +1,5 @@
 //! `Knowa` api behavior that needs a real home and replicas: space identity (DESIGN
-//! §7.3), the actorKind prelude (§4.6) and verify under the write lock (§5).
+//! §7.3), the actorKind prelude (§4.6) and per-actor locking (§5.3).
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -130,21 +130,71 @@ fn explicit_actor_kind_drafts_are_invalid() {
 }
 
 #[test]
-fn verify_waits_for_the_write_lock() {
+fn verify_waits_for_an_actor_lock() {
     let s = Scratch::new("verify-lock");
     let (k, sel, _) = alice(&s);
+    let alice_id = k.home().actor("alice").unwrap().id;
+    // Another process, in effect: its lock is a separate open file.
     let replica = Replica::open(&s.path("alice-space")).unwrap();
-    let held = replica.lock().unwrap();
+    let held = replica.lock_actor(&alice_id).unwrap();
     let (tx, rx) = mpsc::channel();
     std::thread::scope(|scope| {
         scope.spawn(|| tx.send(k.verify(&sel)).unwrap());
         assert!(
             rx.recv_timeout(Duration::from_millis(500)).is_err(),
-            "verify ran while another writer held the lock"
+            "verify read a log while its writer held the lock"
         );
         drop(held);
         let report = rx.recv_timeout(Duration::from_secs(30)).unwrap().unwrap();
         assert!(report.claims > 0);
+    });
+}
+
+/// DESIGN §5.3: writers for different actors never wait for each other. A write
+/// catches up only its own actor, so another actor's append in flight (appended, its
+/// lock still held, not yet applied) does not hold it up; a reader does wait for it.
+#[test]
+fn a_write_does_not_wait_for_another_actors_writer() {
+    let s = Scratch::new("writers");
+    let (k, alice_sel, space) = alice(&s);
+    k.home().new_actor("bot", ActorKind::Agent).unwrap();
+    let bot = Sel { space: None, actor: Some("bot".into()) };
+    k.write(&bot, vec![Draft::new(Id::new_entity().unwrap(), term("knowa:label"), Value::text("first"))]).unwrap();
+
+    let bot_actor = k.home().actor("bot").unwrap();
+    let replica = Replica::open(&s.path("alice-space")).unwrap();
+    let in_flight = replica.lock_actor(&bot_actor.id).unwrap();
+    let head = replica.head(&in_flight).unwrap().unwrap();
+    let body = ClaimBody::from_draft(
+        Draft::new(Id::new_entity().unwrap(), term("knowa:label"), Value::text("in flight")),
+        space,
+        bot_actor.id.clone(),
+        head.seq + 1,
+        Some(head.id),
+        Timestamp::now(),
+    );
+    replica.append(&in_flight, &[bot_actor.signer.seal(body).unwrap()]).unwrap();
+
+    let (tx, rx) = mpsc::channel();
+    let (k, alice_sel) = (&k, &alice_sel);
+    std::thread::scope(|scope| {
+        let write_tx = tx.clone();
+        scope.spawn(move || {
+            let d = Draft::new(Id::new_entity().unwrap(), term("knowa:label"), Value::text("alice"));
+            write_tx.send(("write", k.write(alice_sel, vec![d]).map(|_| ()))).unwrap();
+        });
+        let (what, done) = rx.recv_timeout(Duration::from_secs(10)).expect("a write waited for another actor's writer");
+        assert_eq!(what, "write");
+        done.unwrap();
+
+        let read_tx = tx.clone();
+        scope.spawn(move || read_tx.send(("query", k.query(alice_sel, find_all()).map(|_| ()))).unwrap());
+
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "a reader read past an append in flight");
+        drop(in_flight);
+        let (what, done) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(what, "query");
+        done.unwrap();
     });
 }
 
@@ -314,7 +364,7 @@ fn put_no_store_records_a_file_without_storing_its_bytes() {
     assert_eq!((&item.blob, item.size), (&Id::blob_of(bytes), bytes.len() as u64));
     assert_eq!((item.created, item.stored), (false, false));
     assert!(item.errors.is_empty(), "{:?}", item.errors);
-    assert_eq!(k.blob_path(&sel, &[], &item.blob).unwrap_err().code, ErrorCode::NotFound);
+    assert_eq!(k.blob_open(&sel, &[], &item.blob).err().unwrap().code, ErrorCode::NotFound);
 
     let b = &item.blob;
     assert_eq!(objects(&k, &sel, b, NAME), vec![Value::text("lecture.txt")]);
@@ -347,7 +397,10 @@ fn a_later_put_stores_a_catalog_only_file_under_the_same_id() {
     let stored = k.put(&sel, &[path], PutOptions::default()).unwrap().items.remove(0);
     assert_eq!(stored.blob, catalogued.blob);
     assert_eq!((stored.created, stored.stored), (true, true));
-    assert_eq!(fs::read(k.blob_path(&sel, &[], &stored.blob).unwrap()).unwrap(), bytes);
+    let mut read = Vec::new();
+    std::io::Read::read_to_end(&mut k.blob_open(&sel, &[], &stored.blob).unwrap(), &mut read).unwrap();
+    assert_eq!(read, bytes);
+
     assert_eq!(claim_count(&k, &sel), before, "storing the bytes later writes no claims");
     assert_eq!(stored.claims, catalogued.claims, "the existing claims are returned");
 }

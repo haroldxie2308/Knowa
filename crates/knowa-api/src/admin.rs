@@ -10,7 +10,7 @@ use knowa_model::query::View;
 use knowa_model::{ClaimBody, Draft, Error, Id, Result, Timestamp, Value, Visibility, vocab};
 use knowa_store::{BundleMeta, Manifest, Replica, VerifyReport, import_bundle, read_bundle_meta, write_bundle};
 
-use crate::select::{Space, current};
+use crate::select::{Space, current, index_dir};
 use crate::write::{Txn, term};
 use crate::{ExportResult, ImportResult, InitResult, Sel, SpaceAddResult};
 
@@ -42,10 +42,10 @@ pub(crate) fn init(home: &Home, sel: &Sel, dir: &Path, name: &str, alias: Option
     ))?;
     let replica = Replica::create(dir, &genesis)?;
     let path = fs::canonicalize(replica.root())?;
-    let space = Space { sref: SpaceRef { alias: Some(alias.clone()), path: path.clone(), readonly: false }, replica };
+    let space = Space::new(home, SpaceRef { alias: Some(alias.clone()), path: path.clone(), readonly: false }, replica)?;
 
     // The owner's actorKind comes from the write prelude.
-    let written = Txn::begin(&space)?.write(
+    let written = Txn::begin(&space, &[&owner])?.write(
         &owner,
         vec![
             Draft::new(space_id.clone(), term(vocab::LABEL)?, Value::text(name)),
@@ -83,7 +83,7 @@ pub(crate) fn export(home: &Home, sel: &Sel, out: &Path, level: Visibility) -> R
     let space = current(home, sel)?;
     let actor = home.resolve_actor(sel.actor.as_deref())?;
     let index = space.index()?;
-    let (claim_ids, blobs) = index.export_set(level)?;
+    let (claim_ids, blobs) = index.export_set(&space.replica, level)?;
     let mut wanted: HashSet<Id> = claim_ids.into_iter().collect();
     // Claims are read from the logs, the canonical copy (DESIGN §3.7).
     let mut claims = Vec::with_capacity(wanted.len());
@@ -166,13 +166,10 @@ pub(crate) fn import(home: &Home, bundle: &Path, dir: Option<&Path>, alias: Opti
         )));
     }
     let path = fs::canonicalize(replica.root())?;
-    // If the merge added anything it left the rebuild marker, and `Index::open` rebuilds
-    // (claims that fill gaps below an indexed head are invisible to catch-up) and then
-    // removes it; if it added nothing, catching up is all there is to do (DESIGN §5).
-    let index = {
-        let _lock = replica.lock()?;
-        Index::open(&replica)?
-    };
+    // If the merge added anything it wrote a new rebuild generation, and `Index::open`
+    // rebuilds (claims that fill gaps below an indexed head are invisible to catch-up);
+    // if it added nothing, catching up is all there is to do (DESIGN §5.4).
+    let index = Index::open(&replica, &index_dir(home, &replica)?)?;
     let alias = match alias {
         Some(a) => a.to_string(),
         None => default_import_alias(home, &path, &index, &meta.space)?,
@@ -280,10 +277,7 @@ pub(crate) fn space_add(home: &Home, dir: &Path, alias: Option<&str>, readonly: 
             a.to_string()
         }
         None => {
-            let index = {
-                let _lock = replica.lock()?;
-                Index::open(&replica)?
-            };
+            let index = Index::open(&replica, &index_dir(home, &replica)?)?;
             let label = index.entity(&space, &View::default())?.and_then(|e| e.label);
             match label.as_deref().and_then(slugify) {
                 Some(a) => a,
@@ -295,20 +289,18 @@ pub(crate) fn space_add(home: &Home, dir: &Path, alias: Option<&str>, readonly: 
     Ok(SpaceAddResult { alias, space, path, readonly })
 }
 
-/// Under the write lock: a concurrent append's half-written line would otherwise be
-/// reported as a torn line. Taking the lock first repairs a real torn tail (DESIGN §5),
-/// so verify reports the replica as every later reader will see it.
+/// Each actor is verified under its exclusive lock (`Replica::verify`): a concurrent
+/// append's half-written line would otherwise be reported as a torn line, and taking
+/// the lock first repairs a real torn tail (DESIGN §5.3), so verify reports the
+/// replica as every later reader will see it.
 pub(crate) fn verify(home: &Home, sel: &Sel) -> Result<VerifyReport> {
-    let space = current(home, sel)?;
-    let _lock = space.replica.lock()?;
-    space.replica.verify()
+    current(home, sel)?.replica.verify()
 }
 
-/// Returns the new index epoch.
+/// Rebuilds under the index lock (no actor lock: DESIGN §5.3); returns the new epoch.
 pub(crate) fn reindex(home: &Home, sel: &Sel) -> Result<String> {
     let space = current(home, sel)?;
-    let _lock = space.replica.lock()?;
-    Ok(Index::rebuild(&space.replica)?.epoch().to_string())
+    Ok(Index::rebuild(&space.replica, &space.index_dir)?.epoch().to_string())
 }
 
 #[cfg(test)]

@@ -655,10 +655,10 @@ fn a_torn_tail_left_by_a_crashed_append_is_repaired_by_the_next_writer() {
     assert!(alice.ok(&["verify"])["problems"].as_array().unwrap().is_empty());
 }
 
-/// Depends on the knowa-index side of DESIGN §5 (`Index::open` rebuilds while the
-/// rebuild marker exists, then removes it): import now leaves the rebuild to it.
+/// DESIGN §5.4: the import that fills the gap writes a new rebuild generation, and the
+/// importing home's index rebuilds on its next open. The index stays under the home.
 #[test]
-fn an_import_that_fills_a_gap_is_searchable_and_leaves_no_rebuild_marker() {
+fn an_import_that_fills_a_gap_is_searchable() {
     let sb = Sandbox::new("gapfill");
     let alice = setup_home(&sb, "home-a", "alice", "alice-space");
     let first = note(&alice, &["first public walk"]);
@@ -684,7 +684,61 @@ fn an_import_that_fills_a_gap_is_searchable_and_leaves_no_rebuild_marker() {
     assert!(im["added"].as_u64().unwrap() > 0, "{im}");
     let hits = bob.ok(&["search", "harbour", "--spaces", &replica]);
     assert_eq!(ids(&hits["items"]), [hidden], "{hits}");
-    assert!(!Path::new(&replica).join(".index").join("needs-rebuild").exists());
+    assert!(Path::new(&replica).join("generation").is_file());
+    assert!(!Path::new(&replica).join(".index").exists(), "the replica holds nothing machine-local");
+    let space = im["space"].as_str().unwrap();
+    let index_dirs: Vec<PathBuf> =
+        fs::read_dir(sb.path("home-b").join("index").join(space)).unwrap().map(|e| e.unwrap().path()).collect();
+    assert_eq!(index_dirs.len(), 1, "{index_dirs:?}");
+    assert!(index_dirs[0].join("index.sqlite").is_file());
+}
+
+/// DESIGN §5.2/§5.4: two homes (two machines, in effect) registered on one replica
+/// directory each keep their own index. When one imports a bundle that fills a gap
+/// below the other's indexed head, the other's next query sees the filled claims: the
+/// new rebuild generation is in the replica, where every reader sees it.
+#[test]
+fn a_gap_filled_through_one_home_is_seen_by_another_home_on_the_same_replica() {
+    let sb = Sandbox::new("two-homes");
+    let alice = setup_home(&sb, "home-a", "alice", "alice-space");
+    let first = note(&alice, &["first public walk"]);
+    let hidden = note(&alice, &["hidden harbour diary"]);
+    let last = note(&alice, &["last public walk"]);
+    alice.ok(&["share", &first, "shared"]);
+    alice.ok(&["share", &last, "shared"]);
+    let bundle = sb.path("alice-1.knowa");
+    alice.ok(&["export", s(&bundle), "--level", "shared"]);
+
+    let carol = sb.home("home-c");
+    let replica = carol.ok(&["import", s(&bundle)])["path"].as_str().unwrap().to_string();
+    let dave = sb.home("home-d");
+    dave.ok(&["space", "add", &replica, "--alias", "shared", "--readonly"]);
+    assert!(ids(&dave.ok(&["search", "walk", "--spaces", "shared"])["items"]).contains(&last));
+    assert!(ids(&dave.ok(&["search", "harbour", "--spaces", "shared"])["items"]).is_empty());
+
+    alice.ok(&["share", &hidden, "shared"]);
+    let bundle = sb.path("alice-2.knowa");
+    alice.ok(&["export", s(&bundle), "--level", "shared"]);
+    let im = carol.ok(&["import", s(&bundle)]);
+    assert_eq!(im["path"].as_str().unwrap(), replica);
+    assert!(im["added"].as_u64().unwrap() > 0, "{im}");
+
+    let hits = dave.ok(&["search", "harbour", "--spaces", "shared"]);
+    assert_eq!(ids(&hits["items"]), [hidden], "{hits}");
+}
+
+/// `blob cat` streams the bytes, also past any one read buffer.
+#[test]
+fn blob_cat_streams_a_blob_larger_than_a_buffer() {
+    let sb = Sandbox::new("blob-cat");
+    let alice = setup(&sb);
+    let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let file = sb.path("data.bin");
+    fs::write(&file, &bytes).unwrap();
+    let id = alice.ok(&["blob", "put", s(&file)])["id"].as_str().unwrap().to_string();
+    let out = alice.run(&["blob", "cat", &id], None);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.stdout == bytes, "blob cat returned {} bytes, not the {} stored", out.stdout.len(), bytes.len());
 }
 
 #[test]

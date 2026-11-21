@@ -100,9 +100,8 @@ fn dispatch(cmd: Cmd, g: &Globals, out: &mut Out) -> Result<Finished> {
         }
         Cmd::Blob(BlobCmd::Cat { id, spaces }) => {
             let id = Id::parse(&id)?;
-            let path = g.knowa()?.blob_path(&g.sel, &spaces.spaces, &id)?;
-            let mut f = File::open(&path)?;
-            io::copy(&mut f, out.raw())?;
+            let mut bytes = g.knowa()?.blob_open(&g.sel, &spaces.spaces, &id)?;
+            io::copy(&mut bytes, out.raw())?;
             Ok(())
         }
         Cmd::Put(a) => return put(a, g, out),

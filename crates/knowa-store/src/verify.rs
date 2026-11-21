@@ -1,39 +1,46 @@
 //! Full replica check (`knowa verify`). Collects every problem instead of stopping
 //! at the first; only I/O failures abort.
 
-use std::collections::btree_map::Entry;
 use std::collections::BTreeSet;
-use std::fs;
+use std::collections::btree_map::Entry;
+use std::io::Read;
 
 use knowa_model::{Error, Result};
 
-use crate::fsutil::io_err;
 use crate::log::{self, Chain};
 use crate::{Replica, VerifyReport, blob};
 
+/// Each actor is checked under its exclusive lock, taken here unless this thread
+/// already holds it: taking it repairs a torn tail left by a crashed append (DESIGN
+/// §5.3), and holding it keeps a concurrent append's unfinished batch out of the
+/// report, so verify sees the log as every later reader will.
 pub(crate) fn verify(replica: &Replica) -> Result<VerifyReport> {
-    let root = replica.root();
+    let logs = replica.logs();
     let m = replica.manifest();
     let mut rep = VerifyReport::default();
 
-    let (actors, problems) = log::scan_actors(root)?;
+    let (actors, problems) = logs.actors()?;
     rep.problems.extend(problems);
     rep.actors = actors.len() as u64;
     let mut owner_seq1 = None;
 
     for actor in &actors {
-        let (segments, problems) = log::scan_segments(root, actor)?;
+        let _lock = replica.exclusive(actor)?;
+        let (segments, problems) = logs.segments(actor)?;
         rep.problems.extend(problems);
         let mut chain = Chain::new();
         for seg in &segments {
-            let bytes = fs::read(&seg.path).map_err(|e| io_err(&seg.path, e))?;
+            let mut bytes = Vec::new();
+            logs.open_segment(actor, seg)?
+                .read_to_end(&mut bytes)
+                .map_err(|e| Error::internal(format!("io: {}: {e}", seg.name)))?;
             if bytes.is_empty() {
-                rep.problems.push(format!("{}: empty segment", seg.path.display()));
+                rep.problems.push(format!("{}: empty segment", seg.name));
                 continue;
             }
             for (i, line) in bytes.split_inclusive(|&b| b == b'\n').enumerate() {
                 let lineno = i + 1;
-                let loc = || format!("{}:{lineno}", seg.path.display());
+                let loc = || format!("{}:{lineno}", seg.name);
                 let claim = match log::parse_line(line, &loc) {
                     Ok(c) => c,
                     Err(e) => {
@@ -96,12 +103,14 @@ pub(crate) fn verify(replica: &Replica) -> Result<VerifyReport> {
         None => rep.problems.push(format!("genesis claim {} (seq 1 of owner {}) is missing", m.genesis, m.owner)),
     }
 
-    let (blobs, problems) = blob::scan(root)?;
+    let (blobs, problems) = replica.blob_store().scan()?;
     rep.problems.extend(problems);
     rep.blobs = blobs.len() as u64;
-    for (id, path) in &blobs {
-        if let Some(p) = blob::check(id, path)? {
-            rep.problems.push(p);
+    for (id, name) in &blobs {
+        let mut bytes = replica.blob_store().open(id)?;
+        let (got, _) = blob::hash_reader(&mut bytes, &|| name.clone())?;
+        if got != *id {
+            rep.problems.push(format!("{name}: content hashes to {got}"));
         }
     }
 

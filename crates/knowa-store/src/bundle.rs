@@ -13,7 +13,7 @@ use knowa_model::{Claim, Error, ErrorCode, Id, IdKind, Result, Timestamp};
 
 use crate::fsutil::{TempFile, io_err};
 use crate::log::{self, Chain, SEGMENT_LIMIT};
-use crate::{BundleMeta, ImportReport, MANIFEST_FILE, Manifest, Replica, blob, genesis_problem, mark_rebuild};
+use crate::{BundleMeta, ImportReport, MANIFEST_FILE, Manifest, Replica, blob, genesis_problem};
 
 const META_ENTRY: &str = "bundle.json";
 const LEVELS: &[&str] = &["private", "shared", "public"];
@@ -77,9 +77,9 @@ pub(crate) fn write(replica: &Replica, out: &Path, meta: &BundleMeta, claims: &[
             return Err(Error::invalid(format!("seq {} of {} is given twice", c.body.seq, c.body.actor)));
         }
     }
-    let mut blob_files = BTreeMap::new();
+    let mut blob_sizes = BTreeMap::new();
     for b in blobs {
-        blob_files.insert(b.base(), replica.blob_path(b)?);
+        blob_sizes.insert(b.base(), replica.blob_len(b)?);
     }
 
     let dir = match out.parent() {
@@ -101,10 +101,8 @@ pub(crate) fn write(replica: &Replica, out: &Path, meta: &BundleMeta, claims: &[
             }
         }
     }
-    for (id, path) in &blob_files {
-        let f = File::open(path).map_err(|e| io_err(path, e))?;
-        let size = f.metadata().map_err(|e| io_err(path, e))?.len();
-        append_entry(&mut tar, &blob::rel_path(id)?, size, f.take(size))?;
+    for (id, &size) in &blob_sizes {
+        append_entry(&mut tar, &blob::rel_path(id)?, size, replica.open_blob(id)?.take(size))?;
     }
     let writer = tar.into_inner().map_err(|e| io_err(&tmp_path, e))?;
     writer.into_inner().map_err(|e| io_err(&tmp_path, e.into_error()))?;
@@ -261,19 +259,17 @@ pub(crate) fn import(bundle: &Path, dest: &Path) -> Result<(Replica, BundleMeta,
         Replica::create_replica(dest, &manifest)?
     };
 
-    let lock = replica.lock()?;
-    let plan = log::plan_merge(&parsed.claims, |actor| log::chain(replica.root(), &space, actor))?;
-    // The marker covers blobs too: a text blob arriving for claims that are already
-    // indexed changes their full-text documents, which catch-up never revisits.
-    let adds_blobs = parsed.blobs.iter().any(|id| !replica.has_blob(id));
-    if plan.writes_segments() || adds_blobs {
-        mark_rebuild(replica.root())?;
+    let mut adds_blobs = false;
+    for id in &parsed.blobs {
+        adds_blobs |= !replica.has_blob(id)?;
     }
-
     // Blobs before claims: a failure part-way leaves no claim referring to a blob
     // that did not make it.
-    let mut blobs_added = 0;
-    if adds_blobs {
+    let put_blobs = || -> Result<u64> {
+        if !adds_blobs {
+            return Ok(0);
+        }
+        let mut blobs_added = 0;
         let mut archive = open_archive(bundle)?;
         for entry in archive.entries().map_err(|e| malformed(bundle, e))? {
             let mut entry = entry.map_err(|e| malformed(bundle, e))?;
@@ -283,10 +279,10 @@ pub(crate) fn import(bundle: &Path, dest: &Path) -> Result<(Replica, BundleMeta,
             let Some(id) = blob::parse_rel_path(&path) else {
                 continue;
             };
-            if replica.has_blob(&id) {
+            if replica.has_blob(&id)? {
                 continue;
             }
-            let (got, created, _) = blob::put(replica.root(), &mut entry)?;
+            let (got, created, _) = replica.put_blob(&mut entry)?;
             if got != id {
                 return Err(Error::integrity(format!(
                     "bundle {} changed during import: {path} now hashes to {got}",
@@ -297,9 +293,8 @@ pub(crate) fn import(bundle: &Path, dest: &Path) -> Result<(Replica, BundleMeta,
                 blobs_added += 1;
             }
         }
-    }
-    let mut report = plan.apply(replica.root())?;
-    report.blobs_added = blobs_added;
-    drop(lock);
+        Ok(blobs_added)
+    };
+    let report = replica.merge_checked(&parsed.claims, adds_blobs, put_blobs)?;
     Ok((replica, parsed.meta, report))
 }

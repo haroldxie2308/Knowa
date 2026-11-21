@@ -850,6 +850,13 @@ pub(crate) fn actor_heads(conn: &Connection) -> Result<Vec<(Id, u64)>> {
     rows(conn, &q, |row| Ok((id_from(&row.get::<_, String>(0).map_err(db)?)?, u64_of(row.get(1).map_err(db)?, "seq")?)))
 }
 
+/// Highest indexed seq of one actor.
+pub(crate) fn actor_head(conn: &Connection, actor: &Id) -> Result<Option<u64>> {
+    let head: Option<i64> =
+        conn.query_row("SELECT MAX(seq) FROM claims WHERE actor = ?1", [actor.as_str()], |r| r.get(0)).map_err(db)?;
+    head.map(|seq| u64_of(seq, "seq")).transpose()
+}
+
 pub(crate) fn actors(conn: &Connection) -> Result<Vec<ActorInfo>> {
     let q = Sql::new("SELECT actor, COUNT(*) FROM claims GROUP BY actor");
     let counts: BTreeMap<String, u64> =

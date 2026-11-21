@@ -113,7 +113,7 @@ fn admin() -> Value {
         },
         "worker run": {
             "args": {"actor": "an existing actor of kind agent or worker (else usage)", "cmd": "program and arguments", "batch": format!("feed page size, 1..{MAX_LIMIT}"), "follow": "keep polling every 2 s when caught up"},
-            "does": "Reads the feed from the cursor stored in <replica>/.index/cursors/<actor>.json, skipping claims written by the worker actor itself. For each batch it runs cmd with stdin {\"space\":\"s_…\",\"cursor\":\"<epoch>:<n> after this batch\",\"claims\":[ClaimView…]} and env KNOWA_HOME, KNOWA_SPACE (replica path), KNOWA_ACTOR. The command's stdout is JSONL drafts, written by the worker actor with via.worker = <actor> (a draft naming a different via.worker → invalid). A non-zero exit stops the run (error detail carries stderr) and the cursor is not advanced. cursor_expired names the cursor file to delete.",
+            "does": "Reads the feed from the cursor stored with this machine's index of the replica, in <home>/index/<space-id>/<location key>/cursors/<actor>.json, skipping claims written by the worker actor itself. For each batch it runs cmd with stdin {\"space\":\"s_…\",\"cursor\":\"<epoch>:<n> after this batch\",\"claims\":[ClaimView…]} and env KNOWA_HOME, KNOWA_SPACE (replica path), KNOWA_ACTOR. The command's stdout is JSONL drafts, written by the worker actor with via.worker = <actor> (a draft naming a different via.worker → invalid). A non-zero exit stops the run (error detail carries stderr) and the cursor is not advanced. cursor_expired names the cursor file to delete.",
             "out": {"batches": "commands run", "claimsIn": "claims passed to the command", "claimsOut": "claims newly created", "cursor": "final cursor"}
         },
         "export": {
@@ -123,11 +123,11 @@ fn admin() -> Value {
         },
         "import": {
             "args": {"bundle": "bundle file", "dir": "replica directory, default <home>/replicas/<space-id>", "alias": "default: the space label slugified, else the space id"},
-            "does": "Verifies every signature, blob hash and chain run, and that the genesis is a knowa:owner claim by the owner, merges into the replica (creating it), reindexes it and registers it readonly. Importing into a directory registered as a writable space → conflict. A space is its id and genesis: if a registered replica of the same space id has a different owner or genesis → conflict, and nothing is written (space add applies the same rule).",
+            "does": "Verifies every signature, blob hash and chain run, and that the genesis is a knowa:owner claim by the owner, merges into the replica (creating it) under the locks of the actors it writes, writes a new rebuild generation if it added anything (so every machine's index of the replica rebuilds), reindexes it and registers it readonly. Importing into a directory registered as a writable space → conflict. A space is its id and genesis: if a registered replica of the same space id has a different owner or genesis → conflict, and nothing is written (space add applies the same rule).",
             "out": {"space": "s_…", "path": "absolute path", "alias": "string", "added": "claims added", "skippedExisting": "claims already present", "blobsAdded": "count", "gaps": "number of missing seq runs (partial bundles)"}
         },
-        "verify": {"does": "Takes the space's write lock (which first truncates a torn final line left by a crashed append), then checks every claim (id, signature, space, chain within contiguous runs, unique seq), every blob hash and the genesis. Problems → integrity with the list in detail.", "out": {"claims": "count", "blobs": "count", "actors": "count", "gaps": "[[actor, first missing seq, last missing seq]]", "problems": "[]"}},
-        "reindex": {"does": "Deletes and rebuilds the space's index from its logs; outstanding feed cursors expire.", "out": "the new index epoch"},
+        "verify": {"does": "Under each actor's write lock in turn (taking it first truncates a torn final line left by a crashed append), checks every claim of that actor (id, signature, space, chain within contiguous runs, unique seq); then every blob hash and the genesis. Problems → integrity with the list in detail.", "out": {"claims": "count", "blobs": "count", "actors": "count", "gaps": "[[actor, first missing seq, last missing seq]]", "problems": "[]"}},
+        "reindex": {"does": "Deletes and rebuilds this machine's index of the space from its logs; outstanding feed cursors expire.", "out": "the new index epoch"},
         "schema": {"does": "Prints this document."}
     })
 }

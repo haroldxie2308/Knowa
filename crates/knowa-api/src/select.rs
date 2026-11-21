@@ -1,6 +1,7 @@
 //! Space selection (DESIGN §6.1 `spaces`) and opening replicas/indexes.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use knowa_config::{Home, SpaceRef};
 use knowa_index::Index;
@@ -13,12 +14,19 @@ use crate::Sel;
 pub(crate) struct Space {
     pub sref: SpaceRef,
     pub replica: Replica,
+    /// this machine's state for the replica: its index and worker cursors
+    pub index_dir: PathBuf,
 }
 
 impl Space {
-    pub fn open(sref: SpaceRef) -> Result<Space> {
+    pub fn open(home: &Home, sref: SpaceRef) -> Result<Space> {
         let replica = Replica::open(&sref.path).map_err(|e| in_space(e, &sref))?;
-        Ok(Space { sref, replica })
+        Space::new(home, sref, replica)
+    }
+
+    pub fn new(home: &Home, sref: SpaceRef, replica: Replica) -> Result<Space> {
+        let index_dir = index_dir(home, &replica).map_err(|e| in_space(e, &sref))?;
+        Ok(Space { sref, replica, index_dir })
     }
 
     pub fn id(&self) -> &Id {
@@ -30,12 +38,10 @@ impl Space {
         describe(&self.sref)
     }
 
-    /// Opens (and catches up) the index. Catch-up writes to the index and must not
-    /// interleave with a writer's append → apply, so it runs under the replica lock,
-    /// which is released before returning.
+    /// Opens the index and catches it up with every actor's log, as a reader: it waits
+    /// only for a writer appending to an actor it must catch up (DESIGN §5.4).
     pub fn index(&self) -> Result<Index> {
-        let _lock = self.replica.lock()?;
-        Index::open(&self.replica)
+        Index::open(&self.replica, &self.index_dir)
     }
 
     /// Readonly replicas refuse local writes (DESIGN §7.3).
@@ -85,7 +91,13 @@ pub(crate) fn classify(spaces: &[String]) -> Result<Selection<'_>> {
 
 /// The caller's single space (writes, feed, admin ops).
 pub(crate) fn current(home: &Home, sel: &Sel) -> Result<Space> {
-    Space::open(home.resolve_space(sel.space.as_deref())?)
+    Space::open(home, home.resolve_space(sel.space.as_deref())?)
+}
+
+/// `<home>/index/<s_id>/<key>/`: this machine's index and worker cursors for a replica
+/// (DESIGN §5.2). Every registration of one location on one machine shares it.
+pub(crate) fn index_dir(home: &Home, replica: &Replica) -> Result<PathBuf> {
+    Ok(home.root().join("index").join(replica.manifest().space.as_str()).join(replica.location_key()?))
 }
 
 /// Resolves a `spaces` selection in order. Several replicas of the same space (e.g. an
@@ -110,7 +122,7 @@ pub(crate) fn select(home: &Home, sel: &Sel, spaces: &[String]) -> Result<Vec<Sp
     let mut first: HashMap<Id, usize> = HashMap::new();
     let mut out: Vec<Space> = Vec::with_capacity(refs.len());
     for r in refs {
-        let space = Space::open(r)?;
+        let space = Space::open(home, r)?;
         match first.get(space.id()) {
             None => {
                 first.insert(space.id().clone(), out.len());

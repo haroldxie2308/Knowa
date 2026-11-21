@@ -12,6 +12,9 @@ pub(crate) const INDEX_FILE: &str = "index.sqlite";
 pub(crate) const META_SCHEMA: &str = "schema_version";
 pub(crate) const META_EPOCH: &str = "epoch";
 pub(crate) const META_SPACE: &str = "space";
+/// The replica's rebuild generation the index was built against (DESIGN §5.4); absent
+/// for a replica that has none.
+pub(crate) const META_GENERATION: &str = "generation";
 
 /// Schema v2. `claims.n` is the local arrival number (DESIGN §6 feed) and the rowid
 /// of the claim's `claim_fts` row; `entities.n` is the rowid of `geo`.

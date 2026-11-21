@@ -49,7 +49,8 @@ pub(crate) fn worker_run(
     }
     let space = current(home, sel)?;
     space.ensure_writable()?;
-    let cursor_file = space.replica.index_dir()?.join("cursors").join(format!("{actor_name}.json"));
+    // Machine-local, next to the index whose epoch it names (DESIGN §7.1).
+    let cursor_file = space.index_dir.join("cursors").join(format!("{actor_name}.json"));
     let mut cursor = load_cursor(&cursor_file)?;
     let mut run = WorkerRunResult { batches: 0, claims_in: 0, claims_out: 0, cursor: String::new() };
     loop {
@@ -70,7 +71,7 @@ pub(crate) fn worker_run(
             run.batches += 1;
             run.claims_in += input.len() as u64;
             if !drafts.is_empty() {
-                let mut txn = Txn::begin(&space)?;
+                let mut txn = Txn::begin(&space, &[&actor])?;
                 run.claims_out += txn.write(&actor, drafts)?.created;
             }
         }
@@ -247,9 +248,10 @@ mod tests {
 
     #[test]
     fn expired_cursor_names_the_file() {
-        let e = expired(Error::cursor_expired("x"), Path::new("/r/.index/cursors/w.json"));
+        let file = Path::new("/home/index/s_x/k/cursors/w.json");
+        let e = expired(Error::cursor_expired("x"), file);
         assert_eq!(e.code, ErrorCode::CursorExpired);
-        assert!(e.message.contains("/r/.index/cursors/w.json"));
+        assert!(e.message.contains("/home/index/s_x/k/cursors/w.json"));
         let other = expired(Error::invalid("y"), Path::new("/f"));
         assert_eq!(other.message, "y");
     }

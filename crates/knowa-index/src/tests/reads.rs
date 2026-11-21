@@ -228,10 +228,10 @@ fn feed_is_arrival_order_and_persists_across_reopen() {
 
     let other_space = Id::new_space().unwrap();
     assert!(
-        crate::Index::open_existing(&path, &other_space, &w.owner(), dir.path()).unwrap().is_none(),
+        crate::Index::open_existing(&path, dir.path(), &other_space, &w.owner(), None).unwrap().is_none(),
         "an index of another space must be rebuilt"
     );
-    let mut idx = crate::Index::open_existing(&path, &w.space, &w.owner(), dir.path()).unwrap().unwrap();
+    let mut idx = crate::Index::open_existing(&path, dir.path(), &w.space, &w.owner(), None).unwrap().unwrap();
     assert_eq!(idx.epoch(), epoch, "reopening keeps the epoch");
     let c4 = w.label(G, &e, "four");
     apply(&mut idx, &[&c4]);
@@ -247,7 +247,7 @@ fn feed_is_arrival_order_and_persists_across_reopen() {
     assert_ne!(fresh.epoch(), epoch, "a rebuilt index gets a new epoch");
     assert!(fresh.feed(0, 10).unwrap().0.is_empty());
     drop(fresh);
-    assert!(crate::Index::open_existing(&path, &w.space, &w.owner(), dir.path()).unwrap().is_none(), "an unfinished build must be rebuilt");
+    assert!(crate::Index::open_existing(&path, dir.path(), &w.space, &w.owner(), None).unwrap().is_none(), "an unfinished build must be rebuilt");
 }
 
 #[test]
