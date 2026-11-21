@@ -25,9 +25,6 @@ pub const EXTRACT_ACTOR: &str = "extract";
 
 const CONFIG_FILE: &str = "config.json";
 const ACTORS_DIR: &str = "actors";
-/// The replica manifest's file name. knowa-store owns it, but this crate must not
-/// depend on the store; DESIGN §5 fixes the name.
-const MANIFEST_FILE: &str = "knowa.json";
 const PRIVATE_DIR: u32 = 0o700;
 const PRIVATE_FILE: u32 = 0o600;
 
@@ -44,11 +41,22 @@ pub fn validate_name(name: &str) -> Result<()> {
     }
 }
 
+/// One registration of a replica (DESIGN §5.2, §7). Locations are kept in canonical
+/// form (DESIGN §5.2): a directory's absolute path, or an object-store URL without a
+/// trailing `/`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpaceEntry {
-    /// absolute path of the replica directory
-    pub path: PathBuf,
+    /// the replica's canonical location
+    // Back-compat: homes written before object-store locations (v0, including the
+    // owner's trial home) store this as `path`, the canonical directory path, which is
+    // also its canonical location. Delete the alias once no such home is in use: a home
+    // is rewritten with `location` by any registry change (`space add`, `space use`, …).
+    #[serde(alias = "path")]
+    pub location: String,
+    /// the blob location, canonical, when the blobs do not live at `location`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blobs: Option<String>,
     pub space: Id,
     #[serde(default)]
     pub readonly: bool,
@@ -87,7 +95,10 @@ pub struct Actor {
 pub struct SpaceRef {
     /// registry alias, if the space is registered
     pub alias: Option<String>,
-    pub path: PathBuf,
+    /// the replica's canonical location
+    pub location: String,
+    /// the canonical blob location, when the blobs do not live at `location`
+    pub blobs: Option<String>,
     pub readonly: bool,
 }
 
@@ -272,11 +283,15 @@ impl Home {
         self.actor(&name)
     }
 
-    /// `selector` may be a registered alias or a directory path (containing knowa.json).
-    /// `None` → `config.current_space`. Nothing → `usage` naming `--space` /
-    /// `KNOWA_SPACE` / `knowa space use`. A path that is registered under an alias
-    /// resolves to that entry (so `readonly` applies).
-    pub fn resolve_space(&self, selector: Option<&str>) -> Result<SpaceRef> {
+    /// `selector` may be a registered alias or a replica location: a directory path or
+    /// an object-store URL (DESIGN §5.2). `None` → `config.current_space`. Nothing →
+    /// `usage` naming `--space` / `KNOWA_SPACE` / `knowa space use`. A selector that is
+    /// not an alias goes through `canonical`, which gives its canonical location (or
+    /// fails, e.g. `not_found` for a missing directory): this crate cannot parse
+    /// locations, which knowa-store owns. A location registered under an alias resolves
+    /// to that entry (so `readonly` and the blob location apply). Whether a replica is
+    /// there is for the caller to find out when it opens it.
+    pub fn resolve_space(&self, selector: Option<&str>, canonical: impl FnOnce(&str) -> Result<String>) -> Result<SpaceRef> {
         let config = self.load_config()?;
         let selector = match selector {
             Some(s) => s.to_string(),
@@ -287,22 +302,11 @@ impl Home {
         if let Some(entry) = config.spaces.get(&selector) {
             return Ok(entry_ref(&selector, entry));
         }
-        let path = match fs::canonicalize(&selector) {
-            Ok(p) => p,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Err(Error::not_found(format!(
-                    "{selector:?} is neither a registered space alias nor an existing directory"
-                )));
-            }
-            Err(e) => return Err(io_err(Path::new(&selector), e)),
-        };
-        if !path.join(MANIFEST_FILE).is_file() {
-            return Err(Error::not_found(format!("{} is not a Knowa replica (no {MANIFEST_FILE})", path.display())));
-        }
-        if let Some((alias, entry)) = config.spaces.iter().find(|(_, e)| e.path == path) {
+        let location = canonical(&selector)?;
+        if let Some((alias, entry)) = config.spaces.iter().find(|(_, e)| e.location == location) {
             return Ok(entry_ref(alias, entry));
         }
-        Ok(SpaceRef { alias: None, path, readonly: false })
+        Ok(SpaceRef { alias: None, location, blobs: None, readonly: false })
     }
 
     /// All registered spaces as SpaceRefs (for `spaces: ["*"]`).
@@ -310,38 +314,47 @@ impl Home {
         Ok(self.load_config()?.spaces.iter().map(|(alias, e)| entry_ref(alias, e)).collect())
     }
 
-    /// Registers `path` (canonicalized) under `alias`. Alias taken by another path →
-    /// `conflict`; same path re-registered → updates `readonly`.
-    pub fn register_space(&self, alias: &str, path: &Path, space: &Id, readonly: bool) -> Result<()> {
+    /// Registers the replica at `location` under `alias`, with its blobs at `blobs`
+    /// (`None`: at `location`). Both are canonical locations (DESIGN §5.2), which the
+    /// caller computes: this crate cannot parse locations. Alias taken by another
+    /// location → `conflict`; location registered under another alias → `conflict`;
+    /// same location re-registered → updates `readonly`, but with another blob
+    /// location → `conflict` (every registration of a replica gives the same one).
+    pub fn register_space(&self, alias: &str, location: &str, blobs: Option<&str>, space: &Id, readonly: bool) -> Result<()> {
         validate_name(alias)?;
         if space.kind() != IdKind::Space {
             return Err(Error::invalid(format!("{space} is not a space id")));
         }
-        let path = match fs::canonicalize(path) {
-            Ok(p) => p,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Err(Error::not_found(format!("{} does not exist", path.display())));
-            }
-            Err(e) => return Err(io_err(path, e)),
-        };
         let mut config = self.load_config()?;
-        if let Some((other, _)) = config.spaces.iter().find(|(a, e)| e.path == path && a.as_str() != alias) {
-            return Err(Error::conflict(format!("{} is already registered as {other:?}", path.display())));
+        if let Some((other, _)) = config.spaces.iter().find(|(a, e)| e.location == location && a.as_str() != alias) {
+            return Err(Error::conflict(format!("{location} is already registered as {other:?}")));
         }
         match config.spaces.get_mut(alias) {
-            Some(e) if e.path != path => {
-                return Err(Error::conflict(format!("alias {alias:?} is taken by {}", e.path.display())));
+            Some(e) if e.location != location => {
+                return Err(Error::conflict(format!("alias {alias:?} is taken by {}", e.location)));
             }
             Some(e) if e.space != *space => {
                 return Err(Error::conflict(format!(
-                    "alias {alias:?} at {} is registered for space {}, not {space}",
-                    path.display(),
+                    "alias {alias:?} at {location} is registered for space {}, not {space}",
                     e.space
+                )));
+            }
+            Some(e) if e.blobs.as_deref() != blobs => {
+                return Err(Error::conflict(format!(
+                    "alias {alias:?} at {location} is registered with its blobs at {}, not {}",
+                    e.blobs.as_deref().unwrap_or(location),
+                    blobs.unwrap_or(location)
                 )));
             }
             Some(e) => e.readonly = readonly,
             None => {
-                config.spaces.insert(alias.to_string(), SpaceEntry { path, space: space.clone(), readonly });
+                let entry = SpaceEntry {
+                    location: location.to_string(),
+                    blobs: blobs.map(str::to_string),
+                    space: space.clone(),
+                    readonly,
+                };
+                config.spaces.insert(alias.to_string(), entry);
             }
         }
         self.save_config(&config)
@@ -378,7 +391,7 @@ impl Home {
 }
 
 fn entry_ref(alias: &str, e: &SpaceEntry) -> SpaceRef {
-    SpaceRef { alias: Some(alias.to_string()), path: e.path.clone(), readonly: e.readonly }
+    SpaceRef { alias: Some(alias.to_string()), location: e.location.clone(), blobs: e.blobs.clone(), readonly: e.readonly }
 }
 
 fn io_err(path: &Path, e: io::Error) -> Error {

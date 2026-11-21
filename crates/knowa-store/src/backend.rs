@@ -42,14 +42,20 @@ pub(crate) trait Logs: Send + Sync {
     /// The location, for messages.
     fn describe(&self) -> String;
 
-    /// The canonical location (DESIGN §5.2): the absolute path of a directory, the URL
-    /// of an object store without a trailing `/`.
-    fn canonical_location(&self) -> Result<String>;
+    /// Whether `lock_exclusive` keeps every other writer of the actor out (a directory).
+    /// `false` for a store without locks: two writers of one actor may both read its
+    /// head, and the loser's `append` fails with `conflict` (DESIGN §5.3).
+    fn exclusive_locks(&self) -> bool;
+
+    /// Readies the location for a new replica, before anything is written: it must not
+    /// exist or hold nothing (`conflict` otherwise).
+    fn prepare(&self) -> Result<()>;
 
     /// `knowa.json`; `None` when absent.
     fn read_manifest(&self) -> Result<Option<Vec<u8>>>;
 
-    /// Writes `knowa.json` whole, atomically.
+    /// Writes `knowa.json` whole, atomically, once (DESIGN §5: it never changes). A
+    /// store that can create an object only if absent does so: present → `conflict`.
     fn write_manifest(&self, bytes: &[u8]) -> Result<()>;
 
     /// `generation` (DESIGN §5.4); `None` when absent.
@@ -95,6 +101,10 @@ pub(crate) trait Logs: Send + Sync {
 
 /// The blob location: raw bytes addressed by their hash.
 pub(crate) trait Blobs: Send + Sync {
+    /// Readies the blob location of a new replica. It may already hold blobs: they are
+    /// addressed by their hash, so replicas can share one.
+    fn prepare(&self) -> Result<()>;
+
     /// Accepts a `b_` id with or without fragment; the fragment is ignored. Another
     /// kind of id → `invalid`.
     fn has(&self, id: &Id) -> Result<bool>;
@@ -102,8 +112,13 @@ pub(crate) trait Blobs: Send + Sync {
     /// Size of a stored blob; absent → `not_found`.
     fn len(&self, id: &Id) -> Result<u64>;
 
-    /// The bytes of a stored blob; absent → `not_found`.
+    /// The bytes of a stored blob, checked against its id where they pass through a
+    /// cache (`integrity` otherwise); absent → `not_found`.
     fn open(&self, id: &Id) -> Result<Box<dyn Read + Send>>;
+
+    /// The bytes as the blob location holds them, never from a cache and unchecked: for
+    /// `verify`, which hashes them itself; absent → `not_found`.
+    fn open_raw(&self, id: &Id) -> Result<Box<dyn Read + Send>>;
 
     /// A local file holding the bytes of a stored blob, for readers that need a path;
     /// absent → `not_found`. Callers must not modify it.

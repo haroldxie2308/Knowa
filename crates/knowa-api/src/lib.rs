@@ -10,6 +10,9 @@ use knowa_model::query::{BlobPutResult, FeedResult, QueryDoc, QueryResult, Where
 use knowa_model::{Draft, Error, ErrorCode, Id, IdKind, Result, Visibility, vocab};
 use serde::Serialize;
 
+/// Where a replica or its blobs live (DESIGN §5.2): `init` and `space add` take it.
+pub use knowa_store::Location;
+
 mod admin;
 mod context;
 mod feed;
@@ -24,6 +27,8 @@ mod select;
 mod test_graph;
 mod worker;
 mod write;
+#[cfg(test)]
+mod write_race;
 
 /// Space/actor selectors as given by the caller (flag or env), unresolved.
 #[derive(Debug, Clone, Default)]
@@ -36,7 +41,14 @@ pub struct Sel {
 #[serde(rename_all = "camelCase")]
 pub struct InitResult {
     pub space: Id,
-    pub path: PathBuf,
+    /// The replica's canonical location (DESIGN §5.2). Its JSON key stays `path`, as
+    /// --json output evolves additively (DESIGN §6.4); for a directory it is the same
+    /// absolute path as before.
+    #[serde(rename = "path")]
+    pub location: String,
+    /// the canonical blob location, when it is not the replica's
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blobs: Option<String>,
     pub alias: String,
     pub owner: Id,
     /// the built-in extract worker, granted Worker + autoAccept
@@ -163,7 +175,12 @@ pub struct ImportResult {
 pub struct SpaceAddResult {
     pub alias: String,
     pub space: Id,
-    pub path: PathBuf,
+    /// the replica's canonical location; JSON key `path`, as in `InitResult`
+    #[serde(rename = "path")]
+    pub location: String,
+    /// the canonical blob location, when it is not the replica's
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blobs: Option<String>,
     pub readonly: bool,
 }
 
@@ -187,7 +204,9 @@ impl Knowa {
     /// `invalid`: only the system writes it); if this is the actor's first claim in
     /// the space, prepend a `knowa:actorKind` claim; dedupe via equivalence key (same
     /// actor, active and not stale → `created:false`, nothing appended); seal; append; apply
-    /// to the index. All-or-nothing per call.
+    /// to the index. All-or-nothing per call. On an object store, where another
+    /// writer of the actor can append first, the write is redone on the new head, at
+    /// most 3 times in all before it fails with `conflict` (DESIGN §5.3).
     pub fn write(&self, sel: &Sel, drafts: Vec<Draft>) -> Result<WriteResult> {
         let space = select::current(&self.home, sel)?;
         let actor = self.home.resolve_actor(sel.actor.as_deref())?;
@@ -243,12 +262,21 @@ impl Knowa {
 
     // ---------- admin & composite ops ----------
 
-    /// Creates a space at `dir`, writes genesis (`knowa:owner`), the owner's actorKind,
-    /// `knowa:label` = name on the space id, grants the extract actor `knowa:Worker` +
-    /// `knowa:autoAccept true`, registers `alias` (default: dir basename) and makes it
+    /// Creates a space at `location` (a new or empty directory, or an empty object
+    /// location), its blobs at `blobs` when given (DESIGN §5.2 `--blobs`), writes
+    /// genesis (`knowa:owner`), the owner's actorKind, `knowa:label` = name on the space
+    /// id, grants the extract actor `knowa:Worker` + `knowa:autoAccept true`, registers
+    /// `alias` (default: the location's last name) with both locations and makes it
     /// current if no current space is set.
-    pub fn init(&self, sel: &Sel, dir: &Path, name: &str, alias: Option<&str>) -> Result<InitResult> {
-        admin::init(&self.home, sel, dir, name, alias)
+    pub fn init(
+        &self,
+        sel: &Sel,
+        location: &Location,
+        blobs: Option<&Location>,
+        name: &str,
+        alias: Option<&str>,
+    ) -> Result<InitResult> {
+        admin::init(&self.home, sel, location, blobs, name, alias)
     }
 
     /// Ingests files/directories (recursive; hidden files skipped and NOT silently:
@@ -313,11 +341,17 @@ impl Knowa {
         admin::reindex(&self.home, sel)
     }
 
-    /// Registers an existing replica directory under `alias` (default: the space's label
-    /// slugified, else the directory name). Local config only; writes no claims. Same
-    /// identity rule as `import`.
-    pub fn space_add(&self, dir: &Path, alias: Option<&str>, readonly: bool) -> Result<SpaceAddResult> {
-        admin::space_add(&self.home, dir, alias, readonly)
+    /// Registers the existing replica at `location`, its blobs at `blobs` when given,
+    /// under `alias` (default: the space's label slugified, else the location's last
+    /// name). Local config only; writes no claims. Same identity rule as `import`.
+    pub fn space_add(
+        &self,
+        location: &Location,
+        blobs: Option<&Location>,
+        alias: Option<&str>,
+        readonly: bool,
+    ) -> Result<SpaceAddResult> {
+        admin::space_add(&self.home, location, blobs, alias, readonly)
     }
 }
 

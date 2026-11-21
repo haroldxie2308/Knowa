@@ -238,7 +238,7 @@ Directory locations add `log/<actor-id>/.lock`, the actor's advisory lock (§5.3
 | directory | a path; also a mounted shared filesystem (JuiceFS, NFS) | local disk: as v0. Shared by several machines: experimental |
 | object store | `s3://bucket/prefix`: S3 and S3-compatible stores (R2, MinIO, …) | experimental |
 
-- **Credentials** and the endpoint of an object store come from the environment, in the S3 client's standard variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ENDPOINT` for stores other than AWS, …). They are never written to the home config or to a replica. When one is missing, opening the replica fails with a `usage` error that names it.
+- **Credentials** and the endpoint of an object store come from the environment, in the S3 client's standard variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ENDPOINT` for stores other than AWS, …). They are never written to the home config or to a replica. A missing region fails at open with a `usage` error naming `AWS_REGION` / `AWS_DEFAULT_REGION`; refused credentials are a `usage` error naming the key variables. Without key variables the client tries web identity, the ECS/EKS endpoint and then instance metadata; it does not read `~/.aws` profiles (`AWS_PROFILE` is ignored), so on a laptop set the key variables.
 - **`init <location>` and `space add <location>`** take either form, plus `--blobs <location>`. The blob location belongs to a machine's registration of the replica, not to the space. Every machine that registers the replica must give the same blob location.
 - **The index and the feed cursors** of a replica live in `$KNOWA_HOME/index/<s_id>/<key>/`. `<key>` is the first 16 characters of b32(sha256(canonical location)), where the canonical location is the absolute path of a directory or the URL without a trailing `/`. Two registrations of one location on one machine therefore share one index.
 - **Object-store blob bytes** staged for upload or downloaded for reading are cached in `$KNOWA_HOME/cache/blobs/`. *(later: cache eviction.)*
@@ -247,8 +247,8 @@ Directory locations add `log/<actor-id>/.lock`, the actor's advisory lock (§5.3
 
 - **Write path:**
   1. Take the actor's write exclusivity.
-  2. Bring the local index up to date for that actor.
-  3. Read the actor's head (last seq and id).
+  2. Read the actor's head (last seq and id).
+  3. Bring the local index up to date for that actor, at least to that head. In this order: on an object store another writer may append after step 2, and then step 5 loses; read the other way round, an append between the two steps would leave its claims below this write's seqs, where catch-up never looks.
   4. Build, validate and sign the claims.
   5. Append them as one batch.
   6. Apply them to the local index.
@@ -265,6 +265,8 @@ Directory locations add `log/<actor-id>/.lock`, the actor's advisory lock (§5.3
   - A batch is one new segment object, `log/<actor>/<first seq>.jsonl`, created only if absent (`If-None-Match: *`). Two writers racing for an actor's next seq create the same key, and exactly one succeeds.
   - The loser reads the head again, rebuilds and re-signs its claims, and retries. After 3 attempts in total it fails with `conflict`.
   - Segment objects are never modified, and nothing rotates. *(later: compaction of small segments)*
+  - An object is written whole, so a segment object whose last line is unterminated is damaged, not an append in progress: readers report it as `integrity`.
+  - `merge` takes no lock here either. Its runs are created only if absent, like appends, but a run that starts above the actor's head and an append from the head can use different keys and both succeed, leaving two claims at one seq. That needs the actor to have written different claims at the same seqs in two replicas, a fork, which no Knowa writer does; readers then report the actor's log as `integrity`. Two machines importing the same bundle at once: one of them fails with `integrity` on the run the other created, and running it again skips what is present.
 - **One writer per actor is the norm.** Racing writes of one actor stay correct but waste work, so give each agent process its own actor.
 - **Blob path.** Bytes are hashed while they are staged. They become visible under an id only once their hash is known and equals that id, so a source that changes during the copy can never be stored under the wrong id.
   - *Directory.* The bytes go to a temp file inside `blobs/`, which is hashed and then renamed to its id. If the id is already present, the temp file is discarded, so each byte sequence is stored once per replica. `put` creates the temp file as a copy-on-write clone of the source where the filesystem supports it (APFS, same volume); elsewhere it is a byte copy.

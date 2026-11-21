@@ -1,19 +1,23 @@
 //! The write primitive (DESIGN §4.4, §5.3 "write path", §6).
 //!
-//! `Txn` holds the locks of the actors it writes as and an index caught up with
-//! their logs. Every claim the api appends — `Knowa::write`, ingest, extractors,
-//! workers, `init` — goes through `Txn::write`, so placeholder minting, the actorKind
-//! prelude, idempotency and chaining have exactly one implementation.
+//! `Txn` holds the locks of the actors it writes as and their index. Every claim the
+//! api appends — `Knowa::write`, ingest, extractors, workers, `init` — goes through
+//! `Txn::write`, so placeholder minting, the actorKind prelude, idempotency and
+//! chaining have exactly one implementation.
 
 use std::collections::{BTreeMap, HashMap};
 
 use knowa_config::Actor;
 use knowa_index::Index;
 use knowa_model::query::{Order, View, Where, WriteItem, WriteResult};
-use knowa_model::{ClaimBody, Draft, Error, Id, Result, Status, Term, Timestamp, Value, vocab};
+use knowa_model::{ClaimBody, Draft, Error, ErrorCode, Id, Result, Status, Term, Timestamp, Value, vocab};
 use knowa_store::ActorLock;
 
 use crate::select::Space;
+
+/// Attempts at one write, in all, where another writer of the actor can append first
+/// (an object store, DESIGN §5.3): the loser redoes its write on the new head.
+pub(crate) const WRITE_ATTEMPTS: u32 = 3;
 
 /// One write call's outcome, plus what composite ops (`init`, `put`, workers) need.
 pub(crate) struct Written {
@@ -22,6 +26,15 @@ pub(crate) struct Written {
     pub prelude: Option<Id>,
     /// number of the caller's drafts that produced a new claim
     pub created: u64,
+}
+
+/// How one attempt at a write ended.
+enum Attempt {
+    /// the batch is appended and applied: the items for the caller's drafts, and the
+    /// actorKind prelude's id if one was written
+    Done { items: Vec<WriteItem>, prelude: Option<Id>, created: u64 },
+    /// another writer of the actor appended first; nothing of this attempt was written
+    Lost(Error),
 }
 
 pub(crate) struct Txn<'a> {
@@ -37,24 +50,30 @@ impl<'a> Txn<'a> {
     ///   taken: a rebuild reads every actor's log and may wait for other writers,
     ///   which a writer holding its own actor lock must never do;
     /// - takes the locks of `actors` in ascending id order, the one order every
-    ///   writer uses, so two writers cannot wait for each other;
-    /// - catches the index up with those actors' logs only (the index lock is held
-    ///   for each apply, never while waiting for an actor lock).
+    ///   writer uses, so two writers cannot wait for each other.
     ///
-    /// The locks are held until the `Txn` is dropped.
+    /// Each `write` catches the index up with its actor's log. The locks are held until
+    /// the `Txn` is dropped.
     pub fn begin(space: &'a Space, actors: &[&Actor]) -> Result<Txn<'a>> {
         space.ensure_writable()?;
         let mut ids: Vec<Id> = actors.iter().map(|a| a.id.clone()).collect();
         ids.sort();
         ids.dedup();
-        let mut index = Index::load(&space.replica, &space.index_dir)?;
+        let index = Index::load(&space.replica, &space.index_dir)?;
         let locks = ids.iter().map(|id| space.replica.lock_actor(id)).collect::<Result<Vec<_>>>()?;
-        index.catch_up_actors(&space.replica, &ids)?;
         Ok(Txn { space, locks, index })
     }
 
     /// All-or-nothing: every draft is validated, resolved and sealed before anything
     /// is appended, and the store's append writes nothing on error.
+    ///
+    /// Where another writer of the actor can append first (`Replica::writers_can_race`:
+    /// an object store), an append that loses with `conflict` is redone (DESIGN §5.3):
+    /// the head is read again, the index caught up with it, the plan redone (the other
+    /// writer may have written an equivalent claim), and the claims rebuilt and signed
+    /// again; after `WRITE_ATTEMPTS` attempts in all the `conflict` is returned. A
+    /// directory's lock keeps other writers out, so there a `conflict` is returned at
+    /// once.
     pub fn write(&mut self, actor: &Actor, drafts: Vec<Draft>) -> Result<Written> {
         if drafts.is_empty() {
             return Err(Error::invalid("write: no drafts"));
@@ -80,24 +99,51 @@ impl<'a> Txn<'a> {
             .map(|(i, d)| d.resolve(&minted).map_err(|e| at_draft(e, i)))
             .collect::<Result<Vec<_>>>()?;
 
+        let mut attempt = 1;
+        let (items, prelude, created) = loop {
+            match self.attempt(actor, &resolved)? {
+                Attempt::Done { items, prelude, created } => break (items, prelude, created),
+                Attempt::Lost(_) if attempt < WRITE_ATTEMPTS => attempt += 1,
+                Attempt::Lost(mut e) => {
+                    e.message = format!("{} (gave up after {WRITE_ATTEMPTS} attempts)", e.message);
+                    return Err(e);
+                }
+            }
+        };
+        let placeholders = minted.into_iter().map(|(p, e)| (p.as_str().to_string(), e)).collect();
+        Ok(Written { result: WriteResult { items, placeholders }, prelude, created })
+    }
+
+    /// One attempt at `write`'s resolved drafts, on the actor's head as it is now
+    /// (DESIGN §5.3 write path, steps 2–6).
+    fn attempt(&mut self, actor: &Actor, resolved: &[Draft]) -> Result<Attempt> {
+        let space = self.space;
+        let lock = lock_of(&self.locks, actor)?;
+        // The head first, then the index up to it. The claims chain onto this head, so
+        // the index must hold every claim up to it before they are applied over them:
+        // catch-up resumes above the highest indexed seq and would never see a claim
+        // left below. Under a directory's lock nothing moves and the catch-up finds
+        // nothing new. On an object store another writer may append after the head was
+        // read; then the append below loses with `conflict`.
+        let head = space.replica.head(lock)?;
+        self.index.catch_up_actors(&space.replica, std::slice::from_ref(&actor.id))?;
+
         // Prelude (DESIGN §4.6): an actor's kind is self-declared by its first claim in
         // the space, prepended to the batch.
-        let kind_draft = actor_kind_draft(actor)?;
         let needs_prelude = !self.has_declared_kind(actor)?;
         let mut entries = Vec::with_capacity(resolved.len() + 1);
         if needs_prelude {
-            entries.push(kind_draft);
+            entries.push(actor_kind_draft(actor)?);
         }
         let first_user = entries.len();
-        entries.extend(resolved);
+        entries.extend(resolved.iter().cloned());
 
         let keys = entries.iter().map(Draft::equiv_key).collect::<Result<Vec<_>>>()?;
         let index = &self.index;
         let plan = plan_batch(&keys, |k| Ok(index.equivalent(&actor.id, k)?.map(|cv| cv.claim.id)))?;
 
-        let lock = lock_of(&self.locks, actor)?;
-        let space_id = self.space.id().clone();
-        let (mut seq, mut prev) = match self.space.replica.head(lock)? {
+        let space_id = space.id().clone();
+        let (mut seq, mut prev) = match head {
             Some(h) => (h.seq, Some(h.id)),
             None => (0, None),
         };
@@ -123,10 +169,18 @@ impl<'a> Txn<'a> {
         }
 
         if !claims.is_empty() {
-            self.space.replica.append(lock, &claims)?;
+            match space.replica.append(lock, &claims) {
+                Ok(()) => {}
+                // Another writer of the actor appended first, which only a store without
+                // locks lets happen. Nothing of this batch was written.
+                Err(e) if e.code == ErrorCode::Conflict && space.replica.writers_can_race() => {
+                    return Ok(Attempt::Lost(e));
+                }
+                Err(e) => return Err(e),
+            }
             // From here the claims are durable. If apply fails the error propagates and
             // the next catch-up applies them from the log (DESIGN §5.4).
-            self.index.apply(&self.space.replica, &claims)?;
+            self.index.apply(&space.replica, &claims)?;
         }
 
         let user_ids = &ids[first_user..];
@@ -142,12 +196,7 @@ impl<'a> Txn<'a> {
             created += u64::from(is_new);
             items.push(WriteItem { id: id.clone(), created: is_new, status });
         }
-        let placeholders = minted.into_iter().map(|(p, e)| (p.as_str().to_string(), e)).collect();
-        Ok(Written {
-            result: WriteResult { items, placeholders },
-            prelude: needs_prelude.then(|| ids[0].clone()),
-            created,
-        })
+        Ok(Attempt::Done { items, prelude: needs_prelude.then(|| ids[0].clone()), created })
     }
 
     /// The bytes of `blob` were just stored. Claims about it may already be indexed

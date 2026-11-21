@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-use knowa_api::{Knowa, PutOptions, Sel};
+use knowa_api::{Knowa, Location, PutOptions, Sel};
 use knowa_config::Home;
 use knowa_model::query::{
     ContextDoc, FindDoc, GetDoc, LogDoc, Near, NearId, Order, PathDoc, QueryDoc, Target, View, WhenRange, Where,
@@ -75,7 +75,9 @@ fn dispatch(cmd: Cmd, g: &Globals, out: &mut Out) -> Result<Finished> {
     // Every verb but `put` either completes or fails.
     let completed = match cmd {
         Cmd::Init(a) => {
-            let r = g.knowa()?.init(&g.sel, &a.dir, &a.name, a.alias.as_deref())?;
+            let location = Location::parse(&a.location)?;
+            let blobs = a.blobs.as_deref().map(Location::parse).transpose()?;
+            let r = g.knowa()?.init(&g.sel, &location, blobs.as_ref(), &a.name, a.alias.as_deref())?;
             out.result(|| json_of!(&r), || Ok(render::fields(&json_of!(&r)?)))
         }
         Cmd::Space(c) => space(c, g, out),
@@ -413,25 +415,34 @@ fn space(c: SpaceCmd, g: &Globals, out: &mut Out) -> Result<()> {
             let mut items = Vec::new();
             let mut lines = Vec::new();
             for (alias, e) in &cfg.spaces {
-                items.push(json!({
+                // `path` holds the canonical location, as in `init`'s and `space add`'s
+                // results; `blobs` is added only when the registration has one.
+                let mut item = json!({
                     "alias": alias,
                     "space": e.space,
-                    "path": json_of!(&e.path)?,
+                    "path": e.location,
                     "readonly": e.readonly,
-                }));
+                });
+                if let Some(blobs) = &e.blobs {
+                    item["blobs"] = json!(blobs);
+                }
+                items.push(item);
                 lines.push(format!(
-                    "{} {alias}  {}  {}{}",
+                    "{} {alias}  {}  {}{}{}",
                     if current == Some(alias.as_str()) { "*" } else { " " },
                     e.space,
-                    e.path.display(),
+                    e.location,
+                    e.blobs.as_ref().map(|b| format!("  (blobs at {b})")).unwrap_or_default(),
                     if e.readonly { "  (readonly)" } else { "" },
                 ));
             }
             out.result(|| Ok(json!({ "current": current, "spaces": items })), || Ok(lines))
         }
-        SpaceCmd::Add { dir, alias, readonly } => {
-            let r = g.knowa()?.space_add(&dir, alias.as_deref(), readonly)?;
-            let line = format!("added space {} ({}) at {}", r.alias, r.space, r.path.display());
+        SpaceCmd::Add { location, alias, readonly, blobs } => {
+            let location = Location::parse(&location)?;
+            let blobs = blobs.as_deref().map(Location::parse).transpose()?;
+            let r = g.knowa()?.space_add(&location, blobs.as_ref(), alias.as_deref(), readonly)?;
+            let line = format!("added space {} ({}) at {}", r.alias, r.space, r.location);
             out.result(|| json_of!(&r), || Ok(vec![line]))
         }
         SpaceCmd::Rm { alias } => {

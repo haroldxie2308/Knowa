@@ -5,8 +5,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use knowa_config::{EXTRACT_ACTOR, Home, SpaceRef, validate_name};
-use knowa_model::{ActorKind, ErrorCode, Id};
+use knowa_config::{EXTRACT_ACTOR, Home, SpaceEntry, SpaceRef, validate_name};
+use knowa_model::{ActorKind, Error, ErrorCode, Id, Result};
 
 struct Scratch(PathBuf);
 
@@ -35,12 +35,26 @@ fn mode(p: &Path) -> u32 {
     fs::metadata(p).unwrap().permissions().mode() & 0o777
 }
 
-/// A directory that looks like a replica to the registry (it only checks for the manifest).
-fn replica_dir(s: &Scratch, rel: &str) -> PathBuf {
-    let dir = s.path(rel);
-    fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("knowa.json"), b"{}").unwrap();
-    fs::canonicalize(dir).unwrap()
+/// Stands in for knowa-store's `Location::canonical`, which this crate cannot use:
+/// drops trailing `/`s, and knows nothing at `missing`.
+fn canonical(selector: &str) -> Result<String> {
+    if selector.starts_with("s3://bucket/missing") {
+        return Err(Error::not_found(format!("{selector} does not exist")));
+    }
+    Ok(selector.trim_end_matches('/').to_string())
+}
+
+fn unreachable_canonical(selector: &str) -> Result<String> {
+    panic!("an alias was looked up as a location: {selector}")
+}
+
+fn space_ref(alias: Option<&str>, location: &str, blobs: Option<&str>, readonly: bool) -> SpaceRef {
+    SpaceRef {
+        alias: alias.map(str::to_string),
+        location: location.to_string(),
+        blobs: blobs.map(str::to_string),
+        readonly,
+    }
 }
 
 #[test]
@@ -120,46 +134,67 @@ fn actor_selection() {
 fn space_registry_and_resolution() {
     let s = Scratch::new("spaces");
     let home = open_home(&s);
-    let photos = replica_dir(&s, "photos");
+    let photos = "s3://bucket/photos";
+    let bulk = "s3://bucket/bulk";
     let space = Id::new_space().unwrap();
-    assert_eq!(home.resolve_space(None).unwrap_err().code, ErrorCode::Usage);
+    assert_eq!(home.resolve_space(None, canonical).unwrap_err().code, ErrorCode::Usage);
 
-    // Registered through a non-canonical path; stored canonical.
-    home.register_space("pics", &s.path("photos/../photos"), &space, false).unwrap();
-    let by_alias = home.resolve_space(Some("pics")).unwrap();
-    assert_eq!(by_alias, SpaceRef { alias: Some("pics".into()), path: photos.clone(), readonly: false });
+    home.register_space("pics", photos, Some(bulk), &space, false).unwrap();
+    let by_alias = home.resolve_space(Some("pics"), unreachable_canonical).unwrap();
+    assert_eq!(by_alias, space_ref(Some("pics"), photos, Some(bulk), false));
 
-    // A path that is registered resolves to its entry, so `readonly` applies.
-    home.register_space("pics", &photos, &space, true).unwrap();
-    let by_path = home.resolve_space(Some(photos.to_str().unwrap())).unwrap();
-    assert_eq!(by_path, SpaceRef { alias: Some("pics".into()), path: photos.clone(), readonly: true });
+    // A location that is registered resolves to its entry, matched in canonical form,
+    // so `readonly` and the blob location apply.
+    home.register_space("pics", photos, Some(bulk), &space, true).unwrap();
+    let by_location = home.resolve_space(Some("s3://bucket/photos/"), canonical).unwrap();
+    assert_eq!(by_location, space_ref(Some("pics"), photos, Some(bulk), true));
 
-    let elsewhere = replica_dir(&s, "elsewhere");
-    assert_eq!(home.register_space("pics", &elsewhere, &space, false).unwrap_err().code, ErrorCode::Conflict);
-    assert_eq!(home.register_space("again", &photos, &space, false).unwrap_err().code, ErrorCode::Conflict);
+    let elsewhere = "s3://bucket/elsewhere";
+    assert_eq!(home.register_space("pics", elsewhere, None, &space, false).unwrap_err().code, ErrorCode::Conflict);
+    assert_eq!(home.register_space("again", photos, Some(bulk), &space, false).unwrap_err().code, ErrorCode::Conflict);
     assert_eq!(
-        home.register_space("pics", &photos, &Id::new_space().unwrap(), false).unwrap_err().code,
+        home.register_space("pics", photos, Some(bulk), &Id::new_space().unwrap(), false).unwrap_err().code,
         ErrorCode::Conflict
     );
+    // DESIGN §5.2: every registration of a replica gives the same blob location.
+    assert_eq!(home.register_space("pics", photos, None, &space, true).unwrap_err().code, ErrorCode::Conflict);
 
-    // Unregistered replica path: resolves without an alias.
-    let loose = home.resolve_space(Some(elsewhere.to_str().unwrap())).unwrap();
-    assert_eq!(loose, SpaceRef { alias: None, path: elsewhere, readonly: false });
+    // Unregistered location: resolves without an alias, its blobs at the location.
+    let loose = home.resolve_space(Some(elsewhere), canonical).unwrap();
+    assert_eq!(loose, space_ref(None, elsewhere, None, false));
 
-    let plain = s.path("plain");
-    fs::create_dir_all(&plain).unwrap();
-    assert_eq!(home.resolve_space(Some(plain.to_str().unwrap())).unwrap_err().code, ErrorCode::NotFound);
-    assert_eq!(home.resolve_space(Some("no-such-alias")).unwrap_err().code, ErrorCode::NotFound);
+    // Neither an alias nor a location that exists.
+    let err = home.resolve_space(Some("s3://bucket/missing"), canonical).unwrap_err();
+    assert_eq!(err.code, ErrorCode::NotFound);
 
     assert_eq!(home.set_current_space("nope").unwrap_err().code, ErrorCode::NotFound);
     home.set_current_space("pics").unwrap();
-    assert_eq!(home.resolve_space(None).unwrap().alias.as_deref(), Some("pics"));
+    assert_eq!(home.resolve_space(None, unreachable_canonical).unwrap().alias.as_deref(), Some("pics"));
     assert_eq!(home.all_spaces().unwrap().len(), 1);
 
     home.unregister_space("pics").unwrap();
-    assert_eq!(home.resolve_space(None).unwrap_err().code, ErrorCode::Usage);
+    assert_eq!(home.resolve_space(None, canonical).unwrap_err().code, ErrorCode::Usage);
     assert_eq!(home.unregister_space("pics").unwrap_err().code, ErrorCode::NotFound);
     assert!(home.all_spaces().unwrap().is_empty());
+}
+
+/// A v0 home registered a directory under `path`; it reads as that location, and the
+/// next save writes `location`.
+#[test]
+fn v0_registry_entries_read_their_path_as_the_location() {
+    let s = Scratch::new("v0-home");
+    let home = open_home(&s);
+    let space = Id::new_space().unwrap();
+    let v0 = format!(r#"{{"currentSpace":"main","spaces":{{"main":{{"path":"/srv/knowa/main","space":"{space}"}}}}}}"#);
+    fs::write(s.path("home/config.json"), v0).unwrap();
+    let config = home.load_config().unwrap();
+    let entry = SpaceEntry { location: "/srv/knowa/main".into(), blobs: None, space: space.clone(), readonly: false };
+    assert_eq!(config.spaces["main"], entry);
+    assert_eq!(home.resolve_space(None, unreachable_canonical).unwrap(), space_ref(Some("main"), "/srv/knowa/main", None, false));
+
+    home.save_config(&config).unwrap();
+    let saved = fs::read_to_string(s.path("home/config.json")).unwrap();
+    assert!(saved.contains(r#""location": "/srv/knowa/main""#) && !saved.contains(r#""path""#), "{saved}");
 }
 
 #[test]

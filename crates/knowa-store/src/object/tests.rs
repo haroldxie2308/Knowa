@@ -1,0 +1,416 @@
+//! The object-store backend against `object_store`'s in-memory store: layout, racing
+//! appends, merges and the generation, blobs through the cache, split blob locations,
+//! corrupted downloads, and the S3 client's required region.
+
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
+
+use knowa_model::vocab::OWNER;
+use knowa_model::{Claim, ClaimBody, Draft, ErrorCode, Id, Signer, Term, Timestamp, Value};
+use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
+use object_store::memory::InMemory;
+use object_store::path::Path as Key;
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+
+use super::{PART_SIZE, Remote, block_on, s3_store};
+use crate::dir::{DirBlobs, DirLogs};
+use crate::object::{ObjectBlobs, ObjectLogs};
+use crate::{Location, Replica, Stores, blob};
+
+const URL: &str = "s3://bucket/spaces/notes";
+
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Scratch {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        Scratch(std::env::temp_dir().join(format!("knowa-store-object-{tag}-{}-{n}", std::process::id())))
+    }
+
+    fn path(&self, rel: &str) -> PathBuf {
+        self.0.join(rel)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// An actor writing a hash chain in one space.
+struct Author {
+    signer: Signer,
+    id: Id,
+    space: Id,
+    last: Option<(u64, Id)>,
+}
+
+impl Author {
+    fn new(space: &Id) -> Author {
+        let signer = Signer::generate().unwrap();
+        let id = signer.actor_id();
+        Author { signer, id, space: space.clone(), last: None }
+    }
+
+    fn at(&self, seq: u64, prev: Option<Id>, text: &str) -> Claim {
+        let d = Draft::new(Id::new_entity().unwrap(), Term::parse("test:note").unwrap(), Value::text(text));
+        let body = ClaimBody::from_draft(d, self.space.clone(), self.id.clone(), seq, prev, Timestamp::now());
+        self.signer.seal(body).unwrap()
+    }
+
+    fn push(&mut self, c: Claim) -> Claim {
+        self.last = Some((c.body.seq, c.id.clone()));
+        c
+    }
+
+    fn genesis(&mut self) -> Claim {
+        let d = Draft::new(self.space.clone(), Term::parse(OWNER).unwrap(), Value::Ref(self.id.clone()));
+        let body = ClaimBody::from_draft(d, self.space.clone(), self.id.clone(), 1, None, Timestamp::now());
+        let c = self.signer.seal(body).unwrap();
+        self.push(c)
+    }
+
+    fn note(&mut self, text: &str) -> Claim {
+        let (seq, prev) = match &self.last {
+            Some((s, id)) => (s + 1, Some(id.clone())),
+            None => (1, None),
+        };
+        let c = self.at(seq, prev, text);
+        self.push(c)
+    }
+}
+
+fn memory() -> Arc<dyn ObjectStore> {
+    Arc::new(InMemory::new())
+}
+
+/// A new space on `store` at `URL`, through its own blob cache.
+fn new_space(store: &Arc<dyn ObjectStore>, s: &Scratch) -> (Replica, Author) {
+    let mut owner = Author::new(&Id::new_space().unwrap());
+    let genesis = owner.genesis();
+    (Replica::create_on(Arc::clone(store), URL, &s.path("cache-a"), &genesis).unwrap(), owner)
+}
+
+fn keys(store: &Arc<dyn ObjectStore>) -> Vec<String> {
+    let mut keys: Vec<String> = block_on(futures::StreamExt::collect::<Vec<_>>(store.list(None)))
+        .unwrap()
+        .into_iter()
+        .map(|m| m.unwrap().location.to_string())
+        .collect();
+    keys.sort();
+    keys
+}
+
+fn object(store: &Arc<dyn ObjectStore>, key: &str) -> Option<Vec<u8>> {
+    match block_on(async { store.get(&Key::from(key)).await?.bytes().await }).unwrap() {
+        Ok(b) => Some(b.to_vec()),
+        Err(object_store::Error::NotFound { .. }) => None,
+        Err(e) => panic!("{e}"),
+    }
+}
+
+fn append(r: &Replica, claims: &[Claim]) -> knowa_model::Result<()> {
+    r.append(&r.lock_actor(&claims[0].body.actor).unwrap(), claims)
+}
+
+fn seqs(r: &Replica, actor: &Id) -> Vec<u64> {
+    r.read_log(actor, 1).unwrap().map(|c| c.unwrap().body.seq).collect()
+}
+
+/// DESIGN §5.1: the directory layout, as keys under the URL's prefix. One batch is one
+/// segment object named by its first seq; a second handle sees what the first wrote.
+#[test]
+fn two_handles_create_write_read_and_reopen_one_replica() {
+    let s = Scratch::new("handles");
+    let store = memory();
+    let (a, mut owner) = new_space(&store, &s);
+    let batch = [owner.note("one"), owner.note("two")];
+    append(&a, &batch).unwrap();
+
+    let b = Replica::open_on(Arc::clone(&store), &format!("{URL}/"), &s.path("cache-b")).unwrap();
+    assert_eq!(b.manifest(), a.manifest());
+    assert_eq!(b.location(), &Location::Object(URL.into()));
+    assert_eq!(b.location_key().unwrap(), a.location_key().unwrap());
+    assert_eq!(seqs(&b, &owner.id), [1, 2, 3]);
+    append(&b, &[owner.note("three")]).unwrap();
+    assert_eq!(seqs(&a, &owner.id), [1, 2, 3, 4]);
+    assert_eq!(a.head(&a.lock_actor(&owner.id).unwrap()).unwrap().unwrap().seq, 4);
+    assert_eq!(a.actors().unwrap(), [owner.id.clone()]);
+    assert!(!a.may_have_after(&owner.id, 4).unwrap());
+    assert!(a.may_have_after(&owner.id, 3).unwrap());
+    assert!(a.writers_can_race());
+
+    let log = format!("spaces/notes/log/{}", owner.id);
+    assert_eq!(
+        keys(&store),
+        [
+            "spaces/notes/knowa.json".to_string(),
+            format!("{log}/000000000001.jsonl"),
+            format!("{log}/000000000002.jsonl"),
+            format!("{log}/000000000004.jsonl"),
+        ]
+    );
+    let batch_object = object(&store, &format!("{log}/000000000002.jsonl")).unwrap();
+    assert_eq!(batch_object, [batch[0].to_line().unwrap(), batch[1].to_line().unwrap()].concat());
+    assert_eq!(b.verify().unwrap().claims, 4);
+}
+
+#[test]
+fn create_needs_an_empty_location_and_open_a_manifest() {
+    let s = Scratch::new("empty");
+    let store = memory();
+    let err = Replica::open_on(Arc::clone(&store), URL, &s.path("cache")).err().unwrap();
+    assert_eq!(err.code, ErrorCode::NotFound, "{err:?}");
+
+    block_on(store.put(&Key::from("spaces/notes/stray"), PutPayload::from_static(b"x"))).unwrap().unwrap();
+    let mut owner = Author::new(&Id::new_space().unwrap());
+    let err = Replica::create_on(Arc::clone(&store), URL, &s.path("cache"), &owner.genesis()).err().unwrap();
+    assert_eq!(err.code, ErrorCode::Conflict, "{err:?}");
+    assert_eq!(keys(&store), ["spaces/notes/stray"], "a refused create wrote");
+}
+
+/// DESIGN §5.3: two writers that read the same head both try to create the segment
+/// object of the next seq; exactly one succeeds, the other gets `conflict`, and the
+/// log holds only the winner's batch.
+#[test]
+fn racing_appends_for_one_actor_conflict_exactly_once() {
+    let s = Scratch::new("race");
+    let store = memory();
+    let (first, mut owner) = new_space(&store, &s);
+    append(&first, &[owner.note("base")]).unwrap();
+    let second = Replica::open_on(Arc::clone(&store), URL, &s.path("cache-b")).unwrap();
+
+    let head = owner.last.clone().unwrap();
+    let rivals = [owner.at(head.0 + 1, Some(head.1.clone()), "mine"), owner.at(head.0 + 1, Some(head.1), "yours")];
+    let barrier = Barrier::new(2);
+    let results: Vec<knowa_model::Result<()>> = std::thread::scope(|scope| {
+        let runs: Vec<_> = [&first, &second]
+            .into_iter()
+            .zip(&rivals)
+            .map(|(r, claim)| {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let lock = r.lock_actor(&claim.body.actor).unwrap();
+                    assert_eq!(r.head(&lock).unwrap().unwrap().seq, 2);
+                    barrier.wait();
+                    r.append(&lock, std::slice::from_ref(claim))
+                })
+            })
+            .collect();
+        runs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let lost: Vec<_> = results.iter().filter_map(|r| r.as_ref().err()).collect();
+    assert_eq!(lost.len(), 1, "{results:?}");
+    assert_eq!(lost[0].code, ErrorCode::Conflict, "{:?}", lost[0]);
+    let winner = rivals[results.iter().position(Result::is_ok).unwrap()].id.clone();
+    let log: Vec<Id> = first.read_log(&owner.id, 1).unwrap().map(|c| c.unwrap().id).collect();
+    assert_eq!(log.len(), 3);
+    assert_eq!(log[2], winner);
+    first.verify().unwrap();
+}
+
+/// A merge writes each run as one segment object, never rotating, and the rebuild
+/// generation before and after it (DESIGN §5.4); a run whose object already exists is
+/// `integrity`.
+#[test]
+fn merge_writes_runs_as_objects_and_bumps_the_generation() {
+    let s = Scratch::new("merge");
+    let store = memory();
+    let (r, _) = new_space(&store, &s);
+    let mut other = Author::new(&r.manifest().space);
+    let c: Vec<Claim> = (0..5).map(|i| other.note(&format!("n{i}"))).collect();
+    assert_eq!(r.generation().unwrap(), None);
+
+    let report = r.merge(&[c[0].clone(), c[1].clone(), c[4].clone()]).unwrap();
+    assert_eq!((report.added, report.gaps.len()), (3, 1));
+    let first = r.generation().unwrap().unwrap();
+    let log = format!("spaces/notes/log/{}", other.id);
+    assert!(object(&store, &format!("{log}/000000000001.jsonl")).is_some());
+    assert!(object(&store, &format!("{log}/000000000005.jsonl")).is_some());
+
+    r.merge(&[c[2].clone(), c[3].clone()]).unwrap();
+    let second = r.generation().unwrap().unwrap();
+    assert_ne!(second, first);
+    assert_eq!(seqs(&r, &other.id), [1, 2, 3, 4, 5]);
+    assert_eq!(r.merge(&c).unwrap().skipped_existing, 5);
+    assert_eq!(r.generation().unwrap().unwrap(), second, "a merge that adds nothing writes nothing");
+    assert_eq!(r.verify().unwrap().gaps, []);
+
+    // A run whose object another writer created meanwhile is not overwritten.
+    let err = r.logs().write_run(&other.id, 3, &[c[2].to_line().unwrap()]).unwrap_err();
+    assert_eq!(err.code, ErrorCode::Integrity, "{err:?}");
+}
+
+/// DESIGN §5.3 Blob path: a put stages the bytes into the cache, named by their id,
+/// then uploads them once; a reader on another machine (another cache) downloads and
+/// checks them; the logs and the blobs may live at different kinds of location.
+#[test]
+fn blobs_at_a_separate_object_location_go_through_the_cache() {
+    let s = Scratch::new("split");
+    let store = memory();
+    let blob_url = "s3://bucket/bulk";
+    let remote = Remote::new(Arc::clone(&store), blob_url).unwrap();
+    let stores = Stores {
+        location: Location::Dir(s.path("replica")),
+        logs: Box::new(DirLogs::new(&s.path("replica"))),
+        blobs: Box::new(ObjectBlobs::new(remote.clone(), &s.path("cache-a"))),
+    };
+    let mut owner = Author::new(&Id::new_space().unwrap());
+    let genesis = owner.genesis();
+    let r = Replica::create_in(stores, crate::genesis_manifest(&genesis).unwrap(), &genesis).unwrap();
+    let (id, created, size) = r.put_blob(&mut &b"hello blobs"[..]).unwrap();
+    assert!(created);
+    assert_eq!(size, 11);
+    assert_eq!(r.put_blob(&mut &b"hello blobs"[..]).unwrap(), (id.clone(), false, 11));
+    let rel = blob::rel_path(&id).unwrap();
+    assert_eq!(object(&store, &format!("bulk/{rel}")).unwrap(), b"hello blobs");
+    assert!(blob::path(&s.path("cache-a"), &id).unwrap().is_file(), "the staged copy is named by its id");
+    assert!(!s.path("replica").join(&rel).exists(), "the bytes went to the blob location");
+    assert_eq!(r.blob_ids().unwrap(), std::slice::from_ref(&id));
+    assert_eq!(r.blob_len(&id).unwrap(), 11);
+
+    // Another machine: same replica directory and blob location, an empty cache.
+    let elsewhere = Stores {
+        location: Location::Dir(s.path("replica")),
+        logs: Box::new(DirLogs::new(&s.path("replica"))),
+        blobs: Box::new(ObjectBlobs::new(remote, &s.path("cache-b"))),
+    };
+    let r2 = Replica::open_in(elsewhere).unwrap();
+    assert_eq!(r2.read_blob(&id).unwrap(), b"hello blobs");
+    assert!(blob::path(&s.path("cache-b"), &id).unwrap().is_file());
+    let missing = Id::blob_from_sha256(&[7; 32]);
+    assert!(!r2.has_blob(&missing).unwrap());
+    assert_eq!(r2.read_blob(&missing).unwrap_err().code, ErrorCode::NotFound);
+    assert_eq!(r2.blob_len(&missing).unwrap_err().code, ErrorCode::NotFound);
+    r2.verify().unwrap();
+}
+
+/// The reverse split: logs on the object store, blobs in a directory.
+#[test]
+fn blobs_in_a_directory_beside_object_logs() {
+    let s = Scratch::new("split-reverse");
+    let store = memory();
+    let stores = Stores {
+        location: Location::Object(URL.into()),
+        logs: Box::new(ObjectLogs::new(Remote::new(Arc::clone(&store), URL).unwrap())),
+        blobs: Box::new(DirBlobs::new(&s.path("bulk"))),
+    };
+    let mut owner = Author::new(&Id::new_space().unwrap());
+    let genesis = owner.genesis();
+    let r = Replica::create_in(stores, crate::genesis_manifest(&genesis).unwrap(), &genesis).unwrap();
+    let (id, created, _) = r.put_blob(&mut &b"local bytes"[..]).unwrap();
+    assert!(created);
+    assert!(s.path("bulk").join(blob::rel_path(&id).unwrap()).is_file());
+    assert!(keys(&store).iter().all(|k| !k.contains("/blobs/")), "{:?}", keys(&store));
+    assert_eq!(r.read_blob(&id).unwrap(), b"local bytes");
+}
+
+/// DESIGN §5.3: bytes downloaded into the cache must hash to their id before use. A
+/// corrupted object is `integrity`, leaves nothing in the cache, and `verify` reports
+/// it from the stored bytes even where the cache holds a good copy.
+#[test]
+fn a_corrupted_object_is_rejected_on_download() {
+    let s = Scratch::new("corrupt");
+    let store = memory();
+    let (r, _) = new_space(&store, &s);
+    let (id, _, _) = r.put_blob(&mut &b"genuine"[..]).unwrap();
+    let key = format!("spaces/notes/{}", blob::rel_path(&id).unwrap());
+    block_on(store.put(&Key::from(key.as_str()), PutPayload::from_static(b"forged!"))).unwrap().unwrap();
+
+    let fresh = Replica::open_on(Arc::clone(&store), URL, &s.path("cache-b")).unwrap();
+    let err = fresh.read_blob(&id).unwrap_err();
+    assert_eq!(err.code, ErrorCode::Integrity, "{err:?}");
+    assert_eq!(fresh.blob_file(&id).unwrap_err().code, ErrorCode::Integrity);
+    let cache: Vec<_> = walk(&s.path("cache-b"));
+    assert!(cache.is_empty(), "the cache kept {cache:?}");
+
+    // The writer's own cache still holds the good copy; verify reads the store.
+    assert_eq!(r.read_blob(&id).unwrap(), b"genuine");
+    let err = r.verify().unwrap_err();
+    assert_eq!(err.code, ErrorCode::Integrity);
+    assert!(err.message.contains("content hashes to"), "{}", err.message);
+}
+
+/// Above `PART_SIZE` a blob is uploaded in parts; the object is the whole file.
+#[test]
+fn large_blobs_are_uploaded_in_parts() {
+    let s = Scratch::new("multipart");
+    let store = memory();
+    let (r, _) = new_space(&store, &s);
+    let bytes: Vec<u8> = (0..PART_SIZE + 1000).map(|i| (i % 251) as u8).collect();
+    fs::create_dir_all(&s.0).unwrap();
+    let src = s.path("big.bin");
+    fs::write(&src, &bytes).unwrap();
+    let (id, created, size) = r.put_blob_file(&src).unwrap();
+    assert!(created);
+    assert_eq!(size, bytes.len() as u64);
+    let key = format!("spaces/notes/{}", blob::rel_path(&id).unwrap());
+    assert_eq!(object(&store, &key).unwrap(), bytes);
+    let fresh = Replica::open_on(Arc::clone(&store), URL, &s.path("cache-b")).unwrap();
+    assert_eq!(fresh.read_blob(&id).unwrap(), bytes);
+}
+
+/// `last_line` reads a segment's end only, and widens its window for a line longer
+/// than the first one.
+#[test]
+fn the_head_is_found_past_a_line_longer_than_the_tail_window() {
+    let s = Scratch::new("long-line");
+    let store = memory();
+    let (r, mut owner) = new_space(&store, &s);
+    let long = "x".repeat(40_000);
+    append(&r, &[owner.note("short"), owner.note(&long)]).unwrap();
+    let lock = r.lock_actor(&owner.id).unwrap();
+    assert_eq!(r.head(&lock).unwrap().unwrap().id, owner.last.clone().unwrap().1);
+}
+
+/// DESIGN §5.2: refused credentials are the caller's to fix and name the variables;
+/// not found maps as on a directory; anything else is `internal`, naming the key.
+#[test]
+fn store_errors_map_to_knowa_codes() {
+    let remote = Remote::new(memory(), URL).unwrap();
+    let key = Key::from("spaces/notes/knowa.json");
+    let source = || -> Box<dyn std::error::Error + Send + Sync> { "403".into() };
+    for e in [
+        object_store::Error::PermissionDenied { path: key.to_string(), source: source() },
+        object_store::Error::Unauthenticated { path: key.to_string(), source: source() },
+    ] {
+        let err = remote.err(&key, e);
+        assert_eq!(err.code, ErrorCode::Usage);
+        assert!(err.message.contains("AWS_ACCESS_KEY_ID") && err.message.contains("AWS_SECRET_ACCESS_KEY"), "{}", err.message);
+    }
+    let err = remote.err(&key, object_store::Error::NotFound { path: key.to_string(), source: source() });
+    assert_eq!(err.code, ErrorCode::NotFound);
+    let err = remote.err(&key, object_store::Error::Generic { store: "S3", source: source() });
+    assert_eq!(err.code, ErrorCode::Internal);
+    assert!(err.message.contains("s3://bucket/spaces/notes/knowa.json"), "{}", err.message);
+}
+
+/// DESIGN §5.2: no silent default region.
+#[test]
+fn a_missing_region_is_a_usage_error() {
+    let err = s3_store(AmazonS3Builder::new(), "bucket").err().unwrap();
+    assert_eq!(err.code, ErrorCode::Usage);
+    assert!(err.message.contains("AWS_REGION") && err.message.contains("AWS_DEFAULT_REGION"), "{}", err.message);
+    s3_store(AmazonS3Builder::new().with_region("eu-west-1"), "bucket").unwrap();
+    s3_store(AmazonS3Builder::new().with_config(AmazonS3ConfigKey::DefaultRegion, "eu-west-1"), "bucket").unwrap();
+}
+
+fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for e in entries {
+        let p = e.unwrap().path();
+        if p.is_dir() {
+            out.extend(walk(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}

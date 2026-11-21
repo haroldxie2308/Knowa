@@ -13,7 +13,7 @@ use knowa_model::{Claim, Error, ErrorCode, Id, IdKind, Result, Timestamp};
 
 use crate::fsutil::{TempFile, io_err};
 use crate::log::{self, Chain, SEGMENT_LIMIT};
-use crate::{BundleMeta, ImportReport, MANIFEST_FILE, Manifest, Replica, blob, genesis_problem};
+use crate::{BundleMeta, ImportReport, MANIFEST_FILE, Manifest, Replica, Stores, blob, genesis_problem};
 
 const META_ENTRY: &str = "bundle.json";
 const LEVELS: &[&str] = &["private", "shared", "public"];
@@ -242,7 +242,7 @@ pub(crate) fn import(bundle: &Path, dest: &Path) -> Result<(Replica, BundleMeta,
     let manifest = manifest_of(&parsed.meta);
     let manifest_path = dest.join(MANIFEST_FILE);
     let replica = if manifest_path.try_exists().map_err(|e| io_err(&manifest_path, e))? {
-        let replica = Replica::open(dest)?;
+        let replica = Replica::open_in(Stores::dir(dest))?;
         if *replica.manifest() != manifest {
             return Err(Error::conflict(format!(
                 "{} holds a different replica (space {}) than bundle {} (space {})",
@@ -256,7 +256,7 @@ pub(crate) fn import(bundle: &Path, dest: &Path) -> Result<(Replica, BundleMeta,
     } else {
         // Run the chain checks against an empty replica before anything exists on disk.
         log::plan_merge(&parsed.claims, |_| Ok(Chain::new()))?;
-        Replica::create_replica(dest, &manifest)?
+        Replica::create_replica_in(Stores::dir(dest), &manifest)?
     };
 
     let mut adds_blobs = false;

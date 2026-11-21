@@ -27,8 +27,8 @@ pub struct Cli {
     #[arg(long, env = "KNOWA_HOME", global = true, value_name = "DIR")]
     pub home: Option<PathBuf>,
 
-    /// Current space: a registered alias or a replica directory
-    #[arg(long, env = "KNOWA_SPACE", global = true, value_name = "ALIAS|DIR")]
+    /// Current space: a registered alias or a replica location (a directory or s3://bucket/prefix)
+    #[arg(long, env = "KNOWA_SPACE", global = true, value_name = "ALIAS|LOCATION")]
     pub space: Option<String>,
 
     /// Acting actor name. Must come before the verb (`log --actor` is the log's author filter)
@@ -45,7 +45,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Cmd {
-    /// Create a space in DIR (genesis, owner kind, label, extract worker grant) and register it
+    /// Create a space at LOCATION (genesis, owner kind, label, extract worker grant) and register it
     Init(InitArgs),
     /// Manage this home's space registry
     #[command(subcommand)]
@@ -121,28 +121,36 @@ pub struct SpacesArg {
 
 #[derive(Debug, Args)]
 pub struct InitArgs {
-    /// Directory of the new replica (must not exist, or be empty)
-    pub dir: PathBuf,
+    /// Location of the new replica: a directory that does not exist or is empty, or an
+    /// empty s3://bucket/prefix (credentials and region from the AWS_* environment)
+    pub location: String,
     /// Human name of the space (its `knowa:label`)
     #[arg(long)]
     pub name: String,
-    /// Registry alias [default: the directory's name]
+    /// Registry alias [default: the location's last name]
     #[arg(long)]
     pub alias: Option<String>,
+    /// Where the blobs live, a directory or s3://bucket/prefix [default: the replica's location]
+    #[arg(long, value_name = "LOCATION")]
+    pub blobs: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum SpaceCmd {
     /// List registered spaces (`*` marks the current one)
     Ls,
-    /// Register an existing replica directory
+    /// Register an existing replica: a directory or s3://bucket/prefix
     Add {
-        dir: PathBuf,
+        location: String,
         #[arg(long)]
         alias: Option<String>,
         /// Refuse local writes to this replica
         #[arg(long)]
         readonly: bool,
+        /// Where its blobs live [default: the replica's location]; every registration
+        /// of a replica must give the same one
+        #[arg(long, value_name = "LOCATION")]
+        blobs: Option<String>,
     },
     /// Unregister a space (its files are left untouched)
     Rm { alias: String },

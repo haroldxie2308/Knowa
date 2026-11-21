@@ -759,3 +759,63 @@ fn no_current_space_is_a_usage_error() {
     assert_eq!(err["error"]["code"], "usage");
     assert!(err["error"]["message"].as_str().unwrap().contains("KNOWA_SPACE"), "{err}");
 }
+
+/// DESIGN §5.2 `--blobs`: the blob location belongs to a registration. The bytes go
+/// there, not into the replica, and another home that registers the replica with the
+/// same blob location reads them.
+#[test]
+fn blobs_registered_at_their_own_directory_are_stored_and_read_there() {
+    let sb = Sandbox::new("blobs-dir");
+    let kn = sb.home("home");
+    kn.ok(&["actor", "new", "alice", "--kind", "human"]);
+    let alice = kn.as_actor("alice");
+    let (replica, bulk) = (sb.path("notes"), sb.path("bulk"));
+    let r = alice.ok(&["init", s(&replica), "--name", "notes", "--blobs", s(&bulk)]);
+    let (replica, bulk) = (fs::canonicalize(&replica).unwrap(), fs::canonicalize(&bulk).unwrap());
+    assert_eq!((&r["alias"], &r["path"], &r["blobs"]), (&json!("notes"), &json!(s(&replica)), &json!(s(&bulk))), "{r}");
+    let ls = alice.ok(&["space", "ls"]);
+    assert_eq!(ls["spaces"][0]["blobs"], json!(s(&bulk)), "{ls}");
+
+    let file = sb.path("hello.txt");
+    fs::write(&file, "hello, bulk").unwrap();
+    let id = alice.ok(&["blob", "put", s(&file)])["id"].as_str().unwrap().to_string();
+    assert!(bulk.join("blobs").join(&id[6..8]).join(&id).is_file());
+    assert!(!replica.join("blobs").exists(), "the replica got a blob directory");
+
+    let bob = sb.home("home-b");
+    bob.ok(&["space", "add", s(&replica), "--alias", "shared", "--readonly", "--blobs", s(&bulk)]);
+    let out = bob.run(&["--space", "shared", "blob", "cat", &id], None);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.stdout, b"hello, bulk");
+    // Registered without its blob location, the replica holds no bytes.
+    let (code, err) = sb.home("home-c").fail(&["--space", s(&replica), "blob", "cat", &id]);
+    assert_eq!((code, &err["error"]["code"]), (3, &json!("not_found")), "{err}");
+}
+
+/// Object-store locations fail fast on what the CLI can check without a request: an
+/// unknown scheme is `unsupported`, and a missing region is `usage` naming both
+/// variables (DESIGN §5.2), before anything is registered.
+#[test]
+fn object_locations_need_a_known_scheme_and_a_region() {
+    let sb = Sandbox::new("s3-region");
+    let kn = sb.home("home");
+    kn.ok(&["actor", "new", "alice", "--kind", "human"]);
+    let alice = kn.as_actor("alice");
+    let (code, err) = alice.fail(&["init", "gs://bucket/notes", "--name", "notes"]);
+    assert_eq!((code, &err["error"]["code"]), (6, &json!("unsupported")), "{err}");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_knowa"))
+        .args(["--json", "init", "s3://bucket/notes", "--name", "notes"])
+        .env("KNOWA_HOME", &kn.home)
+        .env("KNOWA_ACTOR", "alice")
+        .env_remove("KNOWA_SPACE")
+        .env_remove("AWS_REGION")
+        .env_remove("AWS_DEFAULT_REGION")
+        .output()
+        .unwrap();
+    let err: Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!((out.status.code(), &err["error"]["code"]), (Some(2), &json!("usage")), "{err}");
+    let message = err["error"]["message"].as_str().unwrap();
+    assert!(message.contains("AWS_REGION") && message.contains("AWS_DEFAULT_REGION"), "{message}");
+    assert_eq!(kn.ok(&["space", "ls"])["spaces"], json!([]));
+}

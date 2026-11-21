@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex};
 use knowa_model::vocab::OWNER;
 use knowa_model::{Claim, ClaimBody, Draft, Error, Id, Result, Signer, Term, Timestamp, Value};
 
-use crate::backend::{Guard, LastLine, Listing, Logs, Segment};
-use crate::dir::{self, DirBlobs, DirLogs};
-use crate::{Manifest, Replica};
+use crate::backend::{Blobs, Guard, LastLine, Listing, Logs, Segment};
+use crate::dir::{DirBlobs, DirLogs};
+use crate::{Location, Manifest, Replica, Stores};
 
 struct Scratch(PathBuf);
 
@@ -45,8 +45,11 @@ impl Logs for Recording {
     fn describe(&self) -> String {
         self.inner.describe()
     }
-    fn canonical_location(&self) -> Result<String> {
-        self.inner.canonical_location()
+    fn exclusive_locks(&self) -> bool {
+        self.inner.exclusive_locks()
+    }
+    fn prepare(&self) -> Result<()> {
+        self.inner.prepare()
     }
     fn read_manifest(&self) -> Result<Option<Vec<u8>>> {
         self.inner.read_manifest()
@@ -115,11 +118,13 @@ fn chain(n: u64) -> (Manifest, Vec<Claim>) {
 }
 
 fn recorded(s: &Scratch, manifest: &Manifest, fail_runs: bool) -> (Replica, Arc<Mutex<Vec<String>>>) {
-    dir::prepare(&s.0).unwrap();
     let events = Arc::new(Mutex::new(Vec::new()));
     let logs = Recording { inner: DirLogs::new(&s.0), events: Arc::clone(&events), fail_runs };
-    let r = Replica::with_stores(&s.0, manifest.clone(), Box::new(logs), Box::new(DirBlobs::new(&s.0)));
-    (r, events)
+    let blobs = DirBlobs::new(&s.0);
+    logs.prepare().unwrap();
+    blobs.prepare().unwrap();
+    let stores = Stores { location: Location::Dir(s.0.clone()), logs: Box::new(logs), blobs: Box::new(blobs) };
+    (Replica::with_stores(stores, manifest.clone()), events)
 }
 
 fn take(events: &Arc<Mutex<Vec<String>>>) -> Vec<String> {

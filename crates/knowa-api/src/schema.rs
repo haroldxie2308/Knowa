@@ -36,10 +36,11 @@ pub(crate) fn schema() -> Value {
 
 fn selection() -> Value {
     json!({
-        "space": "Writes, blob.put, feed and admin ops act on one space: --space / KNOWA_SPACE (alias or replica path), else the current space (knowa space use). Missing → usage.",
+        "space": "Writes, blob.put, feed and admin ops act on one space: --space / KNOWA_SPACE (alias or replica location: a directory path or s3://bucket/prefix), else the current space (knowa space use). Missing → usage.",
+        "locations": "A replica lives at a location: a directory (local, or a mounted shared filesystem) or an object store, s3://bucket/prefix for S3 and S3-compatible stores (experimental). Its blobs live there too unless a separate blob location is registered (--blobs). Object-store credentials, region and endpoint come only from the environment (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION or AWS_DEFAULT_REGION, AWS_ENDPOINT, …); a missing region or refused credentials → usage. On an object store, a write that loses a race with another writer of the same actor is redone on the new head, at most 3 times in all, then fails with conflict.",
         "actor": "Writes are signed by the selected actor: --actor / KNOWA_ACTOR (actor name), else the current actor (knowa actor use). Missing → usage.",
         "readonly": "Spaces registered readonly (e.g. imported bundles) refuse writes with usage. To annotate someone else's content, write in your own space and refer to their ids.",
-        "querySpaces": "A query document's spaces field: [] (default) = the selected space; [\"*\"] = every registered space (cannot be combined with other entries); otherwise aliases or replica paths. Several replicas of the same space count once (the first wins). A space is its id and genesis: selected replicas that share a space id but differ in owner or genesis → conflict."
+        "querySpaces": "A query document's spaces field: [] (default) = the selected space; [\"*\"] = every registered space (cannot be combined with other entries); otherwise aliases or replica locations. Several replicas of the same space count once (the first wins). A space is its id and genesis: selected replicas that share a space id but differ in owner or genesis → conflict."
     })
 }
 
@@ -83,9 +84,9 @@ fn primitives() -> Value {
 fn admin() -> Value {
     json!({
         "init": {
-            "args": {"dir": "new or empty directory", "name": "space label (non-empty)", "alias": "registry alias, default the directory name (must match [a-z0-9][a-z0-9._-]{0,63})"},
-            "does": "Creates the space: genesis knowa:owner by the selected actor, its knowa:actorKind, knowa:label = name on the space id, knowa:role knowa:Worker and knowa:autoAccept true for the built-in extract actor. Registers the alias; makes it current if no space is current.",
-            "out": {"space": "s_…", "path": "absolute path", "alias": "string", "owner": "a_…", "extractActor": "a_…", "claims": "ids of every claim written"}
+            "args": {"location": "a new or empty directory, or an empty object location (s3://bucket/prefix)", "name": "space label (non-empty)", "alias": "registry alias, default the location's last name (must match [a-z0-9][a-z0-9._-]{0,63})", "blobs": "optional blob location (directory or s3://…), default the replica's location"},
+            "does": "Creates the space: genesis knowa:owner by the selected actor, its knowa:actorKind, knowa:label = name on the space id, knowa:role knowa:Worker and knowa:autoAccept true for the built-in extract actor. Registers the alias with the replica's location and blob location; makes it current if no space is current.",
+            "out": {"space": "s_…", "path": "the replica's canonical location: an absolute path, or the URL without a trailing /", "blobs": "the canonical blob location, when not the replica's", "alias": "string", "owner": "a_…", "extractActor": "a_…", "claims": "ids of every claim written"}
         },
         "put": {
             "args": {"paths": "files or directories", "noExtract": "skip extractors", "noStore": "catalog only: record the files without copying their bytes into the replica", "downloadEvicted": "read evicted files (macOS dataless, e.g. iCloud Optimize Mac Storage) so the OS downloads them first; without it they are skipped"},
@@ -215,7 +216,7 @@ fn query() -> Value {
     json!({
         "document": "{\"op\": \"find|get|context|path|log\", …fields of that op}. Each op accepts only its own fields; any other field → invalid.",
         "common": {
-            "spaces": {"type": "string[]", "default": "[] = selected space", "rule": "[\"*\"] = all registered spaces; entries are aliases or replica paths"},
+            "spaces": {"type": "string[]", "default": "[] = selected space", "rule": "[\"*\"] = all registered spaces; entries are aliases or replica locations"},
             "view": {"fields": view(), "rule": "trust filter over claims; not accepted by log"},
             "asOf": {"rule": "reserved for record-time travel: any non-null value → unsupported (not accepted by log)"}
         },

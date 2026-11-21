@@ -1,15 +1,17 @@
 //! One replica of a space (DESIGN §5): manifest, per-actor append-only logs and their
 //! locks, content-addressed blobs, the rebuild generation, verification and bundles.
 //! Storage sits behind two private stores (`backend`), one for the logs and one for
-//! the blobs; directory replicas implement them in `dir`. The store knows nothing
-//! about status, visibility or queries.
+//! the blobs, each at a `Location`: a directory (`dir`) or an object store (`object`).
+//! The store knows nothing about status, visibility or queries.
 
 mod backend;
 mod blob;
 mod bundle;
 mod dir;
 mod fsutil;
+mod location;
 mod log;
+mod object;
 #[cfg(test)]
 mod tests;
 mod verify;
@@ -23,11 +25,15 @@ use std::thread::{self, ThreadId};
 
 use knowa_model::vocab::{FORMAT_VERSION, OWNER};
 use knowa_model::{Claim, Error, ErrorCode, Id, IdKind, Result, Value};
+use object_store::ObjectStore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::backend::{Blobs, Guard, Logs};
 use crate::dir::{DirBlobs, DirLogs};
+use crate::object::{ObjectBlobs, ObjectLogs, Remote};
+
+pub use crate::location::Location;
 
 pub const MANIFEST_FILE: &str = "knowa.json";
 pub const LOG_DIR: &str = "log";
@@ -143,8 +149,63 @@ pub struct BundleMeta {
     pub at: String,
 }
 
+/// A replica's two stores, connected but not yet read (DESIGN §5): the logs at the
+/// replica's location, the blobs there or at a separate blob location.
+pub(crate) struct Stores {
+    pub(crate) location: Location,
+    pub(crate) logs: Box<dyn Logs>,
+    pub(crate) blobs: Box<dyn Blobs>,
+}
+
+impl Stores {
+    /// The stores of a replica at `location` whose blobs are at `blobs`, or at
+    /// `location` when `None`. Object-store blobs pass through `cache`, this machine's
+    /// blob cache. An object location's client is configured from the environment.
+    fn connect(location: &Location, blobs: Option<&Location>, cache: &Path) -> Result<Stores> {
+        let (logs, remote): (Box<dyn Logs>, _) = match location {
+            Location::Dir(dir) => (Box::new(DirLogs::new(dir)), None),
+            Location::Object(url) => {
+                let remote = Remote::s3(url)?;
+                (Box::new(ObjectLogs::new(remote.clone())), Some(remote))
+            }
+        };
+        let blobs: Box<dyn Blobs> = match blobs.unwrap_or(location) {
+            Location::Dir(dir) => Box::new(DirBlobs::new(dir)),
+            Location::Object(url) => {
+                // Blobs at the replica's own object location share its client.
+                let remote = match remote {
+                    Some(remote) if blobs.is_none() => remote,
+                    _ => Remote::s3(url)?,
+                };
+                Box::new(ObjectBlobs::new(remote, cache))
+            }
+        };
+        Ok(Stores { location: location.clone(), logs, blobs })
+    }
+
+    /// A directory replica, logs and blobs both in `dir`: a bundle import's target,
+    /// which needs no blob cache.
+    pub(crate) fn dir(dir: &Path) -> Stores {
+        Stores {
+            location: Location::Dir(dir.to_path_buf()),
+            logs: Box::new(DirLogs::new(dir)),
+            blobs: Box::new(DirBlobs::new(dir)),
+        }
+    }
+
+    /// A replica on `store` at `url`, logs and blobs both there.
+    pub(crate) fn object(store: Arc<dyn ObjectStore>, url: &str, cache: &Path) -> Result<Stores> {
+        let remote = Remote::new(store, url)?;
+        Ok(Stores {
+            location: Location::Object(remote.url().to_string()),
+            logs: Box::new(ObjectLogs::new(remote.clone())),
+            blobs: Box::new(ObjectBlobs::new(remote, cache)),
+        })
+    }
+}
+
 pub struct Replica {
-    root: PathBuf,
+    location: Location,
     manifest: Manifest,
     logs: Box<dyn Logs>,
     blobs: Box<dyn Blobs>,
@@ -152,73 +213,94 @@ pub struct Replica {
 }
 
 impl Replica {
-    /// Creates a new replica at `dir` (must not exist, or be an empty directory),
-    /// writes the manifest and appends `genesis` (seq 1, `knowa:owner`, signed by owner).
-    /// `genesis` must verify; `manifest.genesis == genesis.id`.
-    pub fn create(dir: &Path, genesis: &Claim) -> Result<Replica> {
-        genesis.verify()?;
-        if let Some(p) = genesis_problem(genesis) {
-            return Err(Error::invalid(p));
-        }
-        let b = &genesis.body;
-        let manifest = Manifest {
-            format: FORMAT_VERSION,
-            space: b.space.clone(),
-            owner: b.actor.clone(),
-            genesis: genesis.id.clone(),
-        };
-        dir::prepare(dir)?;
-        let replica = Replica::directory(dir, manifest);
-        let lock = replica.lock_actor(&b.actor)?;
+    /// Creates a new replica at `location` (a directory that does not exist or is
+    /// empty, or an object location holding nothing), with its blobs at `blobs`, or at
+    /// `location` when `None`; `cache` is this machine's blob cache,
+    /// `$KNOWA_HOME/cache/blobs/` (DESIGN §5.2). Appends `genesis` (seq 1,
+    /// `knowa:owner`, signed by the owner), then writes the manifest. `genesis` must
+    /// verify; `manifest.genesis == genesis.id`.
+    pub fn create(location: &Location, blobs: Option<&Location>, cache: &Path, genesis: &Claim) -> Result<Replica> {
+        let manifest = genesis_manifest(genesis)?;
+        Replica::create_in(Stores::connect(location, blobs, cache)?, manifest, genesis)
+    }
+
+    fn create_in(stores: Stores, manifest: Manifest, genesis: &Claim) -> Result<Replica> {
+        stores.logs.prepare()?;
+        stores.blobs.prepare()?;
+        let owner = manifest.owner.clone();
+        let replica = Replica::with_stores(stores, manifest);
+        let lock = replica.lock_actor(&owner)?;
         replica.append(&lock, std::slice::from_ref(genesis))?;
         drop(lock);
-        // The manifest goes last: a directory with `knowa.json` is a complete replica.
+        // The manifest goes last: a location with `knowa.json` is a complete replica.
         replica.write_manifest()?;
         Ok(replica)
     }
 
-    /// Opens an existing replica; missing/invalid manifest → `not_found`/`integrity`.
-    pub fn open(dir: &Path) -> Result<Replica> {
-        let path = dir.join(MANIFEST_FILE);
-        let Some(bytes) = DirLogs::new(dir).read_manifest()? else {
-            return Err(Error::not_found(format!("{} is not a Knowa replica (no {MANIFEST_FILE})", dir.display())));
+    /// Opens an existing replica at `location`, with `blobs` and `cache` as in
+    /// `create`; missing/invalid manifest → `not_found`/`integrity`. Credentials an
+    /// object store refuses → `usage`.
+    pub fn open(location: &Location, blobs: Option<&Location>, cache: &Path) -> Result<Replica> {
+        Replica::open_in(Stores::connect(location, blobs, cache)?)
+    }
+
+    pub(crate) fn open_in(stores: Stores) -> Result<Replica> {
+        let name = format!("{}/{MANIFEST_FILE}", stores.logs.describe());
+        let Some(bytes) = stores.logs.read_manifest()? else {
+            return Err(Error::not_found(format!(
+                "{} is not a Knowa replica (no {MANIFEST_FILE})",
+                stores.logs.describe()
+            )));
         };
-        let manifest: Manifest =
-            serde_json::from_slice(&bytes).map_err(|e| Error::integrity(format!("{}: {e}", path.display())))?;
+        let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|e| Error::integrity(format!("{name}: {e}")))?;
         if manifest.format != FORMAT_VERSION {
             return Err(Error::unsupported(format!(
-                "{}: format {} (this build reads format {FORMAT_VERSION})",
-                path.display(),
+                "{name}: format {} (this build reads format {FORMAT_VERSION})",
                 manifest.format
             )));
         }
         if let Some(p) = manifest_kind_problem(&manifest) {
-            return Err(Error::integrity(format!("{}: {p}", path.display())));
+            return Err(Error::integrity(format!("{name}: {p}")));
         }
-        Ok(Replica::directory(dir, manifest))
+        Ok(Replica::with_stores(stores, manifest))
     }
 
-    /// Creates an empty replica for an *existing* space (import target). `dir` as in `create`.
-    pub fn create_replica(dir: &Path, manifest: &Manifest) -> Result<Replica> {
-        if manifest.format != FORMAT_VERSION {
-            return Err(Error::invalid(format!("manifest format {} (expected {FORMAT_VERSION})", manifest.format)));
-        }
-        if let Some(p) = manifest_kind_problem(manifest) {
-            return Err(Error::invalid(format!("manifest: {p}")));
-        }
-        dir::prepare(dir)?;
-        let replica = Replica::directory(dir, manifest.clone());
+    /// Creates an empty replica for an *existing* space (import target); arguments as
+    /// in `create`.
+    pub fn create_replica(location: &Location, blobs: Option<&Location>, cache: &Path, manifest: &Manifest) -> Result<Replica> {
+        check_manifest(manifest)?;
+        Replica::create_replica_in(Stores::connect(location, blobs, cache)?, manifest)
+    }
+
+    /// `create_replica` on connected stores, for a `manifest` the caller has checked
+    /// (`check_manifest`, or a bundle's validated meta).
+    pub(crate) fn create_replica_in(stores: Stores, manifest: &Manifest) -> Result<Replica> {
+        stores.logs.prepare()?;
+        stores.blobs.prepare()?;
+        let replica = Replica::with_stores(stores, manifest.clone());
         replica.write_manifest()?;
         Ok(replica)
     }
 
-    /// A directory replica: logs and blobs both live in `dir`.
-    fn directory(dir: &Path, manifest: Manifest) -> Replica {
-        Replica::with_stores(dir, manifest, Box::new(DirLogs::new(dir)), Box::new(DirBlobs::new(dir)))
+    /// `create` on an object store given directly instead of configured from the
+    /// environment, for tests in other crates: `object_store`'s in-memory store has no
+    /// URL, and no test-only scheme belongs in `Location::parse`. Logs and blobs both
+    /// live at `url`.
+    #[doc(hidden)]
+    pub fn create_on(store: Arc<dyn ObjectStore>, url: &str, cache: &Path, genesis: &Claim) -> Result<Replica> {
+        let manifest = genesis_manifest(genesis)?;
+        Replica::create_in(Stores::object(store, url, cache)?, manifest, genesis)
     }
 
-    pub(crate) fn with_stores(root: &Path, manifest: Manifest, logs: Box<dyn Logs>, blobs: Box<dyn Blobs>) -> Replica {
-        Replica { root: root.to_path_buf(), manifest, logs, blobs, held: Arc::default() }
+    /// `open` on an object store given directly; see `create_on`.
+    #[doc(hidden)]
+    pub fn open_on(store: Arc<dyn ObjectStore>, url: &str, cache: &Path) -> Result<Replica> {
+        Replica::open_in(Stores::object(store, url, cache)?)
+    }
+
+    pub(crate) fn with_stores(stores: Stores, manifest: Manifest) -> Replica {
+        let Stores { location, logs, blobs } = stores;
+        Replica { location, manifest, logs, blobs, held: Arc::default() }
     }
 
     pub(crate) fn logs(&self) -> &dyn Logs {
@@ -235,20 +317,28 @@ impl Replica {
         self.logs.write_manifest(&bytes)
     }
 
-    pub fn root(&self) -> &Path {
-        &self.root
+    /// The replica's location, as it was given.
+    pub fn location(&self) -> &Location {
+        &self.location
     }
 
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
     }
 
+    /// Whether two writers of one actor can both hold its lock (DESIGN §5.3): `false`
+    /// on a directory, where the lock keeps them out; `true` on an object store, which
+    /// has no lock, so the one whose `append` comes second gets `conflict` and must
+    /// read the head again and rebuild its claims.
+    pub fn writers_can_race(&self) -> bool {
+        !self.logs.exclusive_locks()
+    }
+
     /// The key of this replica's machine-local state, `$KNOWA_HOME/index/<s_id>/<key>/`
-    /// (DESIGN §5.2): the first 16 characters of b32(sha256(canonical location)), where
-    /// a directory's canonical location is its canonicalized absolute path. A path that
-    /// is not UTF-8 → `unsupported`.
+    /// (DESIGN §5.2): the first 16 characters of b32(sha256(canonical location))
+    /// (`Location::canonical`). A directory path that is not UTF-8 → `unsupported`.
     pub fn location_key(&self) -> Result<String> {
-        Ok(location_key(&self.logs.canonical_location()?))
+        Ok(location_key(&self.location.canonical()?))
     }
 
     /// The rebuild generation (DESIGN §5.4); `None` until the first merge. A file that
@@ -491,6 +581,29 @@ pub(crate) fn genesis_problem(genesis: &Claim) -> Option<String> {
     })
 }
 
+/// The manifest a replica created with `genesis` gets, once `genesis` is checked: it
+/// must verify and be a genesis claim (`invalid` otherwise).
+fn genesis_manifest(genesis: &Claim) -> Result<Manifest> {
+    genesis.verify()?;
+    if let Some(p) = genesis_problem(genesis) {
+        return Err(Error::invalid(p));
+    }
+    let b = &genesis.body;
+    Ok(Manifest { format: FORMAT_VERSION, space: b.space.clone(), owner: b.actor.clone(), genesis: genesis.id.clone() })
+}
+
+/// A manifest given for a new replica must be of this format and name ids of the
+/// right kinds (`invalid` otherwise).
+fn check_manifest(manifest: &Manifest) -> Result<()> {
+    if manifest.format != FORMAT_VERSION {
+        return Err(Error::invalid(format!("manifest format {} (expected {FORMAT_VERSION})", manifest.format)));
+    }
+    if let Some(p) = manifest_kind_problem(manifest) {
+        return Err(Error::invalid(format!("manifest: {p}")));
+    }
+    Ok(())
+}
+
 fn manifest_kind_problem(m: &Manifest) -> Option<String> {
     [("space", &m.space, IdKind::Space), ("owner", &m.owner, IdKind::Actor), ("genesis", &m.genesis, IdKind::Claim)]
         .into_iter()
@@ -533,8 +646,9 @@ pub fn read_bundle_meta(bundle: &Path) -> Result<BundleMeta> {
     bundle::read_meta(bundle)
 }
 
-/// Imports a bundle into `dest` (created via `create_replica` if absent; if present its
-/// manifest must match the bundle's space). Verifies all claim signatures and blob hashes,
+/// Imports a bundle into the directory `dest`, a replica whose blobs live in it too
+/// (created via `create_replica` if absent; if present its manifest must match the
+/// bundle's space). Verifies all claim signatures and blob hashes,
 /// and that the bundle's genesis is a genesis claim, before writing anything. Merges as
 /// `Replica::merge` does, and also counts the blobs it adds as writes: the rebuild
 /// generation is written before the first blob or segment it adds and after the last,

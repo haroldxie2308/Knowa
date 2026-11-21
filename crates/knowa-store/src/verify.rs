@@ -107,7 +107,9 @@ pub(crate) fn verify(replica: &Replica) -> Result<VerifyReport> {
     rep.problems.extend(problems);
     rep.blobs = blobs.len() as u64;
     for (id, name) in &blobs {
-        let mut bytes = replica.blob_store().open(id)?;
+        // The stored bytes, not a cached copy (DESIGN §5.4: on an object store, verify
+        // downloads the whole store).
+        let mut bytes = replica.blob_store().open_raw(id)?;
         let (got, _) = blob::hash_reader(&mut bytes, &|| name.clone())?;
         if got != *id {
             rep.problems.push(format!("{name}: content hashes to {got}"));

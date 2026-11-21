@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use knowa_config::{Home, SpaceRef};
 use knowa_index::Index;
 use knowa_model::{Error, Id, Result};
-use knowa_store::Replica;
+use knowa_store::{Location, Replica};
 
 use crate::Sel;
 
@@ -20,7 +20,7 @@ pub(crate) struct Space {
 
 impl Space {
     pub fn open(home: &Home, sref: SpaceRef) -> Result<Space> {
-        let replica = Replica::open(&sref.path).map_err(|e| in_space(e, &sref))?;
+        let replica = open_replica(home, &sref.location, sref.blobs.as_deref()).map_err(|e| in_space(e, &sref))?;
         Space::new(home, sref, replica)
     }
 
@@ -33,7 +33,7 @@ impl Space {
         &self.replica.manifest().space
     }
 
-    /// Alias when registered, else the replica path; for messages.
+    /// Alias when registered, else the replica's location; for messages.
     pub fn name(&self) -> String {
         describe(&self.sref)
     }
@@ -91,13 +91,36 @@ pub(crate) fn classify(spaces: &[String]) -> Result<Selection<'_>> {
 
 /// The caller's single space (writes, feed, admin ops).
 pub(crate) fn current(home: &Home, sel: &Sel) -> Result<Space> {
-    Space::open(home, home.resolve_space(sel.space.as_deref())?)
+    Space::open(home, home.resolve_space(sel.space.as_deref(), canonical)?)
+}
+
+/// A space selector that is not a registered alias, as the canonical location the
+/// registry is keyed by (DESIGN §5.2).
+fn canonical(selector: &str) -> Result<String> {
+    Location::parse(selector).and_then(|l| l.canonical()).map_err(|mut e| {
+        e.message = format!("{selector:?} is not a registered space alias, and as a location: {}", e.message);
+        e
+    })
+}
+
+/// Opens the replica registered (or selected) at the canonical `location`, with its
+/// blobs at `blobs`.
+pub(crate) fn open_replica(home: &Home, location: &str, blobs: Option<&str>) -> Result<Replica> {
+    let location = Location::parse(location)?;
+    let blobs = blobs.map(Location::parse).transpose()?;
+    Replica::open(&location, blobs.as_ref(), &blob_cache(home))
 }
 
 /// `<home>/index/<s_id>/<key>/`: this machine's index and worker cursors for a replica
 /// (DESIGN §5.2). Every registration of one location on one machine shares it.
 pub(crate) fn index_dir(home: &Home, replica: &Replica) -> Result<PathBuf> {
     Ok(home.root().join("index").join(replica.manifest().space.as_str()).join(replica.location_key()?))
+}
+
+/// `<home>/cache/blobs/`: this machine's cache of object-store blob bytes, staged for
+/// upload or downloaded for reading (DESIGN §5.2).
+pub(crate) fn blob_cache(home: &Home) -> PathBuf {
+    home.root().join("cache").join("blobs")
 }
 
 /// Resolves a `spaces` selection in order. Several replicas of the same space (e.g. an
@@ -107,7 +130,7 @@ pub(crate) fn index_dir(home: &Home, replica: &Replica) -> Result<PathBuf> {
 /// would let one shadow the other.
 pub(crate) fn select(home: &Home, sel: &Sel, spaces: &[String]) -> Result<Vec<Space>> {
     let refs = match classify(spaces)? {
-        Selection::Current => vec![home.resolve_space(sel.space.as_deref())?],
+        Selection::Current => vec![home.resolve_space(sel.space.as_deref(), canonical)?],
         Selection::All => {
             let all = home.all_spaces()?;
             if all.is_empty() {
@@ -117,7 +140,9 @@ pub(crate) fn select(home: &Home, sel: &Sel, spaces: &[String]) -> Result<Vec<Sp
             }
             all
         }
-        Selection::Named(names) => names.iter().map(|n| home.resolve_space(Some(n))).collect::<Result<Vec<_>>>()?,
+        Selection::Named(names) => {
+            names.iter().map(|n| home.resolve_space(Some(n), canonical)).collect::<Result<Vec<_>>>()?
+        }
     };
     let mut first: HashMap<Id, usize> = HashMap::new();
     let mut out: Vec<Space> = Vec::with_capacity(refs.len());
@@ -161,7 +186,7 @@ pub(crate) fn open_all(spaces: Vec<Space>) -> Result<Vec<Opened>> {
 fn describe(sref: &SpaceRef) -> String {
     match &sref.alias {
         Some(a) => format!("'{a}'"),
-        None => sref.path.display().to_string(),
+        None => sref.location.clone(),
     }
 }
 

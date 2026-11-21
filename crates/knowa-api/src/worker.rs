@@ -98,7 +98,9 @@ fn run_command(
     let mut child = Command::new(program)
         .args(args)
         .env("KNOWA_HOME", home.root())
-        .env("KNOWA_SPACE", space.replica.root())
+        // The canonical location, which resolves to this space's registration, blob
+        // location included, when it is registered.
+        .env("KNOWA_SPACE", &space.sref.location)
         .env("KNOWA_ACTOR", &actor.name)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

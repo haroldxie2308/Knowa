@@ -1,7 +1,7 @@
-//! Directory replicas (DESIGN §5.1, §5.3): the location is a directory, local or a
-//! mounted shared filesystem, and the blobs live in it too. A batch extends the actor's
-//! newest segment in place under an advisory lock on `log/<actor>/.lock`; every new
-//! file is published by temp + fsync + rename.
+//! Directory locations (DESIGN §5.1, §5.3): a directory, local or a mounted shared
+//! filesystem, holding a replica's logs, its blobs, or both. A batch extends the
+//! actor's newest segment in place under an advisory lock on `log/<actor>/.lock`;
+//! every new file is published by temp + fsync + rename.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -13,24 +13,6 @@ use crate::backend::{Blobs, Guard, LastLine, Listing, Logs, Segment};
 use crate::fsutil::{self, TempFile, io_err};
 use crate::log::{SEGMENT_LIMIT, parse_segment_name, segment_name};
 use crate::{BLOB_DIR, GENERATION_FILE, LOCK_FILE, LOG_DIR, MANIFEST_FILE, blob};
-
-/// Creates `dir` (or accepts it empty) with `log/` and `blobs/`.
-pub(crate) fn prepare(dir: &Path) -> Result<()> {
-    match fs::read_dir(dir) {
-        Ok(mut entries) => {
-            if entries.next().is_some() {
-                return Err(Error::conflict(format!("{} exists and is not empty", dir.display())));
-            }
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) if dir.exists() && !dir.is_dir() => {
-            return Err(Error::conflict(format!("{} exists and is not a directory ({e})", dir.display())));
-        }
-        Err(e) => return Err(io_err(dir, e)),
-    }
-    fsutil::ensure_dir(&dir.join(LOG_DIR))?;
-    fsutil::ensure_dir(&dir.join(BLOB_DIR))
-}
 
 /// Reads `path`; `None` when it does not exist.
 fn read_if_exists(path: &Path) -> Result<Option<Vec<u8>>> {
@@ -69,11 +51,26 @@ impl Logs for DirLogs {
         self.root.display().to_string()
     }
 
-    fn canonical_location(&self) -> Result<String> {
-        let abs = fs::canonicalize(&self.root).map_err(|e| io_err(&self.root, e))?;
-        abs.into_os_string().into_string().map_err(|p| {
-            Error::unsupported(format!("replica location {} is not valid UTF-8, so it has no index key", p.display()))
-        })
+    fn exclusive_locks(&self) -> bool {
+        true
+    }
+
+    /// Creates the directory, or accepts it empty, with `log/`.
+    fn prepare(&self) -> Result<()> {
+        let dir = &self.root;
+        match fs::read_dir(dir) {
+            Ok(mut entries) => {
+                if entries.next().is_some() {
+                    return Err(Error::conflict(format!("{} exists and is not empty", dir.display())));
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) if dir.exists() && !dir.is_dir() => {
+                return Err(Error::conflict(format!("{} exists and is not a directory ({e})", dir.display())));
+            }
+            Err(e) => return Err(io_err(dir, e)),
+        }
+        fsutil::ensure_dir(&dir.join(LOG_DIR))
     }
 
     fn read_manifest(&self) -> Result<Option<Vec<u8>>> {
@@ -398,29 +395,35 @@ fn write_new_segment(dir: &Path, first: u64, lines: &[Vec<u8>], changes: &mut Ve
     tmp.commit(&dest)
 }
 
-/// Blobs in `<root>/blobs/` (DESIGN §5.1).
+/// Blobs in `<location>/blobs/` (DESIGN §5.1).
 pub(crate) struct DirBlobs {
-    root: PathBuf,
+    /// the blob directory, `<location>/blobs`
+    dir: PathBuf,
 }
 
 impl DirBlobs {
-    pub(crate) fn new(root: &Path) -> DirBlobs {
-        DirBlobs { root: root.to_path_buf() }
+    /// The blobs of the directory location `location`.
+    pub(crate) fn new(location: &Path) -> DirBlobs {
+        DirBlobs { dir: location.join(BLOB_DIR) }
     }
 
     /// The stored file of a present blob; absent → `not_found`.
     fn stored(&self, id: &Id) -> Result<PathBuf> {
-        let path = blob::path(&self.root, id)?;
+        let path = blob::path(&self.dir, id)?;
         if !path.is_file() {
-            return Err(Error::not_found(format!("blob {} not found in {}", id.base(), self.root.display())));
+            return Err(Error::not_found(format!("blob {} not found in {}", id.base(), self.dir.display())));
         }
         Ok(path)
     }
 }
 
 impl Blobs for DirBlobs {
+    fn prepare(&self) -> Result<()> {
+        fsutil::ensure_dir(&self.dir)
+    }
+
     fn has(&self, id: &Id) -> Result<bool> {
-        Ok(blob::path(&self.root, id)?.is_file())
+        Ok(blob::path(&self.dir, id)?.is_file())
     }
 
     fn len(&self, id: &Id) -> Result<u64> {
@@ -433,20 +436,24 @@ impl Blobs for DirBlobs {
         Ok(Box::new(File::open(&path).map_err(|e| io_err(&path, e))?))
     }
 
+    fn open_raw(&self, id: &Id) -> Result<Box<dyn Read + Send>> {
+        self.open(id)
+    }
+
     fn local_file(&self, id: &Id) -> Result<PathBuf> {
         self.stored(id)
     }
 
     fn put(&self, r: &mut dyn Read) -> Result<(Id, bool, u64)> {
-        blob::put(&self.root, r)
+        blob::put(&self.dir, r)
     }
 
     fn put_file(&self, src: &Path) -> Result<(Id, bool, u64)> {
-        blob::put_file(&self.root, src)
+        blob::put_file(&self.dir, src)
     }
 
     fn scan(&self) -> Result<Listing<(Id, String)>> {
-        let (blobs, problems) = blob::scan(&self.root)?;
+        let (blobs, problems) = blob::scan(&self.dir)?;
         Ok((blobs.into_iter().map(|(id, path)| (id, path.display().to_string())).collect(), problems))
     }
 }

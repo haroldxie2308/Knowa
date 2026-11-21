@@ -12,7 +12,7 @@ use std::time::Duration;
 use knowa_index::Index;
 use knowa_model::query::{Order, View, Where};
 use knowa_model::{Claim, ClaimBody, Draft, Id, Signer, Status, Term, Timestamp, Value, Visibility, vocab};
-use knowa_store::Replica;
+use knowa_store::{Location, Replica};
 
 /// A scratch directory holding a replica (`replica/`) and, apart from it, the index
 /// directory a home would give it (`index/`).
@@ -27,6 +27,13 @@ impl TempDir {
     }
     fn replica(&self) -> PathBuf {
         self.0.join("replica")
+    }
+    fn location(&self) -> Location {
+        Location::Dir(self.replica())
+    }
+    /// The blob cache a home would give it; a directory replica never uses it.
+    fn cache(&self) -> PathBuf {
+        self.0.join("cache")
     }
     fn index(&self) -> PathBuf {
         self.0.join("index")
@@ -78,7 +85,7 @@ impl Writer {
     fn replica(&mut self, dir: &TempDir) -> Replica {
         let (space, owner) = (self.space.clone(), self.actor(0));
         let genesis = self.say(0, &space, vocab::OWNER, Value::Ref(owner));
-        Replica::create(&dir.replica(), &genesis).unwrap()
+        Replica::create(&dir.location(), None, &dir.cache(), &genesis).unwrap()
     }
 }
 
@@ -277,7 +284,7 @@ fn catch_up_waits_only_for_an_append_past_the_indexed_head() {
     append(&r, &[&c1, &c2]);
     drop(Index::open(&r, &dir.index()).unwrap());
     // Another process, in effect: its locks are separate open files.
-    let other = Replica::open(&dir.replica()).unwrap();
+    let other = Replica::open(&dir.location(), None, &dir.cache()).unwrap();
     let wait = Duration::from_millis(300);
 
     // An actor locked, but with nothing past the indexed head: no wait.

@@ -9,7 +9,34 @@ use std::time::Duration;
 
 use knowa_model::vocab::OWNER;
 use knowa_model::{Claim, ClaimBody, Draft, ErrorCode, Id, Signer, Term, Timestamp, Value};
-use knowa_store::{BundleMeta, Head, Manifest, Replica, hash_file, import_bundle, write_bundle};
+use knowa_store::{BundleMeta, Head, Location, Manifest, Replica, hash_file, import_bundle, write_bundle};
+
+/// The blob cache handed to directory replicas, which keep their blobs in their own
+/// directory and never use it.
+fn unused_cache() -> PathBuf {
+    std::env::temp_dir().join("knowa-store-unused-blob-cache")
+}
+
+/// A directory replica at `dir`, its blobs in it too.
+fn create(dir: &Path, genesis: &Claim) -> knowa_model::Result<Replica> {
+    Replica::create(&Location::Dir(dir.to_path_buf()), None, &unused_cache(), genesis)
+}
+
+fn open(dir: &Path) -> knowa_model::Result<Replica> {
+    Replica::open(&Location::Dir(dir.to_path_buf()), None, &unused_cache())
+}
+
+fn create_replica(dir: &Path, manifest: &Manifest) -> knowa_model::Result<Replica> {
+    Replica::create_replica(&Location::Dir(dir.to_path_buf()), None, &unused_cache(), manifest)
+}
+
+/// The directory of a directory replica.
+fn root(r: &Replica) -> &Path {
+    match r.location() {
+        Location::Dir(dir) => dir,
+        other => panic!("{other} is not a directory replica"),
+    }
+}
 
 struct Scratch(PathBuf);
 
@@ -77,7 +104,7 @@ fn note(text: &str) -> Draft {
 fn new_space(dir: &Path) -> (Replica, Author, Claim) {
     let mut owner = Author::new(&Id::new_space().unwrap());
     let genesis = owner.genesis();
-    (Replica::create(dir, &genesis).unwrap(), owner, genesis)
+    (create(dir, &genesis).unwrap(), owner, genesis)
 }
 
 fn log_of(r: &Replica, actor: &Id, from: u64) -> Vec<Claim> {
@@ -90,7 +117,7 @@ fn seqs(claims: &[Claim]) -> Vec<u64> {
 
 /// Segment file names; dot-names (the actor's `.lock`, temp files) are not segments.
 fn segment_files(r: &Replica, actor: &Id) -> Vec<String> {
-    let mut names: Vec<String> = fs::read_dir(r.root().join("log").join(actor.as_str()))
+    let mut names: Vec<String> = fs::read_dir(root(r).join("log").join(actor.as_str()))
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .filter(|n| !n.starts_with('.'))
@@ -114,7 +141,7 @@ fn meta_for(r: &Replica, level: &str, by: &Id) -> BundleMeta {
 }
 
 fn segment_path(r: &Replica, actor: &Id, first: u64) -> PathBuf {
-    r.root().join("log").join(actor.as_str()).join(format!("{first:012}.jsonl"))
+    root(r).join("log").join(actor.as_str()).join(format!("{first:012}.jsonl"))
 }
 
 fn append_bytes(path: &Path, bytes: &[u8]) {
@@ -147,7 +174,9 @@ fn create_then_open_and_verify() {
     let expected =
         Manifest { format: 1, space: owner.space.clone(), owner: owner.id.clone(), genesis: genesis.id.clone() };
     assert_eq!(r.manifest(), &expected);
-    assert_eq!(Replica::open(&s.0).unwrap().manifest(), &expected);
+    assert_eq!(open(&s.0).unwrap().manifest(), &expected);
+    // DESIGN §5.3: a directory's actor lock keeps other writers out; writes never retry.
+    assert!(!r.writers_can_race());
 
     let lock = r.lock_actor(&owner.id).unwrap();
     assert_eq!(r.head(&lock).unwrap(), Some(Head { seq: 1, id: genesis.id.clone() }));
@@ -166,12 +195,12 @@ fn create_and_open_fail_fast() {
     fs::write(s.path("stray"), b"x").unwrap();
     let mut owner = Author::new(&Id::new_space().unwrap());
     let genesis = owner.genesis();
-    assert_eq!(Replica::create(&s.0, &genesis).err().unwrap().code, ErrorCode::Conflict);
+    assert_eq!(create(&s.0, &genesis).err().unwrap().code, ErrorCode::Conflict);
 
     let not_genesis = Author::new(&owner.space).note("not an owner claim");
-    assert_eq!(Replica::create(&s.path("fresh"), &not_genesis).err().unwrap().code, ErrorCode::Invalid);
+    assert_eq!(create(&s.path("fresh"), &not_genesis).err().unwrap().code, ErrorCode::Invalid);
 
-    assert_eq!(Replica::open(&s.path("missing")).err().unwrap().code, ErrorCode::NotFound);
+    assert_eq!(open(&s.path("missing")).err().unwrap().code, ErrorCode::NotFound);
 }
 
 #[test]
@@ -228,7 +257,7 @@ fn merge_tolerates_gaps_fills_them_and_appends_after() {
     assert_eq!(seqs(&all), [1, 2, 3, 4, 5, 6]);
 
     let sb = Scratch::new("merge-dst");
-    let b = Replica::create_replica(&sb.0, a.manifest()).unwrap();
+    let b = create_replica(&sb.0, a.manifest()).unwrap();
     let partial = [all[0].clone(), all[1].clone(), all[4].clone(), all[5].clone()];
     let rep = b.merge(&partial).unwrap();
     assert_eq!((rep.added, rep.skipped_existing), (4, 0));
@@ -269,14 +298,14 @@ fn merge_rejects_equivocation() {
     assert_ne!(fork.id, c2.id);
 
     let sb = Scratch::new("equiv-dst");
-    let b = Replica::create_replica(&sb.0, a.manifest()).unwrap();
+    let b = create_replica(&sb.0, a.manifest()).unwrap();
     b.merge(&[genesis.clone(), c2.clone()]).unwrap();
     assert_eq!(b.merge(std::slice::from_ref(&fork)).unwrap_err().code, ErrorCode::Integrity);
     assert_eq!(log_of(&b, &owner.id, 1), vec![genesis.clone(), c2.clone()]);
 
     // Both branches in one batch: refused before anything is written.
     let sc = Scratch::new("equiv-batch");
-    let c = Replica::create_replica(&sc.0, a.manifest()).unwrap();
+    let c = create_replica(&sc.0, a.manifest()).unwrap();
     assert_eq!(c.merge(&[genesis, c2, fork]).unwrap_err().code, ErrorCode::Integrity);
     assert!(log_of(&c, &owner.id, 1).is_empty());
 }
@@ -290,7 +319,7 @@ fn merge_rejects_claims_that_do_not_link() {
     a.append(&a.lock_actor(&owner.id).unwrap(), &[c2.clone(), c3.clone()]).unwrap();
 
     let sb = Scratch::new("link-dst");
-    let b = Replica::create_replica(&sb.0, a.manifest()).unwrap();
+    let b = create_replica(&sb.0, a.manifest()).unwrap();
     b.merge(&[genesis.clone(), c3.clone()]).unwrap();
 
     // A different seq-2 claim chains onto genesis but not into the existing seq 3.
@@ -358,7 +387,7 @@ fn blobs_are_deduplicated_and_content_addressed() {
 
 /// Every put writes its temp file directly under `blobs/`, dot-prefixed.
 fn assert_no_temp_files(r: &Replica) {
-    let leftovers: Vec<_> = fs::read_dir(r.root().join("blobs"))
+    let leftovers: Vec<_> = fs::read_dir(root(r).join("blobs"))
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .filter(|n| n.starts_with('.'))
@@ -434,7 +463,7 @@ fn hash_file_gives_the_stored_id_and_size_without_storing() {
     fs::write(&src, &data).unwrap();
 
     let (id, size) = hash_file(&src).unwrap();
-    assert_eq!(fs::read_dir(r.root().join("blobs")).unwrap().count(), 0, "hashing wrote into blobs/");
+    assert_eq!(fs::read_dir(root(&r).join("blobs")).unwrap().count(), 0, "hashing wrote into blobs/");
     assert!(!r.has_blob(&id).unwrap());
     let (stored, _, stored_size) = r.put_blob(&mut data.as_slice()).unwrap();
     assert_eq!((id, size), (stored, stored_size));
@@ -686,7 +715,7 @@ fn taking_the_actor_lock_truncates_a_torn_tail() {
     // whole), so it is left for readers to report.
     let mut other = Author::new(&owner.space);
     let o1 = other.note("hello");
-    let dir = r.root().join("log").join(other.id.as_str());
+    let dir = root(&r).join("log").join(other.id.as_str());
     fs::create_dir_all(&dir).unwrap();
     let partial = &o1.to_line().unwrap()[..10];
     fs::write(dir.join("000000000001.jsonl"), partial).unwrap();
@@ -769,7 +798,7 @@ fn a_second_lock_on_an_actor_waits_until_the_first_is_dropped() {
     let (r1, mut owner, _) = new_space(&s.0);
     let mut other = Author::new(&owner.space);
     r1.append(&r1.lock_actor(&other.id).unwrap(), &[other.note("hello")]).unwrap();
-    let r2 = Replica::open(&s.0).unwrap();
+    let r2 = open(&s.0).unwrap();
 
     let held = r1.lock_actor(&owner.id).unwrap();
     assert_eq!(r1.lock_actor(&owner.id).err().unwrap().code, ErrorCode::Internal, "this thread already holds it");
@@ -812,7 +841,7 @@ fn merge_writes_a_fresh_generation_only_when_it_adds() {
     assert_eq!(a.generation().unwrap(), None, "appends do not touch it");
 
     let sb = Scratch::new("gen-dst");
-    let b = Replica::create_replica(&sb.0, a.manifest()).unwrap();
+    let b = create_replica(&sb.0, a.manifest()).unwrap();
     assert_eq!(b.generation().unwrap(), None);
     b.merge(std::slice::from_ref(&genesis)).unwrap();
     let first = b.generation().unwrap().unwrap();
@@ -860,10 +889,10 @@ fn location_key_is_stable_and_differs_per_directory() {
     let key = a.location_key().unwrap();
     assert_eq!(key.len(), 16);
     assert!(key.bytes().all(|c| c.is_ascii_lowercase() || (b'2'..=b'7').contains(&c)), "{key}");
-    assert_eq!(Replica::open(&s.path("a")).unwrap().location_key().unwrap(), key);
+    assert_eq!(open(&s.path("a")).unwrap().location_key().unwrap(), key);
     std::os::unix::fs::symlink(s.path("a"), s.path("link")).unwrap();
-    assert_eq!(Replica::open(&s.path("link")).unwrap().location_key().unwrap(), key);
-    assert_eq!(Replica::open(&s.path("b/../a")).unwrap().location_key().unwrap(), key);
+    assert_eq!(open(&s.path("link")).unwrap().location_key().unwrap(), key);
+    assert_eq!(open(&s.path("b/../a")).unwrap().location_key().unwrap(), key);
     assert_ne!(b.location_key().unwrap(), key);
 }
 
@@ -882,7 +911,7 @@ fn import_rejects_a_genesis_that_is_not_an_owner_claim() {
     for (i, first) in not_owner_claims.into_iter().enumerate() {
         let manifest =
             Manifest { format: 1, space: space.clone(), owner: first.body.actor.clone(), genesis: first.id.clone() };
-        let m = Replica::create_replica(&s.path(&format!("m{i}")), &manifest).unwrap();
+        let m = create_replica(&s.path(&format!("m{i}")), &manifest).unwrap();
         m.merge(std::slice::from_ref(&first)).unwrap();
         let bundle = s.path(&format!("m{i}.knowa"));
         write_bundle(&m, &bundle, &meta_for(&m, "private", &first.body.actor), std::slice::from_ref(&first), &[]).unwrap();

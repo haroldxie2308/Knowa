@@ -2,19 +2,28 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use knowa_config::{Home, SpaceRef, validate_name};
 use knowa_index::Index;
 use knowa_model::query::View;
-use knowa_model::{ClaimBody, Draft, Error, Id, Result, Timestamp, Value, Visibility, vocab};
-use knowa_store::{BundleMeta, Manifest, Replica, VerifyReport, import_bundle, read_bundle_meta, write_bundle};
+use knowa_model::{ClaimBody, Draft, Error, ErrorCode, Id, Result, Timestamp, Value, Visibility, vocab};
+use knowa_store::{
+    BundleMeta, Location, Manifest, Replica, VerifyReport, import_bundle, read_bundle_meta, write_bundle,
+};
 
-use crate::select::{Space, current, index_dir};
+use crate::select::{Space, blob_cache, current, index_dir, open_replica};
 use crate::write::{Txn, term};
 use crate::{ExportResult, ImportResult, InitResult, Sel, SpaceAddResult};
 
-pub(crate) fn init(home: &Home, sel: &Sel, dir: &Path, name: &str, alias: Option<&str>) -> Result<InitResult> {
+pub(crate) fn init(
+    home: &Home,
+    sel: &Sel,
+    location: &Location,
+    blobs: Option<&Location>,
+    name: &str,
+    alias: Option<&str>,
+) -> Result<InitResult> {
     if name.trim().is_empty() {
         return Err(Error::invalid("init: --name must not be empty"));
     }
@@ -23,7 +32,7 @@ pub(crate) fn init(home: &Home, sel: &Sel, dir: &Path, name: &str, alias: Option
             validate_name(a)?;
             a.to_string()
         }
-        None => default_init_alias(dir)?,
+        None => default_alias("init", location)?,
     };
     if home.load_config()?.spaces.contains_key(&alias) {
         return Err(Error::conflict(format!("init: alias '{alias}' is already registered; pass --alias")));
@@ -40,9 +49,10 @@ pub(crate) fn init(home: &Home, sel: &Sel, dir: &Path, name: &str, alias: Option
         None,
         Timestamp::now(),
     ))?;
-    let replica = Replica::create(dir, &genesis)?;
-    let path = fs::canonicalize(replica.root())?;
-    let space = Space::new(home, SpaceRef { alias: Some(alias.clone()), path: path.clone(), readonly: false }, replica)?;
+    let replica = Replica::create(location, blobs, &blob_cache(home), &genesis)?;
+    let (location, blobs) = registered_locations(location, blobs)?;
+    let sref = SpaceRef { alias: Some(alias.clone()), location: location.clone(), blobs: blobs.clone(), readonly: false };
+    let space = Space::new(home, sref, replica)?;
 
     // The owner's actorKind comes from the write prelude.
     let written = Txn::begin(&space, &[&owner])?.write(
@@ -54,8 +64,8 @@ pub(crate) fn init(home: &Home, sel: &Sel, dir: &Path, name: &str, alias: Option
         ],
     )?;
     // Registered only once the space is complete: a failure above leaves an
-    // unregistered directory, never a registered half-initialized space.
-    home.register_space(&alias, &path, &space_id, false)?;
+    // unregistered replica, never a registered half-initialized space.
+    home.register_space(&alias, &location, blobs.as_deref(), &space_id, false)?;
     if home.load_config()?.current_space.is_none() {
         home.set_current_space(&alias)?;
     }
@@ -63,20 +73,31 @@ pub(crate) fn init(home: &Home, sel: &Sel, dir: &Path, name: &str, alias: Option
     let mut claims = vec![genesis.id];
     claims.extend(written.prelude);
     claims.extend(written.result.items.into_iter().map(|i| i.id));
-    Ok(InitResult { space: space_id, path, alias, owner: owner.id, extract_actor: extract.id, claims })
+    Ok(InitResult { space: space_id, location, blobs, alias, owner: owner.id, extract_actor: extract.id, claims })
 }
 
-/// The directory's base name, which must already be a valid alias.
-fn default_init_alias(dir: &Path) -> Result<String> {
-    let abs = std::path::absolute(dir)?;
-    let base = abs
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| Error::invalid(format!("init: cannot derive an alias from {}; pass --alias", dir.display())))?;
-    validate_name(base).map_err(|e| {
-        Error::invalid(format!("init: the directory name {base:?} is not a valid alias ({}); pass --alias", e.message))
+/// The canonical replica and blob locations a registration stores (DESIGN §5.2). A
+/// blob location equal to the replica's is the default, so it is stored as none: every
+/// registration of the replica then reads the same.
+fn registered_locations(location: &Location, blobs: Option<&Location>) -> Result<(String, Option<String>)> {
+    let location = location.canonical()?;
+    let blobs = blobs.map(Location::canonical).transpose()?.filter(|b| *b != location);
+    Ok((location, blobs))
+}
+
+/// The last name in `location`, which must already be a valid alias: a directory's
+/// base name, an object location's last prefix segment, else its bucket. `op` names
+/// the command, for messages.
+fn default_alias(op: &str, location: &Location) -> Result<String> {
+    let base = match location {
+        Location::Dir(dir) => std::path::absolute(dir)?.file_name().and_then(|n| n.to_str()).map(str::to_string),
+        Location::Object(url) => url.trim_end_matches('/').rsplit('/').next().map(str::to_string),
+    };
+    let base = base.ok_or_else(|| Error::invalid(format!("{op}: cannot derive an alias from {location}; pass --alias")))?;
+    validate_name(&base).map_err(|e| {
+        Error::invalid(format!("{op}: the location's name {base:?} is not a valid alias ({}); pass --alias", e.message))
     })?;
-    Ok(base.to_string())
+    Ok(base)
 }
 
 pub(crate) fn export(home: &Home, sel: &Sel, out: &Path, level: Visibility) -> Result<ExportResult> {
@@ -165,22 +186,22 @@ pub(crate) fn import(home: &Home, bundle: &Path, dir: Option<&Path>, alias: Opti
             dest.display()
         )));
     }
-    let path = fs::canonicalize(replica.root())?;
+    let location = replica.location().canonical()?;
     // If the merge added anything it wrote a new rebuild generation, and `Index::open`
     // rebuilds (claims that fill gaps below an indexed head are invisible to catch-up);
     // if it added nothing, catching up is all there is to do (DESIGN §5.4).
     let index = Index::open(&replica, &index_dir(home, &replica)?)?;
     let alias = match alias {
         Some(a) => a.to_string(),
-        None => default_import_alias(home, &path, &index, &meta.space)?,
+        None => default_import_alias(home, &location, &index, &meta.space)?,
     };
-    home.register_space(&alias, &path, &meta.space, true).map_err(|mut e| {
-        e.message = format!("imported into {}, but registering it failed: {} (re-run with --alias)", path.display(), e.message);
+    home.register_space(&alias, &location, None, &meta.space, true).map_err(|mut e| {
+        e.message = format!("imported into {location}, but registering it failed: {} (re-run with --alias)", e.message);
         e
     })?;
     Ok(ImportResult {
         space: meta.space,
-        path,
+        path: PathBuf::from(location),
         alias,
         added: report.added,
         skipped_existing: report.skipped_existing,
@@ -198,7 +219,7 @@ fn check_identity(home: &Home, m: &Manifest, op: &str) -> Result<()> {
         if entry.space != m.space {
             continue;
         }
-        let other = Replica::open(&entry.path).map_err(|mut e| {
+        let other = open_replica(home, &entry.location, entry.blobs.as_deref()).map_err(|mut e| {
             e.message = format!("{op}: registered space '{alias}' (same space id): {}", e.message);
             e
         })?;
@@ -217,27 +238,26 @@ fn check_identity(home: &Home, m: &Manifest, op: &str) -> Result<()> {
 /// Import registers its destination readonly; refuse a destination registered as a
 /// writable space, which the import would otherwise silently make readonly.
 fn refuse_writable(home: &Home, dir: &Path) -> Result<()> {
-    let canon = match fs::canonicalize(dir) {
+    let canon = match Location::Dir(dir.to_path_buf()).canonical() {
         Ok(c) => c,
         // Not created yet, so it cannot be registered.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
+        Err(e) if e.code == ErrorCode::NotFound => return Ok(()),
+        Err(e) => return Err(e),
     };
     for (alias, entry) in home.load_config()?.spaces {
-        if entry.path == canon && !entry.readonly {
+        if entry.location == canon && !entry.readonly {
             return Err(Error::conflict(format!(
-                "import: {} is your writable space '{alias}'; import into another directory",
-                canon.display()
+                "import: {canon} is your writable space '{alias}'; import into another directory"
             )));
         }
     }
     Ok(())
 }
 
-/// Existing registration of this path, else the space's label slugified, else the
+/// Existing registration of this location, else the space's label slugified, else the
 /// space id.
-fn default_import_alias(home: &Home, path: &Path, index: &Index, space: &Id) -> Result<String> {
-    if let Some((alias, _)) = home.load_config()?.spaces.into_iter().find(|(_, e)| e.path == *path) {
+fn default_import_alias(home: &Home, location: &str, index: &Index, space: &Id) -> Result<String> {
+    if let Some((alias, _)) = home.load_config()?.spaces.into_iter().find(|(_, e)| e.location == location) {
         return Ok(alias);
     }
     let label = index.entity(space, &View::default())?.and_then(|e| e.label);
@@ -264,12 +284,18 @@ pub(crate) fn slugify(label: &str) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
-/// Registers an existing replica directory (DESIGN §7 `space add`). Default alias: the
-/// space's label slugified, else the directory name (as `init`).
-pub(crate) fn space_add(home: &Home, dir: &Path, alias: Option<&str>, readonly: bool) -> Result<SpaceAddResult> {
-    let replica = Replica::open(dir)?;
+/// Registers an existing replica (DESIGN §7 `space add`), with its blobs at `blobs`.
+/// Default alias: the space's label slugified, else the location's name (as `init`).
+pub(crate) fn space_add(
+    home: &Home,
+    location: &Location,
+    blobs: Option<&Location>,
+    alias: Option<&str>,
+    readonly: bool,
+) -> Result<SpaceAddResult> {
+    let replica = Replica::open(location, blobs, &blob_cache(home))?;
     check_identity(home, replica.manifest(), "space add")?;
-    let path = fs::canonicalize(replica.root())?;
+    let (canonical, blobs) = registered_locations(location, blobs)?;
     let space = replica.manifest().space.clone();
     let alias = match alias {
         Some(a) => {
@@ -281,12 +307,12 @@ pub(crate) fn space_add(home: &Home, dir: &Path, alias: Option<&str>, readonly: 
             let label = index.entity(&space, &View::default())?.and_then(|e| e.label);
             match label.as_deref().and_then(slugify) {
                 Some(a) => a,
-                None => default_init_alias(dir)?,
+                None => default_alias("space add", location)?,
             }
         }
     };
-    home.register_space(&alias, &path, &space, readonly)?;
-    Ok(SpaceAddResult { alias, space, path, readonly })
+    home.register_space(&alias, &canonical, blobs.as_deref(), &space, readonly)?;
+    Ok(SpaceAddResult { alias, space, location: canonical, blobs, readonly })
 }
 
 /// Each actor is verified under its exclusive lock (`Replica::verify`): a concurrent

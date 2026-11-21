@@ -13,3 +13,10 @@ knowa-model = { version = "0.1.0", path = "../knowa-model" }
 knowa-store = { version = "0.1.0", path = "../knowa-store" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+
+[dev-dependencies]
+# The write-retry test (src/write_race.rs) runs a replica on object_store's in-memory
+# store behind a wrapper that loses an append race on purpose; the same versions as
+# knowa-store's dependencies.
+futures = { version = "0.3.34", default-features = false, features = ["std"] }
+object_store = { version = "0.14.2", default-features = false }

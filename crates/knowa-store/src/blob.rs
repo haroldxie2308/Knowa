@@ -1,5 +1,7 @@
 //! Content-addressed blobs: `blobs/<id[6..8]>/<id>`. Hashing and naming are shared by
-//! every store; storing, listing and paths are the directory store's (`dir::DirBlobs`).
+//! every store. Storing, listing and paths work on a blob directory, the one holding
+//! the fan-out directories: a directory replica's `blobs/` (`dir::DirBlobs`), or this
+//! machine's blob cache, through which an object store's blobs pass (`object`).
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -17,20 +19,20 @@ const COPY_BUF: usize = 64 * 1024;
 pub(crate) type Scan = (Vec<(Id, PathBuf)>, Vec<String>);
 
 /// Streaming SHA-256 → blob id.
-struct BlobHasher {
+pub(crate) struct BlobHasher {
     hasher: Sha256,
 }
 
 impl BlobHasher {
-    fn new() -> BlobHasher {
+    pub(crate) fn new() -> BlobHasher {
         BlobHasher { hasher: Sha256::new() }
     }
 
-    fn update(&mut self, bytes: &[u8]) {
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
         self.hasher.update(bytes);
     }
 
-    fn finish(self) -> Id {
+    pub(crate) fn finish(self) -> Id {
         Id::blob_from_sha256(&self.hasher.finalize().into())
     }
 }
@@ -119,16 +121,17 @@ pub(crate) fn parse_rel_path(rel: &str) -> Option<Id> {
     (fanout(&id).ok()? == dir).then_some(id)
 }
 
-pub(crate) fn path(root: &Path, id: &Id) -> Result<PathBuf> {
+/// `<dir>/<fanout>/<id>`, where `dir` is a blob directory.
+pub(crate) fn path(dir: &Path, id: &Id) -> Result<PathBuf> {
     let id = require_blob(id)?;
-    Ok(root.join(BLOB_DIR).join(fanout(&id)?).join(id.as_str()))
+    Ok(dir.join(fanout(&id)?).join(id.as_str()))
 }
 
-/// Streams `r` into a temp file inside `blobs/` while hashing, then publishes it.
-pub(crate) fn put(root: &Path, r: &mut dyn Read) -> Result<(Id, bool, u64)> {
-    let dir = root.join(BLOB_DIR);
-    fsutil::ensure_dir(&dir)?;
-    let mut tmp = TempFile::create_in(&dir)?;
+/// Streams `r` into a temp file inside the blob directory `dir` while hashing. Returns
+/// the staged file, its id and its size.
+fn stage(dir: &Path, r: &mut dyn Read, what: &dyn Fn() -> String) -> Result<(TempFile, Id, u64)> {
+    fsutil::ensure_dir(dir)?;
+    let mut tmp = TempFile::create_in(dir)?;
     let tmp_path = tmp.path().to_path_buf();
     let mut hasher = BlobHasher::new();
     let size = pump(
@@ -138,17 +141,39 @@ pub(crate) fn put(root: &Path, r: &mut dyn Read) -> Result<(Id, bool, u64)> {
             hasher.update(chunk);
             Ok(())
         },
-        &|| "blob input".to_string(),
+        what,
     )?;
-    publish(root, tmp, hasher.finish(), size)
+    Ok((tmp, hasher.finish(), size))
+}
+
+/// Streams `r` into the blob directory `dir` while hashing, then publishes it.
+pub(crate) fn put(dir: &Path, r: &mut dyn Read) -> Result<(Id, bool, u64)> {
+    let (tmp, id, size) = stage(dir, r, &|| "blob input".to_string())?;
+    publish(dir, tmp, id, size)
+}
+
+/// Stores `r`'s bytes in the blob directory `dir` only if they hash to `expected`;
+/// otherwise nothing is stored and the result is `integrity` (DESIGN §5.3: downloaded
+/// bytes must equal their id before they are used). Returns the stored file.
+pub(crate) fn put_expected(dir: &Path, r: &mut dyn Read, expected: &Id, what: &dyn Fn() -> String) -> Result<PathBuf> {
+    let expected = require_blob(expected)?;
+    let (tmp, got, size) = stage(dir, r, what)?;
+    if got != expected {
+        // Dropped unpublished, the temp file is removed (see `TempPath`'s drop): the
+        // mismatch is the error to report.
+        drop(tmp);
+        return Err(Error::integrity(format!("{}: content hashes to {got}, not to its id {expected}", what())));
+    }
+    publish(dir, tmp, got, size)?;
+    path(dir, &expected)
 }
 
 /// Stores the file at `src` (DESIGN §5 Blob path): `fs::copy` onto a fresh temp name
-/// inside `blobs/`, which clones where the filesystem supports it (std tries
+/// inside the blob directory `dir`, which clones where the filesystem supports it (std tries
 /// `fclonefileat` first on Apple targets, and that works only onto a path that does
 /// not exist yet), then hashes the temp file, never `src`, and publishes it. A locked
 /// source is streamed instead (see `has_lock_flags`).
-pub(crate) fn put_file(root: &Path, src: &Path) -> Result<(Id, bool, u64)> {
+pub(crate) fn put_file(dir: &Path, src: &Path) -> Result<(Id, bool, u64)> {
     // Checked up front, not left to `fs::copy`.
     let meta = regular_source(src)?;
     if has_lock_flags(&meta) {
@@ -158,12 +183,11 @@ pub(crate) fn put_file(root: &Path, src: &Path) -> Result<(Id, bool, u64)> {
         // Streaming makes a fresh file without flags: still a byte copy, hashed as it
         // is written, so the stored bytes match their id. Only the clone is lost.
         let mut f = File::open(src).map_err(|e| source_err(src, e))?;
-        return put(root, &mut f);
+        return put(dir, &mut f);
     }
-    let dir = root.join(BLOB_DIR);
-    fsutil::ensure_dir(&dir)?;
-    let perms = fsutil::fresh_file_permissions(&dir)?;
-    let reserved = TempPath::reserve_in(&dir)?;
+    fsutil::ensure_dir(dir)?;
+    let perms = fsutil::fresh_file_permissions(dir)?;
+    let reserved = TempPath::reserve_in(dir)?;
     fs::copy(src, reserved.path()).map_err(|e| {
         Error::internal(format!("io: copy {} to {}: {e}", src.display(), reserved.path().display()))
     })?;
@@ -173,7 +197,7 @@ pub(crate) fn put_file(root: &Path, src: &Path) -> Result<(Id, bool, u64)> {
     // which entry point stored it.
     tmp.file().set_permissions(perms).map_err(|e| io_err(&tmp_path, e))?;
     let (id, size) = hash_reader(tmp.file(), &|| tmp_path.display().to_string())?;
-    publish(root, tmp, id, size)
+    publish(dir, tmp, id, size)
 }
 
 /// True if `meta` carries a BSD file flag that forbids chmod, rename or unlink of the
@@ -197,9 +221,9 @@ fn has_lock_flags(_meta: &fs::Metadata) -> bool {
 
 /// Shared tail of every put: renames the hashed temp file to its id (fsync file,
 /// rename, fsync dir). An already-present blob is left untouched and the temp file
-/// removed, so each byte sequence is stored once per replica.
-fn publish(root: &Path, tmp: TempFile, id: Id, size: u64) -> Result<(Id, bool, u64)> {
-    let dest = path(root, &id)?;
+/// removed, so each byte sequence is stored once per blob directory.
+fn publish(dir: &Path, tmp: TempFile, id: Id, size: u64) -> Result<(Id, bool, u64)> {
+    let dest = path(dir, &id)?;
     if dest.is_file() {
         tmp.discard()?;
         return Ok((id, false, size));
@@ -211,17 +235,16 @@ fn publish(root: &Path, tmp: TempFile, id: Id, size: u64) -> Result<(Id, bool, u
     Ok((id, true, size))
 }
 
-/// Every blob file under `blobs/`.
-pub(crate) fn scan(root: &Path) -> Result<Scan> {
-    let dir = root.join(BLOB_DIR);
+/// Every blob file in the blob directory `dir`.
+pub(crate) fn scan(dir: &Path) -> Result<Scan> {
     let (mut blobs, mut problems) = (Vec::new(), Vec::new());
     // `blobs/` absent: tools such as git drop empty directories; no directory means
     // no blobs, exactly as an empty one does.
-    let Some(entries) = fsutil::read_dir_if_exists(&dir)? else {
+    let Some(entries) = fsutil::read_dir_if_exists(dir)? else {
         return Ok((blobs, problems));
     };
     for entry in entries {
-        let entry = entry.map_err(|e| io_err(&dir, e))?;
+        let entry = entry.map_err(|e| io_err(dir, e))?;
         let name = match fsutil::entry_name(&entry) {
             Ok(n) => n,
             Err(p) => {

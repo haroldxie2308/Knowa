@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use knowa_api::{Knowa, PutOptions, Sel};
+use knowa_api::{Knowa, Location, PutOptions, Sel};
 use knowa_config::Home;
 use knowa_model::query::{FindItems, MAX_LIMIT, QueryDoc, QueryResult};
 use knowa_model::view::{EntityWhen, WhenSource};
@@ -30,6 +30,14 @@ impl Scratch {
     fn path(&self, rel: &str) -> PathBuf {
         self.0.join(rel)
     }
+    fn dir(&self, rel: &str) -> Location {
+        Location::Dir(self.path(rel))
+    }
+    /// A replica directory opened the way another process would open it; its blobs
+    /// live in it, so no blob cache is involved.
+    fn open(&self, rel: &str) -> Replica {
+        Replica::open(&self.dir(rel), None, &self.path("unused-cache")).unwrap()
+    }
 }
 
 impl Drop for Scratch {
@@ -44,7 +52,7 @@ fn alice(s: &Scratch) -> (Knowa, Sel, Id) {
     home.new_actor("alice", ActorKind::Human).unwrap();
     let k = Knowa::new(home);
     let sel = Sel { space: None, actor: Some("alice".into()) };
-    let init = k.init(&sel, &s.path("alice-space"), "alice notes", Some("main")).unwrap();
+    let init = k.init(&sel, &s.dir("alice-space"), None, "alice notes", Some("main")).unwrap();
     (k, sel, init.space)
 }
 
@@ -67,7 +75,7 @@ fn impostor(s: &Scratch, space: &Id) -> (PathBuf, PathBuf) {
         ))
         .unwrap();
     let dir = s.path("mallory-space");
-    let r = Replica::create(&dir, &genesis).unwrap();
+    let r = Replica::create(&s.dir("mallory-space"), None, &s.path("unused-cache"), &genesis).unwrap();
     let m = r.manifest();
     let meta = BundleMeta {
         format: m.format,
@@ -97,7 +105,7 @@ fn import_and_space_add_refuse_a_second_genesis_for_a_known_space_id() {
     let err = k.import(&bundle, None, None).unwrap_err();
     assert_eq!(err.code, ErrorCode::Conflict, "{err:?}");
     assert!(!k.home().root().join("replicas").join(space.as_str()).exists(), "import wrote before refusing");
-    let err = k.space_add(&dir, Some("fake"), true).unwrap_err();
+    let err = k.space_add(&Location::Dir(dir), None, Some("fake"), true).unwrap_err();
     assert_eq!(err.code, ErrorCode::Conflict, "{err:?}");
     assert!(!k.home().load_config().unwrap().spaces.contains_key("fake"));
 }
@@ -109,7 +117,8 @@ fn queries_refuse_replicas_that_share_a_space_id_but_not_a_genesis() {
     k.query(&sel, find_all()).unwrap();
     let (dir, _) = impostor(&s, &space);
     // Registered behind the api's back (e.g. by a home set up before the rule existed).
-    k.home().register_space("fake", &dir, &space, true).unwrap();
+    let location = Location::Dir(dir).canonical().unwrap();
+    k.home().register_space("fake", &location, None, &space, true).unwrap();
 
     let err = k.query(&sel, find_all()).unwrap_err();
     assert_eq!(err.code, ErrorCode::Conflict, "{err:?}");
@@ -135,7 +144,7 @@ fn verify_waits_for_an_actor_lock() {
     let (k, sel, _) = alice(&s);
     let alice_id = k.home().actor("alice").unwrap().id;
     // Another process, in effect: its lock is a separate open file.
-    let replica = Replica::open(&s.path("alice-space")).unwrap();
+    let replica = s.open("alice-space");
     let held = replica.lock_actor(&alice_id).unwrap();
     let (tx, rx) = mpsc::channel();
     std::thread::scope(|scope| {
@@ -162,7 +171,7 @@ fn a_write_does_not_wait_for_another_actors_writer() {
     k.write(&bot, vec![Draft::new(Id::new_entity().unwrap(), term("knowa:label"), Value::text("first"))]).unwrap();
 
     let bot_actor = k.home().actor("bot").unwrap();
-    let replica = Replica::open(&s.path("alice-space")).unwrap();
+    let replica = s.open("alice-space");
     let in_flight = replica.lock_actor(&bot_actor.id).unwrap();
     let head = replica.head(&in_flight).unwrap().unwrap();
     let body = ClaimBody::from_draft(
@@ -517,7 +526,7 @@ struct Reviewing {
 fn reviewing(tag: &str) -> Reviewing {
     let s = Scratch::new(tag);
     let (k, alice, _) = alice(&s);
-    k.init(&alice, &s.path("other-space"), "other notes", Some("other")).unwrap();
+    k.init(&alice, &s.dir("other-space"), None, "other notes", Some("other")).unwrap();
     let bot = k.home().new_actor("bot", ActorKind::Agent).unwrap().id;
     k.home().new_actor("bot2", ActorKind::Agent).unwrap();
     let write = |space: Option<&str>, actor: &str, texts: &[&str]| -> Vec<Id> {
