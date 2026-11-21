@@ -296,7 +296,6 @@ fn reopening_keeps_the_build_and_another_space_or_an_unfinished_build_is_rebuilt
     apply(&mut idx, &[&g]);
     let epoch = idx.epoch().to_string();
     assert_eq!(epoch.len(), 32);
-    assert_eq!(idx.generation(), Some(generation));
     drop(idx);
 
     let other_space = Id::new_space().unwrap();
@@ -309,7 +308,7 @@ fn reopening_keeps_the_build_and_another_space_or_an_unfinished_build_is_rebuilt
         "an index of another generation must be rebuilt"
     );
     let mut idx = crate::Index::open_existing(&path, dir.path(), &w.space, &w.owner(), Some(generation)).unwrap().unwrap();
-    assert_eq!((idx.epoch(), idx.generation()), (epoch.as_str(), Some(generation)), "reopening keeps the build");
+    assert_eq!(idx.epoch(), epoch, "reopening at the recorded generation keeps the build");
     let e = ent();
     let c2 = w.label(G, &e, "two");
     apply(&mut idx, &[&c2]);

@@ -12,7 +12,7 @@ use std::time::Duration;
 use knowa_index::Index;
 use knowa_model::query::{Order, View, Where};
 use knowa_model::{Claim, ClaimBody, Draft, Id, Signer, Status, Term, Timestamp, Value, Visibility, vocab};
-use knowa_store::{Location, Replica};
+use knowa_store::{BundleMeta, Location, Manifest, Replica, import_bundle, write_bundle};
 
 /// A scratch directory holding a replica (`replica/`) and, apart from it, the index
 /// directory a home would give it (`index/`).
@@ -262,8 +262,12 @@ fn an_explicit_rebuild_records_the_generation() {
     let mut w = Writer::new(2);
     let r = w.replica(&dir);
     drop(Index::open(&r, &dir.index()).unwrap());
-    let c1 = w.say(1, &Id::new_entity().unwrap(), vocab::LABEL, Value::text("merged"));
+    let e = Id::new_entity().unwrap();
+    let c1 = w.say(1, &e, vocab::LABEL, Value::text("merged"));
+    let c2 = w.say(1, &e, vocab::LABEL, Value::text("merged before it"));
+    r.merge(std::slice::from_ref(&c2)).unwrap();
     r.merge(std::slice::from_ref(&c1)).unwrap();
+    assert!(r.generation().unwrap().is_some(), "filling the gap below seq 2 wrote one");
     let idx = Index::rebuild(&r, &dir.index()).unwrap();
     assert!(indexed(&idx, &c1));
     let epoch = idx.epoch().to_string();
@@ -345,6 +349,94 @@ fn indexes_in_two_directories_follow_one_replica() {
     r.merge(std::slice::from_ref(&c1)).unwrap();
     assert!(indexed(&Index::open(&r, &a).unwrap(), &c1));
     assert!(indexed(&Index::open(&r, &b).unwrap(), &c1), "B sees the filled gap");
+}
+
+/// DESIGN §5.4: claims merged above every actor's head need no generation, since
+/// catch-up reads above the indexed heads: the replica's generations stay as they are,
+/// and every index, also another home's, sees the claims without rebuilding.
+#[test]
+fn claims_merged_above_every_head_are_caught_up_without_a_rebuild() {
+    let dir = TempDir::new();
+    let mut w = Writer::new(2);
+    let r = w.replica(&dir);
+    let (a, b) = (dir.0.join("home-a-index"), dir.0.join("home-b-index"));
+    let e = Id::new_entity().unwrap();
+    let mine = w.say(0, &e, vocab::LABEL, Value::text("owner's"));
+    let c1 = w.say(1, &e, vocab::LABEL, Value::text("first"));
+    let c2 = w.say(1, &e, vocab::LABEL, Value::text("second"));
+    let c3 = w.say(1, &e, vocab::LABEL, Value::text("third"));
+    let epochs = [&a, &b].map(|index_dir| Index::open(&r, index_dir).unwrap().epoch().to_string());
+
+    // Above the owner's head and into actor 1's empty log.
+    r.merge(&[mine.clone(), c1.clone()]).unwrap();
+    // Above actor 1's head again, leaving a gap at seq 2.
+    r.merge(std::slice::from_ref(&c3)).unwrap();
+    assert_eq!((r.generation().unwrap(), r.gaps().unwrap()), (None, None));
+    for (index_dir, epoch) in [&a, &b].into_iter().zip(&epochs) {
+        let idx = Index::open(&r, index_dir).unwrap();
+        assert_eq!(idx.epoch(), epoch, "{}: no rebuild", index_dir.display());
+        assert!([&mine, &c1, &c3].into_iter().all(|c| indexed(&idx, c)), "{}", index_dir.display());
+        assert!(!indexed(&idx, &c2));
+    }
+}
+
+/// A bundle of `m`'s space at level private, exported by `by`.
+fn private_meta(m: &Manifest, by: &Id) -> BundleMeta {
+    BundleMeta {
+        format: m.format,
+        space: m.space.clone(),
+        owner: m.owner.clone(),
+        genesis: m.genesis.clone(),
+        level: "private".into(),
+        partial: false,
+        exported_by: by.clone(),
+        at: Timestamp::now().format(),
+    }
+}
+
+/// DESIGN §5.4, §7.2: catch-up never revisits a claim indexed while its blob's bytes
+/// were absent. A merge that adds the bytes writes a fresh rebuild generation, so every
+/// index rebuilds and finds the text through the claims it already held; it fills no
+/// gap, so the gap generation that feed cursors record stays.
+#[test]
+fn a_merge_that_adds_a_text_blob_rebuilds_and_makes_its_text_searchable() {
+    let dir = TempDir::new();
+    let mut w = Writer::new(1);
+    let r = w.replica(&dir);
+    let bytes = "a catalogued quokka sighting".as_bytes();
+    let txt = Id::blob_of(bytes);
+    let note = Id::new_entity().unwrap();
+    let claims = [
+        w.say(0, &txt, vocab::MEDIA_TYPE, Value::text("text/plain")),
+        w.say(0, &note, vocab::CONTENT, Value::Ref(txt.clone())),
+    ];
+    append(&r, &claims.iter().collect::<Vec<_>>());
+    let idx = Index::open(&r, &dir.index()).unwrap();
+    assert!(claims.iter().all(|c| indexed(&idx, c)));
+    assert!(search(&idx, "quokka").is_empty(), "catalog-only: no text yet");
+    let epoch = idx.epoch().to_string();
+    drop(idx);
+
+    // Another replica of the space holds the bytes; a private bundle of it carries them.
+    let holder = Replica::create_replica(&Location::Dir(dir.0.join("holder")), None, &dir.cache(), r.manifest()).unwrap();
+    assert_eq!(holder.put_blob(&mut &bytes[..]).unwrap().0, txt);
+    let genesis = r.read_log(&w.actor(0), 1).unwrap().next().unwrap().unwrap();
+    let bundle = dir.0.join("bytes.knowa");
+    write_bundle(&holder, &bundle, &private_meta(r.manifest(), &w.actor(0)), &[genesis], std::slice::from_ref(&txt))
+        .unwrap();
+    let (generation, gaps) = (r.generation().unwrap(), r.gaps().unwrap());
+    let (_, _, report) = import_bundle(&bundle, &dir.replica()).unwrap();
+    assert_eq!((report.added, report.blobs_added), (0, 1));
+    assert_ne!(r.generation().unwrap(), generation);
+    assert_eq!(r.gaps().unwrap(), gaps, "blobs fill no gap");
+
+    let idx = Index::open(&r, &dir.index()).unwrap();
+    assert_ne!(idx.epoch(), epoch, "the new rebuild generation forces a rebuild");
+    let mut want = vec![txt, note];
+    want.sort();
+    let mut got = search(&idx, "quokka");
+    got.sort();
+    assert_eq!(got, want);
 }
 
 #[test]

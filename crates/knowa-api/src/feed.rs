@@ -4,11 +4,11 @@
 //! **Cursor format, version 1.** Opaque to clients, but deterministic and validated:
 //!
 //! ```text
-//! fc1.<generation>(.<actor>.<seq>)*
+//! fc1.<gaps>(.<actor>.<seq>)*
 //! ```
 //!
-//! - `<generation>` is the replica's rebuild generation (DESIGN §5.4) that the index
-//!   serving the page was built against, or empty when the replica has none.
+//! - `<gaps>` is the replica's gap generation (DESIGN §5.4), read before the index
+//!   serving the page is opened, or empty when the replica has none.
 //! - Each `<actor>.<seq>` pair is an `a_` actor id and the highest seq of that actor
 //!   already delivered, in decimal without leading zeros, within 1..=2^53−1. Pairs
 //!   are sorted by actor id, one per actor. An actor without a pair has had nothing
@@ -20,8 +20,11 @@
 //! one cursor. Anything else → `invalid`.
 //!
 //! Per-actor seqs mean the same on every index of a replica, so a cursor holds as long
-//! as the replica's generation does. A new generation means a merge filled gaps in the
-//! logs, possibly below seqs the cursor has passed → `cursor_expired`.
+//! as the replica's gap generation does: across a reindex, and across merges that only
+//! add claims above every actor's head (which land above every seq a cursor has
+//! passed) or add blobs, which rebuild indexes without changing any seq. A new gap
+//! generation means a merge filled gaps in the logs, possibly below seqs the cursor has
+//! passed → `cursor_expired`.
 
 use std::collections::BTreeMap;
 
@@ -36,23 +39,24 @@ const CURSOR_VERSION: &str = "fc1";
 /// Separates the cursor's fields.
 const SEP: char = '.';
 
-/// A feed position: what has been delivered, valid at one rebuild generation.
+/// A feed position: what has been delivered, valid at one gap generation.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Cursor {
-    generation: Option<String>,
+    /// the replica's gap generation
+    gaps: Option<String>,
     /// the highest seq delivered, per actor
     delivered: BTreeMap<Id, u64>,
 }
 
 impl Cursor {
-    /// Nothing delivered yet, at `generation`, which comes from the replica (through the
-    /// index). One that the format cannot carry → `internal`: the store's generation
-    /// rule and this format disagree.
-    fn start(generation: Option<&str>) -> Result<Cursor> {
-        if let Some(g) = generation.filter(|g| !is_generation(g)) {
-            return Err(Error::internal(format!("rebuild generation {g:?} cannot be recorded in a feed cursor")));
+    /// Nothing delivered yet, at gap generation `gaps`, which comes from the replica.
+    /// One that the format cannot carry → `internal`: the store's rule for the `gaps`
+    /// file and this format disagree.
+    fn start(gaps: Option<&str>) -> Result<Cursor> {
+        if let Some(g) = gaps.filter(|g| !is_ulid(g)) {
+            return Err(Error::internal(format!("gap generation {g:?} cannot be recorded in a feed cursor")));
         }
-        Ok(Cursor { generation: generation.map(str::to_string), delivered: BTreeMap::new() })
+        Ok(Cursor { gaps: gaps.map(str::to_string), delivered: BTreeMap::new() })
     }
 
     /// Accepts exactly the texts `encode` produces; anything else → `invalid`.
@@ -65,11 +69,12 @@ impl Cursor {
             .and_then(|r| r.strip_prefix(SEP))
             .ok_or_else(|| malformed(format!("it does not start with {CURSOR_VERSION}{SEP}")))?;
         let mut fields = rest.split(SEP);
-        let generation = match fields.next() {
-            // `split` always yields a first field; empty means the replica had no generation.
+        let gaps = match fields.next() {
+            // `split` always yields a first field; empty means the replica had no gap
+            // generation.
             None | Some("") => None,
-            Some(g) if is_generation(g) => Some(g.to_string()),
-            Some(g) => return Err(malformed(format!("{g:?} is not a rebuild generation"))),
+            Some(g) if is_ulid(g) => Some(g.to_string()),
+            Some(g) => return Err(malformed(format!("{g:?} is not a gap generation"))),
         };
         let mut delivered = BTreeMap::new();
         while let Some(actor) = fields.next() {
@@ -81,7 +86,7 @@ impl Cursor {
             let seq = parse_seq(seq).ok_or_else(|| malformed(format!("{seq:?} is not a seq in 1..=2^53−1")))?;
             delivered.insert(actor, seq);
         }
-        let cursor = Cursor { generation, delivered };
+        let cursor = Cursor { gaps, delivered };
         if cursor.encode() != s {
             return Err(malformed("it is not in canonical form (actors sorted, each once; seqs without leading zeros)".into()));
         }
@@ -90,8 +95,8 @@ impl Cursor {
 
     fn encode(&self) -> String {
         let mut out = format!("{CURSOR_VERSION}{SEP}");
-        // An absent generation is the empty field.
-        if let Some(g) = &self.generation {
+        // An absent gap generation is the empty field.
+        if let Some(g) = &self.gaps {
             out.push_str(g);
         }
         for (actor, seq) in &self.delivered {
@@ -109,10 +114,10 @@ impl Cursor {
     }
 }
 
-/// What a replica's generation file holds: one ULID, 26 lowercase base32 characters
+/// What a replica's `gaps` file holds: one ULID, 26 lowercase base32 characters
 /// (knowa-store accepts exactly these). Checked so that a cut-off cursor is `invalid`,
 /// not `cursor_expired`.
-fn is_generation(g: &str) -> bool {
+fn is_ulid(g: &str) -> bool {
     g.len() == 26 && g.bytes().all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
 }
 
@@ -127,25 +132,31 @@ fn parse_seq(s: &str) -> Option<u64> {
 
 /// DESIGN §6 feed: the claims `cursor` has not delivered (all of them without one), in
 /// this machine's arrival order, and the cursor that also covers them. A cursor issued
-/// at another rebuild generation than the replica's now → `cursor_expired`.
+/// at another gap generation than the replica's now → `cursor_expired`.
 pub(crate) fn feed(space: &Space, cursor: Option<&str>, limit: u32) -> Result<FeedResult> {
     check_limit(limit, "limit")?;
     let given = cursor.map(Cursor::parse).transpose()?;
-    let index = space.index()?;
+    // Read before the index is opened. A merge that fills gaps writes a fresh `gaps`
+    // after its last write, so if this page misses claims of one that lands from here
+    // on, the cursor it returns expires on the next call. And one that finished before
+    // this read wrote its rebuild generation before its last `gaps`, so the index
+    // opened below rebuilds over the gaps it filled.
+    let gaps = space.replica.gaps()?;
     let mut next = match given {
-        None => Cursor::start(index.generation())?,
-        Some(c) if c.generation.as_deref() == index.generation() => c,
+        None => Cursor::start(gaps.as_deref())?,
+        Some(c) if c.gaps == gaps => c,
         Some(c) => {
             let name = |g: Option<&str>| g.map_or_else(|| "none".to_string(), str::to_string);
             return Err(Error::cursor_expired(format!(
-                "feed cursor is from rebuild generation {}, but the replica of space {} is now at generation {}: a merge has filled gaps in its logs since, possibly below seqs this cursor has passed; restart the feed from the beginning, without a cursor (writes are idempotent)",
-                name(c.generation.as_deref()),
+                "feed cursor is from gap generation {}, but the replica of space {} is now at gap generation {}: a merge has filled gaps in its logs since, possibly below seqs this cursor has passed; restart the feed from the beginning, without a cursor (writes are idempotent)",
+                name(c.gaps.as_deref()),
                 space.name(),
-                name(index.generation())
+                name(gaps.as_deref())
             ))
-            .with_detail(serde_json::json!({ "cursor": cursor, "generation": index.generation() })));
+            .with_detail(serde_json::json!({ "cursor": cursor, "gaps": gaps })));
         }
     };
+    let index = space.index()?;
     let claims = index.feed(&next.delivered, limit)?;
     for c in &claims {
         next.deliver(&c.claim.body.actor, c.claim.body.seq);
@@ -166,43 +177,43 @@ mod tests {
     use super::*;
     use knowa_model::{ErrorCode, Signer};
 
-    const GEN: &str = "01jd5k8v0m3q7x9yz2c4b6n8pr";
+    const GAPS: &str = "01jd5k8v0m3q7x9yz2c4b6n8pr";
 
     fn actor(n: u8) -> Id {
         Signer::from_seed([n; 32]).actor_id()
     }
 
-    fn cursor(generation: Option<&str>, delivered: &[(&Id, u64)]) -> Cursor {
-        Cursor { generation: generation.map(str::to_string), delivered: delivered.iter().map(|(a, s)| ((*a).clone(), *s)).collect() }
+    fn cursor(gaps: Option<&str>, delivered: &[(&Id, u64)]) -> Cursor {
+        Cursor { gaps: gaps.map(str::to_string), delivered: delivered.iter().map(|(a, s)| ((*a).clone(), *s)).collect() }
     }
 
     #[test]
     fn cursors_round_trip_in_one_canonical_form() {
         let (a, b) = (actor(1), actor(2));
         let (lo, hi) = if a < b { (&a, &b) } else { (&b, &a) };
-        let c = cursor(Some(GEN), &[(hi, 7), (lo, 42)]);
+        let c = cursor(Some(GAPS), &[(hi, 7), (lo, 42)]);
         let text = c.encode();
-        assert_eq!(text, format!("fc1.{GEN}.{lo}.42.{hi}.7"), "actors sorted by id");
+        assert_eq!(text, format!("fc1.{GAPS}.{lo}.42.{hi}.7"), "actors sorted by id");
         assert_eq!(Cursor::parse(&text).unwrap(), c);
 
         let none = cursor(None, &[(&a, 1)]);
-        assert_eq!(none.encode(), format!("fc1..{a}.1"), "no generation: an empty field");
+        assert_eq!(none.encode(), format!("fc1..{a}.1"), "no gap generation: an empty field");
         assert_eq!(Cursor::parse(&none.encode()).unwrap(), none);
 
         let start = Cursor::start(None).unwrap();
         assert_eq!(start.encode(), "fc1.");
         assert_eq!(Cursor::parse("fc1.").unwrap(), start);
-        assert_eq!(Cursor::parse(&format!("fc1.{GEN}")).unwrap(), Cursor::start(Some(GEN)).unwrap());
+        assert_eq!(Cursor::parse(&format!("fc1.{GAPS}")).unwrap(), Cursor::start(Some(GAPS)).unwrap());
     }
 
     #[test]
     fn delivering_keeps_the_highest_seq_per_actor() {
         let (a, b) = (actor(1), actor(2));
-        let mut c = cursor(Some(GEN), &[(&a, 5)]);
+        let mut c = cursor(Some(GAPS), &[(&a, 5)]);
         c.deliver(&a, 6);
         c.deliver(&b, 1);
         c.deliver(&a, 3);
-        assert_eq!(c, cursor(Some(GEN), &[(&a, 6), (&b, 1)]));
+        assert_eq!(c, cursor(Some(GAPS), &[(&a, 6), (&b, 1)]));
     }
 
     #[test]
@@ -219,36 +230,36 @@ mod tests {
             "fc2.".into(),
             "FC1.".into(),
             " fc1.".into(),
-            format!("fc1.{GEN}."),
-            format!("fc1.{}", &GEN[..20]),
-            format!("fc1.{}", GEN.to_uppercase()),
-            format!("fc1.{GEN}x"),
-            format!("fc1.{GEN}.{a}"),
-            format!("fc1.{GEN}.{a}."),
-            format!("fc1.{GEN}.{a}.0"),
-            format!("fc1.{GEN}.{a}.007"),
-            format!("fc1.{GEN}.{a}.+7"),
-            format!("fc1.{GEN}.{a}.-7"),
-            format!("fc1.{GEN}.{a}.7 "),
-            format!("fc1.{GEN}.{a}.{}", max + 1),
-            format!("fc1.{GEN}.{a}.99999999999999999999999"),
-            format!("fc1.{GEN}.{hi}.1.{lo}.1"),
-            format!("fc1.{GEN}.{a}.1.{a}.2"),
-            format!("fc1.{GEN}.{entity}.1"),
-            format!("fc1.{GEN}.{}.1", &a.as_str()[..20]),
-            format!("fc1.{GEN}.{a}.1:2"),
+            format!("fc1.{GAPS}."),
+            format!("fc1.{}", &GAPS[..20]),
+            format!("fc1.{}", GAPS.to_uppercase()),
+            format!("fc1.{GAPS}x"),
+            format!("fc1.{GAPS}.{a}"),
+            format!("fc1.{GAPS}.{a}."),
+            format!("fc1.{GAPS}.{a}.0"),
+            format!("fc1.{GAPS}.{a}.007"),
+            format!("fc1.{GAPS}.{a}.+7"),
+            format!("fc1.{GAPS}.{a}.-7"),
+            format!("fc1.{GAPS}.{a}.7 "),
+            format!("fc1.{GAPS}.{a}.{}", max + 1),
+            format!("fc1.{GAPS}.{a}.99999999999999999999999"),
+            format!("fc1.{GAPS}.{hi}.1.{lo}.1"),
+            format!("fc1.{GAPS}.{a}.1.{a}.2"),
+            format!("fc1.{GAPS}.{entity}.1"),
+            format!("fc1.{GAPS}.{}.1", &a.as_str()[..20]),
+            format!("fc1.{GAPS}.{a}.1:2"),
         ];
         for s in &bad {
             let e = Cursor::parse(s).unwrap_err();
             assert_eq!(e.code, ErrorCode::Invalid, "{s:?}");
             assert!(e.message.contains("pass a cursor back exactly"), "{s:?}: {}", e.message);
         }
-        assert!(Cursor::parse(&format!("fc1.{GEN}.{a}.{max}")).is_ok(), "the largest seq");
+        assert!(Cursor::parse(&format!("fc1.{GAPS}.{a}.{max}")).is_ok(), "the largest seq");
     }
 
     #[test]
-    fn a_generation_the_format_cannot_carry_is_internal() {
-        assert_eq!(Cursor::start(Some("not.a.generation")).unwrap_err().code, ErrorCode::Internal);
+    fn a_gap_generation_the_format_cannot_carry_is_internal() {
+        assert_eq!(Cursor::start(Some("not.a.ulid")).unwrap_err().code, ErrorCode::Internal);
     }
 
     #[test]

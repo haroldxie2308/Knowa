@@ -1,6 +1,6 @@
 //! The storage seam (DESIGN §5): a replica is its manifest plus two stores, one for
-//! the claim logs (which also holds the manifest and the rebuild generation, at the
-//! replica's location) and one for blobs (at the blob location). Everything that is
+//! the claim logs (which also holds the manifest and the rebuild and gap generations,
+//! at the replica's location) and one for blobs (at the blob location). Everything that is
 //! not storage — claim checks, chains, merge plans, verification — is written once
 //! against these traits.
 //!
@@ -37,7 +37,7 @@ pub(crate) struct LastLine {
     pub(crate) trailing: u64,
 }
 
-/// The replica's location: manifest, rebuild generation and claim logs.
+/// The replica's location: manifest, rebuild and gap generations, and claim logs.
 pub(crate) trait Logs: Send + Sync {
     /// The location, for messages.
     fn describe(&self) -> String;
@@ -63,6 +63,12 @@ pub(crate) trait Logs: Send + Sync {
 
     /// Replaces `generation` whole, atomically: a reader sees the old or the new value.
     fn write_generation(&self, bytes: &[u8]) -> Result<()>;
+
+    /// `gaps` (DESIGN §5.4); `None` when absent.
+    fn read_gaps(&self) -> Result<Option<Vec<u8>>>;
+
+    /// Replaces `gaps` whole, atomically: a reader sees the old or the new value.
+    fn write_gaps(&self, bytes: &[u8]) -> Result<()>;
 
     /// Blocks until `actor`'s write exclusivity is held. A store without locks returns
     /// a guard that holds nothing; it relies on create-only segment writes instead.

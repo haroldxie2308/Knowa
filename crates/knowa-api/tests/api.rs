@@ -14,7 +14,7 @@ use knowa_model::query::{FindItems, MAX_LIMIT, QueryDoc, QueryResult};
 use knowa_model::view::{EntityWhen, WhenSource};
 use knowa_model::vocab::{ACTOR_KIND, CREATED, MEDIA_TYPE, MODIFIED, NAME, OWNER, SIZE, SOURCE};
 use knowa_model::{ActorKind, ClaimBody, Draft, ErrorCode, Id, Signer, Term, Timestamp, Value, When};
-use knowa_store::{BundleMeta, Replica, write_bundle};
+use knowa_store::{BundleMeta, Replica, import_bundle, write_bundle};
 
 struct Scratch(PathBuf);
 
@@ -664,7 +664,7 @@ fn every_claim(k: &Knowa, sel: &Sel) -> Vec<Id> {
     sorted(ids(&all))
 }
 
-/// A cursor is per-actor seqs at a rebuild generation, so pages served by different
+/// A cursor is per-actor seqs at a gap generation, so pages served by different
 /// indexes of one replica (this home's, the same after `reindex`, another home's, each
 /// with its own arrival order) together deliver every claim exactly once.
 #[test]
@@ -756,28 +756,77 @@ fn chain(space: &Id, n: u64) -> Vec<knowa_model::Claim> {
     out
 }
 
-/// DESIGN §5.4 / §6 feed: a merge that fills a gap below seqs a cursor has passed gives
-/// the replica a new rebuild generation, which expires the cursor instead of letting it
-/// step over the claims that filled the gap.
+/// Imports blob bytes the replica in `rel` lacks, with no new claim: a private bundle
+/// of another replica of its space that holds them. Returns the blob's id.
+fn import_new_blob(s: &Scratch, rel: &str, bytes: &[u8]) -> Id {
+    let replica = s.open(rel);
+    let m = replica.manifest();
+    let holder = Replica::create_replica(&s.dir("holder"), None, &s.path("unused-cache"), m).unwrap();
+    let (blob, _, _) = holder.put_blob(&mut &bytes[..]).unwrap();
+    let genesis = replica.read_log(&m.owner, 1).unwrap().next().unwrap().unwrap();
+    let meta = BundleMeta {
+        format: m.format,
+        space: m.space.clone(),
+        owner: m.owner.clone(),
+        genesis: m.genesis.clone(),
+        level: "private".into(),
+        partial: false,
+        exported_by: m.owner.clone(),
+        at: Timestamp::now().format(),
+    };
+    let bundle = s.path("bytes.knowa");
+    write_bundle(&holder, &bundle, &meta, &[genesis], std::slice::from_ref(&blob)).unwrap();
+    let (_, _, report) = import_bundle(&bundle, &s.path(rel)).unwrap();
+    assert_eq!((report.added, report.blobs_added), (0, 1));
+    blob
+}
+
+/// DESIGN §5.4 / §6 feed: a cursor records the replica's gap generation and expires
+/// exactly when it changes. Claims merged above every head and blob bytes leave it (the
+/// latter make indexes rebuild, which a cursor survives); a merge that fills a gap
+/// below seqs a cursor has passed writes a fresh one, which expires the cursor instead
+/// of letting it step over the claims that filled the gap.
 #[test]
-fn a_merge_that_fills_a_gap_expires_feed_cursors() {
+fn a_feed_cursor_expires_exactly_when_the_gap_generation_changes() {
     let s = Scratch::new("feed-gap");
     let (k, sel, space) = alice(&s);
     let replica = s.open("alice-space");
+    let mut cursor = k.feed(&sel, None, MAX_LIMIT).unwrap().cursor;
     let dave = chain(&space, 3);
-    replica.merge(&[dave[0].clone(), dave[2].clone()]).unwrap();
-    let page = k.feed(&sel, None, MAX_LIMIT).unwrap();
-    assert!(ids(&page).contains(&dave[2].id) && !ids(&page).contains(&dave[1].id));
-    k.reindex(&sel).unwrap();
-    assert!(k.feed(&sel, Some(&page.cursor), MAX_LIMIT).unwrap().claims.is_empty(), "a reindex alone does not expire it");
 
+    // Into dave's empty log: above every head, gap and all.
+    replica.merge(&[dave[0].clone(), dave[2].clone()]).unwrap();
+    assert_eq!(replica.gaps().unwrap(), None);
+    let page = k.feed(&sel, Some(&cursor), MAX_LIMIT).unwrap();
+    assert_eq!(sorted(ids(&page)), sorted(vec![dave[0].id.clone(), dave[2].id.clone()]));
+    cursor = page.cursor;
+    k.reindex(&sel).unwrap();
+    assert!(k.feed(&sel, Some(&cursor), MAX_LIMIT).unwrap().claims.is_empty(), "a reindex does not expire it");
+
+    // New bytes: a new rebuild generation, the same gap generation.
+    let generation = replica.generation().unwrap();
+    import_new_blob(&s, "alice-space", b"bytes that arrive later");
+    assert_ne!(replica.generation().unwrap(), generation);
+    assert_eq!(replica.gaps().unwrap(), None);
+    let page = k.feed(&sel, Some(&cursor), MAX_LIMIT).unwrap();
+    assert!(page.claims.is_empty(), "{:?}", ids(&page));
+    assert_eq!(page.cursor, cursor, "nothing new: the cursor stays");
+    label(&k, "alice", "after the bytes");
+    let page = k.feed(&sel, Some(&cursor), MAX_LIMIT).unwrap();
+    assert_eq!(page.claims.len(), 1, "{:?}", ids(&page));
+    cursor = page.cursor;
+
+    // Below dave's head: the gap generation changes, and with it the cursor expires.
     replica.merge(std::slice::from_ref(&dave[1])).unwrap();
-    let err = k.feed(&sel, Some(&page.cursor), MAX_LIMIT).unwrap_err();
+    let gaps = replica.gaps().unwrap().unwrap();
+    let err = k.feed(&sel, Some(&cursor), MAX_LIMIT).unwrap_err();
     assert_eq!(err.code, ErrorCode::CursorExpired, "{err:?}");
     assert!(err.message.contains("restart the feed from the beginning"), "{}", err.message);
-    let generation = replica.generation().unwrap().unwrap();
-    assert_eq!(err.detail.as_ref().unwrap()["generation"], generation.as_str());
-    assert!(ids(&k.feed(&sel, None, MAX_LIMIT).unwrap()).contains(&dave[1].id), "from the beginning, the filled gap is there");
+    assert_eq!(err.detail.as_ref().unwrap()["gaps"], gaps.as_str());
+    let restart = k.feed(&sel, None, MAX_LIMIT).unwrap();
+    assert!(ids(&restart).contains(&dave[1].id), "from the beginning, the filled gap is there");
+    assert!(restart.cursor.starts_with(&format!("fc1.{gaps}.")), "{}", restart.cursor);
+    assert!(k.feed(&sel, Some(&restart.cursor), MAX_LIMIT).unwrap().claims.is_empty());
 }
 
 /// A command that appends each batch it gets, one JSON line per batch, to `log`.

@@ -187,13 +187,13 @@ fn save_cursor(path: &Path, cursor: &str) -> Result<()> {
     Ok(())
 }
 
-/// The persisted cursor predates a new rebuild generation of the replica.
+/// The persisted cursor predates a new gap generation of the replica.
 fn expired(e: Error, cursor_file: &Path) -> Error {
     if e.code != ErrorCode::CursorExpired {
         return e;
     }
     Error::cursor_expired(format!(
-        "worker cursor is from an earlier rebuild generation of the replica (a merge has filled gaps in its logs since, possibly below seqs the worker has passed); delete {} to restart the worker from the beginning. The whole feed is then replayed through the command: a draft equal to an active, non-stale claim the worker already wrote is a no-op, but a draft using placeholders (_:x) mints new entities and is written again, duplicating its earlier output",
+        "worker cursor is from an earlier gap generation of the replica (a merge has filled gaps in its logs since, possibly below seqs the worker has passed); delete {} to restart the worker from the beginning. The whole feed is then replayed through the command: a draft equal to an active, non-stale claim the worker already wrote is a no-op, but a draft using placeholders (_:x) mints new entities and is written again, duplicating its earlier output",
         cursor_file.display()
     ))
     .with_detail(serde_json::json!({ "cursorFile": cursor_file }))

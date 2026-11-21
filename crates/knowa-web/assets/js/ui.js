@@ -20,7 +20,7 @@ const ADVICE = {
   invalid: "Correct the input, then retry.",
   conflict: "Resolve the conflict the message names in a terminal, then retry.",
   unsupported: "Narrow the request as the message suggests.",
-  cursor_expired: "The index was rebuilt since this page loaded. Retry to start from the beginning.",
+  cursor_expired: "An import filled gaps in this space’s history since this page loaded. Retry to start from the beginning.",
   integrity: "Run knowa verify in a terminal to see what failed.",
   internal: "Retry. If it keeps failing, the terminal running knowa serve shows the cause.",
   app: "Reload the page. If it happens again, the browser console has the details.",

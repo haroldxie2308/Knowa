@@ -255,7 +255,7 @@ impl Knowa {
 
     /// DESIGN §6 feed. `cursor` is one a previous call returned (malformed → `invalid`),
     /// None = from the beginning. It holds across a reindex and on every machine reading
-    /// the replica; issued at another rebuild generation than the replica's now →
+    /// the replica; issued at another gap generation than the replica's now →
     /// `cursor_expired`.
     pub fn feed(&self, sel: &Sel, cursor: Option<&str>, limit: u32) -> Result<FeedResult> {
         feed::feed(&select::current(&self.home, sel)?, cursor, limit)

@@ -75,8 +75,6 @@ pub struct Page<T> {
 pub struct Index {
     conn: Connection,
     epoch: String,
-    /// the replica's rebuild generation this index was built against (DESIGN §5.4)
-    generation: Option<String>,
     space: Id,
     /// genesis owner, from the manifest
     owner: Id,
@@ -224,12 +222,6 @@ impl Index {
         &self.epoch
     }
 
-    /// The replica's rebuild generation this index was built against (DESIGN §5.4);
-    /// `None` for a replica that has none. Feed cursors record it.
-    pub fn generation(&self) -> Option<&str> {
-        self.generation.as_deref()
-    }
-
     /// Highest indexed seq per actor (for catch-up / diagnostics).
     pub fn actor_heads(&self) -> Result<Vec<(Id, u64)>> {
         read::actor_heads(&self.conn)
@@ -281,8 +273,8 @@ impl Index {
     /// DESIGN §6 feed: the claims not yet delivered according to `delivered`, the
     /// highest seq already delivered per actor (an actor without an entry has had
     /// nothing delivered), in local arrival order, at most `limit`. The map is only
-    /// meaningful at the `generation` it was built against, which the caller checks;
-    /// `read::feed` says why a page then never steps over a claim.
+    /// meaningful at the replica's gap generation it was built at, which the caller
+    /// checks; `read::feed` says why a page then never steps over a claim.
     pub fn feed(&self, delivered: &BTreeMap<Id, u64>, limit: u32) -> Result<Vec<ClaimView>> {
         read::feed(&self.conn, delivered, limit)
     }
@@ -389,7 +381,6 @@ impl Index {
         let index = Index {
             conn,
             epoch,
-            generation: generation.map(str::to_string),
             space: space.clone(),
             owner: owner.clone(),
             dir: dir.to_path_buf(),
@@ -426,7 +417,8 @@ impl Index {
         if get(META_SPACE)?.as_deref() != Some(space.as_str()) {
             return Ok(None);
         }
-        // A merge since the build may have filled gaps below indexed heads (DESIGN §5.4).
+        // A merge since the build may have filled gaps below indexed heads, or brought
+        // the text of claims already indexed (DESIGN §5.4).
         if get(META_GENERATION)?.as_deref() != generation {
             return Ok(None);
         }
@@ -434,7 +426,6 @@ impl Index {
         Ok(Some(Index {
             conn,
             epoch,
-            generation: generation.map(str::to_string),
             space: space.clone(),
             owner: owner.clone(),
             dir: dir.to_path_buf(),

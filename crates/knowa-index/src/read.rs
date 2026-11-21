@@ -848,8 +848,9 @@ pub(crate) const FEED_NEXT_SQL: &str = "SELECT n, seq FROM claims WHERE actor = 
 ///
 /// Claims that fill a gap below an indexed head are never applied by catch-up. The
 /// merge that brings them changes the replica's rebuild generation, which makes the
-/// index rebuild and expires every cursor issued before (checked by the caller), so a
-/// cursor never steps over a claim that arrives later below it.
+/// index rebuild, and its gap generation, which expires every cursor issued before
+/// (checked by the caller), so a cursor never steps over a claim that arrives later
+/// below it.
 ///
 /// An actor's undelivered claims are therefore a suffix of its claims by seq and by
 /// arrival alike, and a page is a k-way merge, by arrival number, of one such stream

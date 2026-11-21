@@ -139,17 +139,23 @@ pub(crate) fn tail(logs: &dyn Logs, space: &Id, actor: &Id) -> Result<Option<Hea
 }
 
 /// Whether `actor`'s log may hold a claim with seq above `seq`, judged without any lock
-/// from the last complete line of the newest segment (DESIGN §5.4 catch-up). An
-/// unterminated final line is a batch still being written, or one a crash left for the
-/// next writer to truncate, and is ignored. `true` whenever it cannot tell, so that the
-/// caller reads the log under the actor's lock and gets the authoritative answer.
+/// from the last complete line of the newest segment (DESIGN §5.4 catch-up). On a store
+/// whose appends extend a segment in place (a directory), an unterminated final line
+/// is a batch still being written, or one a crash left for the next writer to
+/// truncate, and is ignored; where segments are written whole it is damage, which the
+/// read reports. `true` whenever it cannot tell, so that the caller reads the log under
+/// the actor's lock and gets the authoritative answer.
 pub(crate) fn may_have_after(logs: &dyn Logs, actor: &Id, seq: u64) -> Result<bool> {
     let (segments, problems) = logs.segments(actor)?;
     let Some(newest) = segments.last() else {
         // Misnamed entries and nothing else: the locked read reports them.
         return Ok(!problems.is_empty());
     };
-    let Some(line) = logs.last_line(actor, newest)?.line else {
+    let last = logs.last_line(actor, newest)?;
+    if last.trailing > 0 && !appends_in_place(logs) {
+        return Ok(true);
+    }
+    let Some(line) = last.line else {
         // A newest segment without a complete line, which no append leaves behind: the
         // locked read reports it.
         return Ok(true);
@@ -163,20 +169,31 @@ pub(crate) fn may_have_after(logs: &dyn Logs, actor: &Id, seq: u64) -> Result<bo
     }
 }
 
+/// Whether `logs` extends an actor's newest segment in place, under the actor's
+/// exclusive lock (a directory), so that its unterminated final line can be an append
+/// in flight or torn. A store without locks writes every segment whole (DESIGN §5.3).
+fn appends_in_place(logs: &dyn Logs) -> bool {
+    logs.exclusive_locks()
+}
+
 /// Streams one actor's claims with seq ≥ `from_seq`, ascending. Checks structure,
 /// ownership and ordering, and verifies (id + signature) every claim it yields: logs
 /// are never trusted (DESIGN §5.3). Lines below `from_seq` are only parsed for ordering.
 ///
 /// The actor's lock is held for as long as the iterator lives: exclusively by the
-/// caller, or as `guard`, a shared lock the iterator releases when dropped. Under it,
-/// an unterminated final line of the newest segment after at least one complete line
-/// is an append that never returned, which the next exclusive lock truncates: the
-/// iteration ends before it instead of failing.
+/// caller, or as `guard`, a shared lock the iterator releases when dropped. Where
+/// appends extend a segment in place, an unterminated final line of the newest segment
+/// after at least one complete line is, under that lock, an append that never
+/// returned, which the next exclusive lock truncates: the iteration ends before it
+/// instead of failing. Where segments are written whole (an object store), the same
+/// line is damage → `integrity`, naming the segment.
 pub(crate) struct LogIter<'a> {
     logs: &'a dyn Logs,
     space: Id,
     actor: Id,
     from_seq: u64,
+    /// `appends_in_place(logs)`
+    torn_tail_is_append: bool,
     segments: std::vec::IntoIter<Segment>,
     current: Option<Open>,
     last_seq: u64,
@@ -204,6 +221,7 @@ impl<'a> LogIter<'a> {
             space: space.clone(),
             actor: actor.clone(),
             from_seq,
+            torn_tail_is_append: appends_in_place(logs),
             segments: segments.into_iter(),
             current: None,
             last_seq: 0,
@@ -237,7 +255,13 @@ impl<'a> LogIter<'a> {
                 continue;
             }
             if open.newest && open.next_seq > open.first && !line.ends_with(b"\n") {
-                return Ok(None);
+                if self.torn_tail_is_append {
+                    return Ok(None);
+                }
+                return Err(Error::integrity(format!(
+                    "{}: unterminated final line at seq {}: segment objects are written whole, so this one is damaged",
+                    open.name, open.next_seq
+                )));
             }
             let expected = open.next_seq;
             let claim = parse_line(&line, &|| format!("{}: seq {expected}", open.name))?;
@@ -353,13 +377,16 @@ fn equivocation(actor: &Id, seq: u64, have: &Id, got: &Id) -> Error {
 /// What a merge will write; computed (and fully validated) before writing.
 pub(crate) struct MergePlan {
     runs: Vec<(Id, u64, Vec<Vec<u8>>)>,
+    /// whether a new claim fills a gap (DESIGN §5.4)
+    fills_gap: bool,
     report: ImportReport,
 }
 
 /// Plans merging already-checked `claims` against the chains `existing` returns.
 /// Rejects equivocation (same actor+seq, different id) and any adjacency where
 /// both sides are known but `prev` does not link them — including an existing
-/// successor of a gap-filling claim.
+/// successor of a gap-filling claim. A new claim at or below its actor's head, the
+/// highest seq in its existing chain (0 without one), fills a gap (DESIGN §5.4).
 pub(crate) fn plan_merge(claims: &[Claim], mut existing: impl FnMut(&Id) -> Result<Chain>) -> Result<MergePlan> {
     let mut by_actor: BTreeMap<&Id, BTreeMap<u64, &Claim>> = BTreeMap::new();
     for c in claims {
@@ -374,8 +401,10 @@ pub(crate) fn plan_merge(claims: &[Claim], mut existing: impl FnMut(&Id) -> Resu
     }
     let mut report = ImportReport::default();
     let mut runs = Vec::new();
+    let mut fills_gap = false;
     for (actor, incoming) in by_actor {
         let have = existing(actor)?;
+        let head = have.keys().next_back().copied().unwrap_or(0);
         let mut new: BTreeMap<u64, &Claim> = BTreeMap::new();
         for (seq, c) in incoming {
             match have.get(&seq) {
@@ -411,6 +440,7 @@ pub(crate) fn plan_merge(claims: &[Claim], mut existing: impl FnMut(&Id) -> Resu
             }
         }
         report.added += new.len() as u64;
+        fills_gap |= new.keys().next().is_some_and(|&lowest| lowest <= head);
         for (first, lines) in line_runs(new.iter().map(|(&seq, &c)| (seq, c)))? {
             runs.push((actor.clone(), first, lines));
         }
@@ -418,18 +448,19 @@ pub(crate) fn plan_merge(claims: &[Claim], mut existing: impl FnMut(&Id) -> Resu
         seqs.extend(new.keys().copied());
         report.gaps.extend(gaps(&seqs).into_iter().map(|(lo, hi)| (actor.clone(), lo, hi)));
     }
-    Ok(MergePlan { runs, report })
+    Ok(MergePlan { runs, fills_gap, report })
 }
 
 impl MergePlan {
-    /// True when `apply` will write at least one segment.
-    pub(crate) fn writes_segments(&self) -> bool {
-        !self.runs.is_empty()
+    /// Whether a run fills a gap: index catch-up cannot see it, and a feed cursor may
+    /// already have passed its seqs (DESIGN §5.4).
+    pub(crate) fn fills_gap(&self) -> bool {
+        self.fills_gap
     }
 
     /// Writes every planned run as new segments. The caller holds every planned actor's
-    /// exclusive lock and has already written a fresh rebuild generation: index catch-up
-    /// cannot see a run that fills a gap below an indexed head (DESIGN §5.4).
+    /// exclusive lock and, when the plan `fills_gap`, has already written a fresh gap
+    /// and rebuild generation (DESIGN §5.4).
     pub(crate) fn apply(self, logs: &dyn Logs) -> Result<ImportReport> {
         for (actor, first, lines) in &self.runs {
             logs.write_run(actor, *first, lines)?;

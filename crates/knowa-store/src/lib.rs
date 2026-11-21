@@ -1,5 +1,6 @@
 //! One replica of a space (DESIGN §5): manifest, per-actor append-only logs and their
-//! locks, content-addressed blobs, the rebuild generation, verification and bundles.
+//! locks, content-addressed blobs, the rebuild and gap generations, verification and
+//! bundles.
 //! Storage sits behind two private stores (`backend`), one for the logs and one for
 //! the blobs, each at a `Location`: a directory (`dir`) or an object store (`object`).
 //! The store knows nothing about status, visibility or queries.
@@ -41,8 +42,11 @@ pub const BLOB_DIR: &str = "blobs";
 /// `log/<actor>/.lock` in a directory replica: the actor's advisory lock (DESIGN §5.3).
 pub const LOCK_FILE: &str = ".lock";
 /// The rebuild generation at the replica's location (DESIGN §5.4): a ULID line, absent
-/// until the first merge.
+/// until a merge first fills a gap or adds a blob.
 pub const GENERATION_FILE: &str = "generation";
+/// The gap generation at the replica's location (DESIGN §5.4): a ULID line, absent
+/// until a merge first fills a gap.
+pub const GAPS_FILE: &str = "gaps";
 pub const SEGMENT_LINES: u64 = 10_000;
 
 /// Characters of `Replica::location_key` (DESIGN §5.2).
@@ -341,26 +345,33 @@ impl Replica {
         Ok(location_key(&self.location.canonical()?))
     }
 
-    /// The rebuild generation (DESIGN §5.4); `None` until the first merge. A file that
-    /// is not one ULID line → `integrity`.
+    /// The rebuild generation (DESIGN §5.4), which an index records; `None` until a
+    /// merge first fills a gap or adds a blob. A file that is not one ULID line →
+    /// `integrity`.
     pub fn generation(&self) -> Result<Option<String>> {
-        let Some(bytes) = self.logs.read_generation()? else {
-            return Ok(None);
-        };
-        parse_generation(&bytes).map(Some).ok_or_else(|| {
-            Error::integrity(format!("{}: {GENERATION_FILE} is not one ULID line", self.logs.describe()))
-        })
+        self.logs.read_generation()?.map(|bytes| self.ulid_line(&bytes, GENERATION_FILE)).transpose()
     }
 
-    /// Writes a fresh generation, atomically.
+    /// The gap generation (DESIGN §5.4), which a feed cursor records; `None` until a
+    /// merge first fills a gap. A file that is not one ULID line → `integrity`.
+    pub fn gaps(&self) -> Result<Option<String>> {
+        self.logs.read_gaps()?.map(|bytes| self.ulid_line(&bytes, GAPS_FILE)).transpose()
+    }
+
+    /// The ULID in `file`'s content `bytes`; anything else → `integrity`.
+    fn ulid_line(&self, bytes: &[u8], file: &str) -> Result<String> {
+        parse_ulid_line(bytes)
+            .ok_or_else(|| Error::integrity(format!("{}: {file} is not one ULID line", self.logs.describe())))
+    }
+
+    /// Writes a fresh rebuild generation, atomically.
     fn bump_generation(&self) -> Result<()> {
-        // The model mints ULIDs only inside ids: a new entity id is `e_` + a fresh ULID.
-        let entity = Id::new_entity()?;
-        let ulid = entity
-            .as_str()
-            .strip_prefix("e_")
-            .ok_or_else(|| Error::internal(format!("new entity id {entity} lacks the e_ prefix")))?;
-        self.logs.write_generation(format!("{ulid}\n").as_bytes())
+        self.logs.write_generation(&fresh_ulid_line()?)
+    }
+
+    /// Writes a fresh gap generation, atomically.
+    fn bump_gaps(&self) -> Result<()> {
+        self.logs.write_gaps(&fresh_ulid_line()?)
     }
 
     /// Blocks until `actor`'s exclusive lock is held (DESIGN §5.3), then repairs that
@@ -414,8 +425,10 @@ impl Replica {
 
     /// Whether `actor`'s log may hold a claim with seq above `seq`: the readers' fast
     /// path (DESIGN §5.4). Peeks, without any lock and without verifying it, at the last
-    /// complete line of the newest segment, ignoring an unterminated final line. `true`
-    /// whenever it cannot tell; `false` only when no claim above `seq` exists.
+    /// complete line of the newest segment, ignoring an unterminated final line on a
+    /// directory (an append in flight); on an object store such a line is damage, and
+    /// the answer is `true` so that the read reports it. `true` whenever it cannot
+    /// tell; `false` only when no claim above `seq` exists.
     pub fn may_have_after(&self, actor: &Id, seq: u64) -> Result<bool> {
         log::may_have_after(&*self.logs, actor, seq)
     }
@@ -440,9 +453,10 @@ impl Replica {
     /// Already-present (actor, seq) with the same id → skipped; same (actor, seq) with a
     /// different id → `integrity` (equivocation). Gaps are allowed and reported.
     /// Where seq n-1 is present, `prev` must equal its id → else `integrity`.
-    /// Takes the lock of every actor in `claims`, in ascending id order; if anything is
-    /// new, writes a fresh rebuild generation before the first segment and again after
-    /// the last (DESIGN §5.4).
+    /// Takes the lock of every actor in `claims`, in ascending id order. If a new claim
+    /// fills a gap (its seq is at or below its actor's head), writes a fresh gap and
+    /// rebuild generation before the first segment and again after the last; claims
+    /// above every head need neither (DESIGN §5.4).
     pub fn merge(&self, claims: &[Claim]) -> Result<ImportReport> {
         for c in claims {
             log::check_claim(c, &self.manifest.space, ErrorCode::Integrity)?;
@@ -450,9 +464,12 @@ impl Replica {
         self.merge_checked(claims, false, || Ok(0))
     }
 
-    /// The merge shared with bundle import, over checked `claims`. When anything will
-    /// be written (a segment, or blobs: `adds_blobs`), the generation is written first,
-    /// then `put_blobs` runs, then the segments are written, then the generation again.
+    /// The merge shared with bundle import, over checked `claims`, where `adds_blobs`
+    /// says that `put_blobs` will store blobs the replica lacks. It classifies what it
+    /// will write (DESIGN §5.4): a claim that fills a gap needs a fresh `gaps` and
+    /// `generation`, an added blob a fresh `generation`, and claims above every head
+    /// neither. Those it needs are written first, then `put_blobs` runs, then the
+    /// segments are written, then the same generations again.
     pub(crate) fn merge_checked(
         &self,
         claims: &[Claim],
@@ -463,27 +480,40 @@ impl Replica {
         let _locks = actors.into_iter().map(|a| self.lock_actor(a)).collect::<Result<Vec<_>>>()?;
         let space = &self.manifest.space;
         let plan = log::plan_merge(claims, |actor| log::chain(&*self.logs, space, actor))?;
-        if !plan.writes_segments() && !adds_blobs {
-            return plan.apply(&*self.logs);
+        let fills_gap = plan.fills_gap();
+        let rebuilds = fills_gap || adds_blobs;
+        if fills_gap {
+            self.bump_gaps()?;
         }
-        self.bump_generation()?;
+        if rebuilds {
+            self.bump_generation()?;
+        }
         let written = put_blobs().and_then(|blobs_added| {
             let mut report = plan.apply(&*self.logs)?;
             report.blobs_added = blobs_added;
             Ok(report)
         });
         // Also when a write failed part-way: what was written stays, and an index built
-        // since the first generation (blobs are read without a lock) may have missed it.
-        let after = self.bump_generation();
-        match (written, after) {
-            (Ok(report), Ok(())) => Ok(report),
-            (Ok(_), Err(e)) | (Err(e), Ok(())) => Err(e),
-            (Err(mut e), Err(again)) => {
-                e.message =
-                    format!("{}; writing the rebuild generation after it also failed: {}", e.message, again.message);
-                Err(e)
-            }
+        // or a cursor issued since the first write of each (blobs are read without a
+        // lock) may have missed it. The generation goes first: a feed reads `gaps`
+        // before it opens the index, so once it can see the new `gaps`, the index it
+        // opens sees the new generation too and rebuilds over the filled gaps.
+        let after = [
+            rebuilds.then(|| self.bump_generation().map_err(|e| after_merge(e, "rebuild generation"))),
+            fills_gap.then(|| self.bump_gaps().map_err(|e| after_merge(e, "gap generation"))),
+        ];
+        let mut failed = after.into_iter().flatten().filter_map(Result::err);
+        let mut err = match written {
+            Ok(report) => match failed.next() {
+                None => return Ok(report),
+                Some(e) => e,
+            },
+            Err(e) => e,
+        };
+        for again in failed {
+            err.message = format!("{}; {}", err.message, again.message);
         }
+        Err(err)
     }
 
     /// Actors that have a log.
@@ -499,8 +529,10 @@ impl Replica {
     ///
     /// Unless this thread holds the actor's lock through this replica, the iterator
     /// holds the actor's shared lock until it is dropped (DESIGN §5.3): it waits for an
-    /// append in flight and never sees a batch a failed write will take back. It ends
-    /// before an unterminated final line, an append that never returned.
+    /// append in flight and never sees a batch a failed write will take back. On a
+    /// directory it ends before an unterminated final line, an append that never
+    /// returned; on an object store, whose segments are written whole, that line is
+    /// damage → `integrity`.
     pub fn read_log(&self, actor: &Id, from_seq: u64) -> Result<Box<dyn Iterator<Item = Result<Claim>> + '_>> {
         let guard = if self.held.by_this_thread(actor) {
             None
@@ -611,8 +643,26 @@ fn manifest_kind_problem(m: &Manifest) -> Option<String> {
         .map(|(field, id, kind)| format!("{field} {id} is not a {kind:?} id"))
 }
 
-/// A generation file's content: one ULID (26 lowercase base32 characters) and `\n`.
-fn parse_generation(bytes: &[u8]) -> Option<String> {
+/// A fresh `generation` or `gaps` content: a new ULID and `\n`.
+fn fresh_ulid_line() -> Result<Vec<u8>> {
+    // The model mints ULIDs only inside ids: a new entity id is `e_` + a fresh ULID.
+    let entity = Id::new_entity()?;
+    let ulid = entity
+        .as_str()
+        .strip_prefix("e_")
+        .ok_or_else(|| Error::internal(format!("new entity id {entity} lacks the e_ prefix")))?;
+    Ok(format!("{ulid}\n").into_bytes())
+}
+
+/// `e`, a failure to write the `what` generation after a merge's last write, saying so.
+fn after_merge(mut e: Error, what: &str) -> Error {
+    e.message = format!("writing the {what} after the merge failed: {}", e.message);
+    e
+}
+
+/// A `generation` or `gaps` file's content: one ULID (26 lowercase base32 characters)
+/// and `\n`.
+fn parse_ulid_line(bytes: &[u8]) -> Option<String> {
     let ulid = std::str::from_utf8(bytes).ok()?.strip_suffix('\n')?;
     (ulid.len() == 26 && ulid.bytes().all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())).then(|| ulid.to_string())
 }
@@ -650,10 +700,11 @@ pub fn read_bundle_meta(bundle: &Path) -> Result<BundleMeta> {
 /// (created via `create_replica` if absent; if present its manifest must match the
 /// bundle's space). Verifies all claim signatures and blob hashes,
 /// and that the bundle's genesis is a genesis claim, before writing anything. Merges as
-/// `Replica::merge` does, and also counts the blobs it adds as writes: the rebuild
-/// generation is written before the first blob or segment it adds and after the last,
-/// because a text blob arriving for claims that are already indexed changes their
-/// full-text documents, which catch-up never revisits.
+/// `Replica::merge` does, and also counts the blobs it adds: if it adds any, the
+/// rebuild generation is written before the first blob or segment it adds and after
+/// the last, because a text blob arriving for claims that are already indexed changes
+/// their full-text documents, which catch-up never revisits. Blobs alone leave the gap
+/// generation, and so every feed cursor, as it is (DESIGN §5.4).
 pub fn import_bundle(bundle: &Path, dest: &Path) -> Result<(Replica, BundleMeta, ImportReport)> {
     bundle::import(bundle, dest)
 }

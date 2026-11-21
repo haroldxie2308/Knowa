@@ -1,5 +1,5 @@
 //! Replica integrity: chain/append/merge (gaps, equivocation), per-actor locks, the
-//! rebuild generation, blobs, verify, bundle round-trips and tamper rejection.
+//! rebuild and gap generations, blobs, verify, bundle round-trips and tamper rejection.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -830,52 +830,63 @@ fn a_second_lock_on_an_actor_waits_until_the_first_is_dropped() {
     });
 }
 
-/// DESIGN §5.4: a merge that adds claims writes a fresh generation; one that adds
-/// nothing leaves it.
+/// DESIGN §5.4: catch-up sees claims above their actor's head, so a merge of only such
+/// claims writes neither generation; a claim at or below its actor's head fills a gap
+/// and gets a fresh `gaps` and `generation`; a merge that adds nothing writes nothing.
+/// Each file is one ULID line.
 #[test]
-fn merge_writes_a_fresh_generation_only_when_it_adds() {
+fn merge_writes_the_generations_only_when_it_fills_a_gap() {
     let sa = Scratch::new("gen-src");
     let (a, mut owner, genesis) = new_space(&sa.0);
-    let c2 = owner.note("two");
-    a.append(&a.lock_actor(&owner.id).unwrap(), std::slice::from_ref(&c2)).unwrap();
-    assert_eq!(a.generation().unwrap(), None, "appends do not touch it");
+    let (c2, c3) = (owner.note("two"), owner.note("three"));
+    a.append(&a.lock_actor(&owner.id).unwrap(), &[c2.clone(), c3.clone()]).unwrap();
+    assert_eq!((a.generation().unwrap(), a.gaps().unwrap()), (None, None), "appends touch neither");
 
     let sb = Scratch::new("gen-dst");
     let b = create_replica(&sb.0, a.manifest()).unwrap();
-    assert_eq!(b.generation().unwrap(), None);
-    b.merge(std::slice::from_ref(&genesis)).unwrap();
-    let first = b.generation().unwrap().unwrap();
-    assert_eq!(fs::read_to_string(sb.path("generation")).unwrap(), format!("{first}\n"));
-
+    let generations = || (b.generation().unwrap(), b.gaps().unwrap());
+    b.merge(&[genesis.clone(), c3]).unwrap();
+    assert_eq!(generations(), (None, None), "above every head, gap and all");
+    assert!(!sb.path("generation").exists() && !sb.path("gaps").exists());
     assert_eq!(b.merge(std::slice::from_ref(&genesis)).unwrap().skipped_existing, 1);
-    assert_eq!(b.generation().unwrap().as_ref(), Some(&first));
+    assert_eq!(generations(), (None, None));
 
     b.merge(std::slice::from_ref(&c2)).unwrap();
-    assert_ne!(b.generation().unwrap().unwrap(), first);
+    let (generation, gaps) = generations();
+    let (generation, gaps) = (generation.unwrap(), gaps.unwrap());
+    assert_eq!(fs::read_to_string(sb.path("generation")).unwrap(), format!("{generation}\n"));
+    assert_eq!(fs::read_to_string(sb.path("gaps")).unwrap(), format!("{gaps}\n"));
 
     fs::write(sb.path("generation"), b"not a ulid\n").unwrap();
     assert_eq!(b.generation().unwrap_err().code, ErrorCode::Integrity);
+    fs::write(sb.path("gaps"), &gaps).unwrap();
+    let err = b.gaps().unwrap_err();
+    assert_eq!(err.code, ErrorCode::Integrity);
+    assert!(err.message.contains("gaps is not one ULID line"), "{}", err.message);
 }
 
+/// DESIGN §5.4: an import into a new replica brings claims above every head, which
+/// needs no generation. One that adds only blobs writes a fresh rebuild generation, for
+/// the text they may carry for claims already indexed, which catch-up never revisits;
+/// it fills no gap, so the gap generation stays.
 #[test]
-fn import_writes_a_fresh_generation_when_it_adds_claims_or_blobs() {
+fn import_writes_the_rebuild_generation_for_new_blobs_and_no_gap_generation() {
     let s = Scratch::new("import-gen");
     let (a, owner, claims, blobs) = populated(&s.path("a"));
     write_bundle(&a, &s.path("claims.knowa"), &meta_for(&a, "shared", &owner.id), &claims, &[]).unwrap();
     write_bundle(&a, &s.path("all.knowa"), &meta_for(&a, "private", &owner.id), &claims, &blobs).unwrap();
 
-    let (b, _, _) = import_bundle(&s.path("claims.knowa"), &s.path("b")).unwrap();
-    let first = b.generation().unwrap().unwrap();
-
+    let (b, _, rep) = import_bundle(&s.path("claims.knowa"), &s.path("b")).unwrap();
+    assert_eq!(rep.added, 4);
+    assert_eq!((b.generation().unwrap(), b.gaps().unwrap()), (None, None));
     let (b, _, rep) = import_bundle(&s.path("claims.knowa"), &s.path("b")).unwrap();
     assert_eq!(rep.added, 0);
-    assert_eq!(b.generation().unwrap().as_ref(), Some(&first));
+    assert_eq!((b.generation().unwrap(), b.gaps().unwrap()), (None, None));
 
-    // Only blobs are new: a text blob changes the full-text documents of claims that
-    // are already indexed, which catch-up never revisits.
     let (b, _, rep) = import_bundle(&s.path("all.knowa"), &s.path("b")).unwrap();
     assert_eq!((rep.added, rep.blobs_added), (0, 2));
-    assert_ne!(b.generation().unwrap().unwrap(), first);
+    assert!(b.generation().unwrap().is_some());
+    assert_eq!(b.gaps().unwrap(), None, "blobs fill no gap");
     assert!(!s.path("b").join(".index").exists(), "the replica holds nothing machine-local");
 }
 

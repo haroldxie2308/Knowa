@@ -12,7 +12,7 @@ use knowa_model::{Error, Id, IdKind, Result};
 use crate::backend::{Blobs, Guard, LastLine, Listing, Logs, Segment};
 use crate::fsutil::{self, TempFile, io_err};
 use crate::log::{SEGMENT_LIMIT, parse_segment_name, segment_name};
-use crate::{BLOB_DIR, GENERATION_FILE, LOCK_FILE, LOG_DIR, MANIFEST_FILE, blob};
+use crate::{BLOB_DIR, GAPS_FILE, GENERATION_FILE, LOCK_FILE, LOG_DIR, MANIFEST_FILE, blob};
 
 /// Reads `path`; `None` when it does not exist.
 fn read_if_exists(path: &Path) -> Result<Option<Vec<u8>>> {
@@ -89,6 +89,14 @@ impl Logs for DirLogs {
         fsutil::atomic_write(&self.root.join(GENERATION_FILE), bytes)
     }
 
+    fn read_gaps(&self) -> Result<Option<Vec<u8>>> {
+        read_if_exists(&self.root.join(GAPS_FILE))
+    }
+
+    fn write_gaps(&self, bytes: &[u8]) -> Result<()> {
+        fsutil::atomic_write(&self.root.join(GAPS_FILE), bytes)
+    }
+
     fn lock_exclusive(&self, actor: &Id) -> Result<Guard> {
         let dir = self.actor_dir(actor);
         fsutil::ensure_dir(&dir)?;
@@ -163,8 +171,9 @@ impl Logs for DirLogs {
 
     fn write_run(&self, actor: &Id, first_seq: u64, lines: &[Vec<u8>]) -> Result<()> {
         // A merge that fails part-way keeps the runs already written: each is a
-        // verified, chain-checked run, and the rebuild generation written before it
-        // makes every index rebuild over it (DESIGN §5.4).
+        // verified, chain-checked run. Catch-up sees a run above the actor's head, and
+        // the generations a gap-filling merge writes before and after its runs make
+        // every index rebuild over one below it (DESIGN §5.4).
         write_run(&self.actor_dir(actor), None, first_seq, lines, SEGMENT_LIMIT, &mut Vec::new())
     }
 }

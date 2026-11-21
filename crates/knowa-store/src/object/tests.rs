@@ -1,6 +1,7 @@
 //! The object-store backend against `object_store`'s in-memory store: layout, racing
-//! appends, merges and the generation, blobs through the cache, split blob locations,
-//! corrupted downloads, and the S3 client's required region.
+//! appends, merges and the generations, damaged segment objects, blobs through the
+//! cache, split blob locations, corrupted downloads, and the S3 client's required
+//! region.
 
 use std::fs;
 use std::path::PathBuf;
@@ -213,36 +214,69 @@ fn racing_appends_for_one_actor_conflict_exactly_once() {
     first.verify().unwrap();
 }
 
-/// A merge writes each run as one segment object, never rotating, and the rebuild
-/// generation before and after it (DESIGN §5.4); a run whose object already exists is
-/// `integrity`.
+/// A merge writes each run as one segment object, never rotating. Runs above every
+/// head write no generation; one that fills a gap overwrites the `generation` and
+/// `gaps` objects (DESIGN §5.4). A run whose object already exists is `integrity`.
 #[test]
-fn merge_writes_runs_as_objects_and_bumps_the_generation() {
+fn merge_writes_runs_as_objects_and_the_generations_only_when_it_fills_a_gap() {
     let s = Scratch::new("merge");
     let store = memory();
     let (r, _) = new_space(&store, &s);
     let mut other = Author::new(&r.manifest().space);
     let c: Vec<Claim> = (0..5).map(|i| other.note(&format!("n{i}"))).collect();
-    assert_eq!(r.generation().unwrap(), None);
+    let generations = || (r.generation().unwrap(), r.gaps().unwrap());
 
     let report = r.merge(&[c[0].clone(), c[1].clone(), c[4].clone()]).unwrap();
     assert_eq!((report.added, report.gaps.len()), (3, 1));
-    let first = r.generation().unwrap().unwrap();
     let log = format!("spaces/notes/log/{}", other.id);
     assert!(object(&store, &format!("{log}/000000000001.jsonl")).is_some());
     assert!(object(&store, &format!("{log}/000000000005.jsonl")).is_some());
+    assert_eq!(generations(), (None, None), "every claim was above its actor's head");
+    assert!(object(&store, "spaces/notes/generation").is_none() && object(&store, "spaces/notes/gaps").is_none());
 
     r.merge(&[c[2].clone(), c[3].clone()]).unwrap();
-    let second = r.generation().unwrap().unwrap();
-    assert_ne!(second, first);
+    let (generation, gaps) = generations();
+    let (generation, gaps) = (generation.unwrap(), gaps.unwrap());
+    assert_ne!(generation, gaps, "two fresh values");
+    assert_eq!(object(&store, "spaces/notes/generation").unwrap(), format!("{generation}\n").as_bytes());
+    assert_eq!(object(&store, "spaces/notes/gaps").unwrap(), format!("{gaps}\n").as_bytes());
     assert_eq!(seqs(&r, &other.id), [1, 2, 3, 4, 5]);
     assert_eq!(r.merge(&c).unwrap().skipped_existing, 5);
-    assert_eq!(r.generation().unwrap().unwrap(), second, "a merge that adds nothing writes nothing");
+    assert_eq!(generations(), (Some(generation), Some(gaps)), "a merge that adds nothing writes nothing");
     assert_eq!(r.verify().unwrap().gaps, []);
 
     // A run whose object another writer created meanwhile is not overwritten.
     let err = r.logs().write_run(&other.id, 3, &[c[2].to_line().unwrap()]).unwrap_err();
     assert_eq!(err.code, ErrorCode::Integrity, "{err:?}");
+}
+
+/// DESIGN §5.3: a segment object is written whole, so an unterminated last line is
+/// damage, not an append in progress: reading it is `integrity`, naming the segment,
+/// and the catch-up peek defers to that read instead of answering from the line
+/// before. (A directory stops before such a line instead:
+/// `a_reader_stops_before_an_unterminated_last_line` in tests/store.rs.)
+#[test]
+fn an_unterminated_last_line_of_a_segment_object_is_integrity() {
+    let s = Scratch::new("torn-object");
+    let store = memory();
+    let (r, mut owner) = new_space(&store, &s);
+    let batch = [owner.note("two"), owner.note("three")];
+    append(&r, &batch).unwrap();
+    let key = format!("spaces/notes/log/{}/000000000002.jsonl", owner.id);
+    let torn = batch[1].to_line().unwrap();
+    let damaged = [batch[0].to_line().unwrap(), torn[..torn.len() / 2].to_vec()].concat();
+    block_on(store.put(&Key::from(key.as_str()), PutPayload::from(damaged))).unwrap().unwrap();
+
+    for from in [1, 3] {
+        let read: Vec<_> = r.read_log(&owner.id, from).unwrap().collect();
+        let err = read.last().unwrap().as_ref().unwrap_err();
+        assert_eq!(err.code, ErrorCode::Integrity, "from seq {from}: {err:?}");
+        assert!(err.message.contains(&format!("s3://bucket/{key}")), "{}", err.message);
+        assert!(err.message.contains("unterminated final line"), "{}", err.message);
+    }
+    // The last complete line is seq 2, but the peek must not answer from it.
+    assert!(r.may_have_after(&owner.id, 2).unwrap());
+    assert_eq!(r.verify().unwrap_err().code, ErrorCode::Integrity);
 }
 
 /// DESIGN §5.3 Blob path: a put stages the bytes into the cache, named by their id,

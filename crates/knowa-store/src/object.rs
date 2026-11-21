@@ -33,7 +33,7 @@ use crate::blob::{self, BlobHasher};
 use crate::fsutil::io_err;
 use crate::location::object_url;
 use crate::log::{parse_segment_name, segment_rel_path};
-use crate::{BLOB_DIR, GENERATION_FILE, LOG_DIR, MANIFEST_FILE};
+use crate::{BLOB_DIR, GAPS_FILE, GENERATION_FILE, LOG_DIR, MANIFEST_FILE};
 
 /// Blobs up to this size are uploaded in one PUT; larger ones in parts of at least
 /// this size. 8 MiB is the AWS CLI's default threshold and part size: memory holds one
@@ -297,7 +297,7 @@ impl BufRead for Body {
     }
 }
 
-/// The manifest, generation and claim logs at an object location.
+/// The manifest, generations and claim logs at an object location.
 pub(crate) struct ObjectLogs {
     remote: Remote,
 }
@@ -353,6 +353,14 @@ impl Logs for ObjectLogs {
 
     fn write_generation(&self, bytes: &[u8]) -> Result<()> {
         self.remote.overwrite(&self.remote.key(GENERATION_FILE), bytes.to_vec())
+    }
+
+    fn read_gaps(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self.remote.get(&self.remote.key(GAPS_FILE))?.map(|b| b.to_vec()))
+    }
+
+    fn write_gaps(&self, bytes: &[u8]) -> Result<()> {
+        self.remote.overwrite(&self.remote.key(GAPS_FILE), bytes.to_vec())
     }
 
     /// No lock: segment objects are created only if absent instead (DESIGN §5.3).

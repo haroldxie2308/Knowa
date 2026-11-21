@@ -187,9 +187,10 @@ pub(crate) fn import(home: &Home, bundle: &Path, dir: Option<&Path>, alias: Opti
         )));
     }
     let location = replica.location().canonical()?;
-    // If the merge added anything it wrote a new rebuild generation, and `Index::open`
-    // rebuilds (claims that fill gaps below an indexed head are invisible to catch-up);
-    // if it added nothing, catching up is all there is to do (DESIGN §5.4).
+    // If the merge filled a gap or added a blob it wrote a new rebuild generation, and
+    // `Index::open` rebuilds (catch-up never sees claims below an indexed head, nor
+    // revisits claims whose text arrives in a blob); otherwise catching up is all there
+    // is to do (DESIGN §5.4).
     let index = Index::open(&replica, &index_dir(home, &replica)?)?;
     let alias = match alias {
         Some(a) => a.to_string(),
