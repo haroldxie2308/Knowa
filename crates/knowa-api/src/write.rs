@@ -134,6 +134,13 @@ impl<'a> Txn<'a> {
             created,
         })
     }
+
+    /// The bytes of `blob` were just stored. Claims about it may already be indexed
+    /// (a catalog-only put, a partial import) and their full-text documents lack its
+    /// text; no claim arrives to make the index revisit them (DESIGN §7.2).
+    pub fn refresh_blob(&mut self, blob: &Id) -> Result<()> {
+        self.index.refresh_blob(blob)
+    }
 }
 
 impl Txn<'_> {

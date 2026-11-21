@@ -154,6 +154,11 @@ impl Knowa {
         let space = select::current(&self.home, sel)?;
         space.ensure_writable()?;
         let (id, created, size) = space.replica.put_blob(r)?;
+        // Claims about these bytes may already be indexed (DESIGN §5 Catalog-only
+        // blobs); storing them writes no claim, so the index must be told. Also when
+        // the bytes were already present: an earlier blob put may have crashed between
+        // storing them and this refresh.
+        write::Txn::begin(&space)?.refresh_blob(&id)?;
         Ok(BlobPutResult { id, created, size })
     }
 

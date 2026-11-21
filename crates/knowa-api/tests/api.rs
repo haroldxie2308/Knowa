@@ -362,3 +362,40 @@ fn put_no_store_of_already_stored_bytes_reports_them_stored() {
     assert_eq!(again.blob, first.blob);
     assert_eq!((again.created, again.stored), (false, true));
 }
+
+// ---------- bytes stored after the claims about them (DESIGN §5, §7.2) ----------
+
+/// Entities in the current space whose text matches `word`.
+fn text_hits(k: &Knowa, sel: &Sel, word: &str) -> Vec<Id> {
+    match find(k, sel, serde_json::json!({"op": "find", "where": {"text": word}})) {
+        FindItems::Entities(e) => e.into_iter().map(|e| e.id).collect(),
+        FindItems::Claims(_) => panic!("target is entities"),
+    }
+}
+
+/// Regression: every claim already existed, so the put appended none, and the index
+/// learnt of the bytes only at the next reindex.
+#[test]
+fn a_catalog_only_text_file_stored_later_is_searchable_without_a_reindex() {
+    let s = Scratch::new("put-catalog-fts");
+    let (k, sel, _) = alice(&s);
+    let path = file_at(&s, "notes.txt", b"pangolin migration\n", UNIX_EPOCH + Duration::from_secs(1_500_000_000));
+    let blob = k.put(&sel, std::slice::from_ref(&path), catalog_only()).unwrap().items.remove(0).blob;
+    assert!(text_hits(&k, &sel, "pangolin").is_empty(), "a catalog-only blob has no full-text content");
+
+    k.put(&sel, &[path], PutOptions::default()).unwrap();
+    assert_eq!(text_hits(&k, &sel, "pangolin"), vec![blob]);
+}
+
+#[test]
+fn blob_put_of_bytes_already_described_as_text_is_searchable_without_a_reindex() {
+    let s = Scratch::new("blob-put-fts");
+    let (k, sel, _) = alice(&s);
+    let bytes = b"okapi sightings\n";
+    let blob = Id::blob_of(bytes);
+    k.write(&sel, vec![Draft::new(blob.clone(), term(MEDIA_TYPE), Value::text("text/plain"))]).unwrap();
+    assert!(text_hits(&k, &sel, "okapi").is_empty());
+
+    assert!(k.blob_put(&sel, &mut &bytes[..]).unwrap().created);
+    assert_eq!(text_hits(&k, &sel, "okapi"), vec![blob]);
+}

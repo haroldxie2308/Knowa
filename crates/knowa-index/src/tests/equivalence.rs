@@ -268,3 +268,30 @@ fn incremental_apply_equals_rebuild() {
     assert!(inactive_equivalents, "no non-retracted claim was ever an inactive equivalent");
     assert!(routes_compared > 1000, "only {routes_compared} entity results compared across routes");
 }
+
+/// Bytes that arrive after every claim about them (a catalog-only file stored by a
+/// later put, a blob put for claims already indexed) come with no claim to apply:
+/// `refresh_blob` must bring the index to what a build with the bytes present gives.
+#[test]
+fn refresh_blob_after_the_claims_equals_rebuild() {
+    let mut search_changed = false;
+    for seed in 0..6u64 {
+        let (w, claims, blobs) = scenario(seed, 220);
+        let mut replay = claims.clone();
+        replay.sort_by(|a, b| (&a.body.actor, a.body.seq).cmp(&(&b.body.actor, b.body.seq)));
+        let (_d0, reference) = index_with(&w, &blobs, &[replay]);
+        let expected = snapshot(&reference, &claims, &blobs);
+
+        let mut rng = Rng(seed ^ 0x1a7e_b10b);
+        let (_d1, mut late) = index_with(&w, &MemBlobs::default(), &batched(&mut rng, claims.clone()));
+        search_changed |= snapshot(&late, &claims, &blobs).search != expected.search;
+        let [blob] = blobs.0.keys().cloned().collect::<Vec<_>>().try_into().unwrap();
+        late.refresh_blob_with(&blob, &blobs).unwrap();
+        let ctx = format!("seed {seed}: claims first, bytes later, then refresh_blob");
+        assert_same(&snapshot(&late, &claims, &blobs), &expected, &ctx);
+        if seed == 0 {
+            assert_routes_agree(&late, &route_queries(&w.owner()), &ctx);
+        }
+    }
+    assert!(search_changed, "the late bytes never changed a search result: refresh_blob went unexercised");
+}

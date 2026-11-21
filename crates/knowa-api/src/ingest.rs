@@ -157,6 +157,14 @@ fn put_file(space: &Space, actor: &Actor, extractor: Option<&Actor>, no_store: b
         }
         errors.extend(failures.iter().map(describe_failure));
     }
+    if stored {
+        // Every claim about the blob is applied by now; when they were all already
+        // there (it was put with --no-store before), nothing above indexed its text.
+        // Not only when `created`: a crash after the bytes were stored and before this
+        // refresh committed would otherwise leave the text unindexed until reindex,
+        // since the next put finds the bytes present. Any later put repairs it.
+        txn.refresh_blob(&blob)?;
+    }
     Ok(PutItem { path: path.to_path_buf(), blob, created, stored, size, claims, errors })
 }
 

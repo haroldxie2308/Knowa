@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use knowa_model::query::{Order, View, Where};
-use knowa_model::{ActorInfo, Claim, ClaimView, Edge, EntityView, Error, Id, Result, Visibility};
+use knowa_model::{ActorInfo, Claim, ClaimView, Edge, EntityView, Error, Id, IdKind, Result, Visibility};
 use knowa_store::Replica;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
@@ -101,6 +101,16 @@ impl Index {
     /// per-claim FTS docs (incl. text blobs read from `replica`) and geo.
     pub fn apply(&mut self, replica: &Replica, claims: &[knowa_model::Claim]) -> Result<()> {
         self.apply_with(replica, claims)
+    }
+
+    /// Re-derives, in one transaction, the full-text documents that carry `blob`'s text
+    /// (its `text/*` `knowa:mediaType` claims and the `knowa:content` claims linking
+    /// it) from the replica's blob store. For bytes that arrived without a new claim
+    /// about them, which neither `apply` nor catch-up revisits (DESIGN §7.2). A
+    /// fragment is ignored; a non-blob id → `invalid`.
+    pub fn refresh_blob(&mut self, blob: &Id) -> Result<()> {
+        let replica = self.replica()?;
+        self.refresh_blob_with(blob, &replica)
     }
 
     /// Random token chosen at (re)build time.
@@ -203,6 +213,15 @@ impl Index {
         tx.commit().map_err(db)
     }
 
+    fn refresh_blob_with(&mut self, blob: &Id, blobs: &dyn BlobSource) -> Result<()> {
+        if blob.kind() != IdKind::Blob {
+            return Err(Error::invalid(format!("refresh_blob: {blob} is not a blob id")));
+        }
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db)?;
+        entity::refresh_blob_text(&tx, blobs, blob.base().as_str())?;
+        tx.commit().map_err(db)
+    }
+
     fn export_set_with(&self, level: Visibility, blobs: &dyn BlobSource) -> Result<(Vec<Id>, Vec<Id>)> {
         export::export_set(&self.conn, &self.space, level, blobs)
     }
@@ -214,8 +233,9 @@ impl Index {
         Ok(out)
     }
 
-    /// The blob store of the replica this index was opened for. `export_set` and
-    /// `blobs_without_worker` take no replica argument, so they reopen it by path.
+    /// The blob store of the replica this index was opened for. `export_set`,
+    /// `blobs_without_worker` and `refresh_blob` take no replica argument, so they
+    /// reopen it by path.
     fn replica(&self) -> Result<Replica> {
         Replica::open(&self.root)
     }
