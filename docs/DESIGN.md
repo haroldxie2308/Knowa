@@ -253,6 +253,7 @@ Directory locations add `log/<actor-id>/.lock`, the actor's advisory lock (§5.3
   6. Apply them to the local index.
 
   Exclusivity is **per actor**. Writers for different actors never wait for each other, and readers wait only for a writer of the actor whose log they are reading.
+  A writer whose local index must be rebuilt rebuilds it before taking its actor locks, because a rebuild reads every actor's log and may wait for other writers. The status a write returns is computed by this machine's index, which may not yet hold claims written on other machines; it converges when they are caught up.
 - **Lock order:** a writer holds its actor lock and then takes the index lock. A reader therefore never waits for an actor lock while it holds the index lock. It reads an actor's new lines first, releases that actor's lock, and then applies the lines under the index lock, skipping any (actor, seq) already applied.
 - **Directory.** Exclusivity is an exclusive advisory lock on `log/<actor>/.lock`.
   - A batch is appended to the actor's newest segment and fsynced before the write returns. Segments rotate at 10000 lines.
@@ -284,7 +285,7 @@ Directory locations add `log/<actor-id>/.lock`, the actor's advisory lock (§5.3
   - `merge` (bundle import) writes a fresh `generation` (a new ULID) before its first segment and again after its last.
   - An index records the generation it was built against. It rebuilds when the replica's generation differs.
   - This replaces v0's `.index/needs-rebuild` marker, which only the importing machine could see.
-- **Rebuild on mismatch.** An index that is missing or has the wrong schema version is rebuilt and gets a new epoch.
+- **Rebuild on mismatch.** An index that is missing or has the wrong schema version is rebuilt and gets a new epoch. A rebuild resets the index under the index lock, then fills it by ordinary catch-up without holding that lock, so a crash part-way is finished by the next catch-up.
 - **`verify`** reads every blob in full. On an object store, that downloads the whole store.
 
 ## 6. The interface (stable contract) *(v0)*
