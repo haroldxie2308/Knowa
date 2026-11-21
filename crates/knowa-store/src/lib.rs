@@ -271,6 +271,12 @@ impl Replica {
         blob::put(&self.root, r)
     }
 
+    /// Stores the file at `path` (DESIGN §5 Blob path). Same result as `put_blob`:
+    /// (id, created, size).
+    pub fn put_blob_file(&self, path: &Path) -> Result<(Id, bool, u64)> {
+        blob::put_file(&self.root, path)
+    }
+
     /// Accepts a `b_` id with or without fragment; fragment ignored.
     pub fn has_blob(&self, id: &Id) -> bool {
         // Non-blob ids are simply not present; the path cannot fail for a blob id.

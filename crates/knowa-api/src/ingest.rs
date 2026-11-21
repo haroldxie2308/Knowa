@@ -2,7 +2,7 @@
 //! DESIGN §7, §7.2.
 
 use std::collections::{BTreeMap, HashSet};
-use std::fs::{self, File};
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -92,8 +92,8 @@ fn put_file(space: &Space, actor: &Actor, extractor: Option<&Actor>, path: &Path
     // path, so the check covers the file being rewritten or replaced at that path.
     let meta = fs::metadata(path).map_err(disappeared)?;
     let before = Stat::of(&meta)?;
-    let mut file = File::open(path).map_err(disappeared)?;
-    let (blob, created, size) = space.replica.put_blob(&mut file)?;
+    // Same-volume APFS sources are stored as a clone (DESIGN §5 Blob path).
+    let (blob, created, size) = space.replica.put_blob_file(path)?;
     unchanged(path, before, Stat::of(&fs::metadata(path).map_err(disappeared)?)?)?;
 
     let mut errors = Vec::new();

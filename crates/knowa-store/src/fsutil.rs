@@ -1,7 +1,7 @@
 //! Filesystem primitives shared by the store: in-flight temp files, atomic
 //! publication (temp + fsync + rename + dir fsync), and error mapping.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, Permissions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -67,21 +67,75 @@ pub(crate) fn ensure_dir(dir: &Path) -> Result<()> {
     }
 }
 
+/// `<dir>/.tmp-<pid>-<n>`: unique among live processes (pid) and within this one (n).
+fn temp_name(dir: &Path) -> PathBuf {
+    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!("{TEMP_PREFIX}{}-{n}", std::process::id()))
+}
+
+/// A temp name that is ours: dropping it while armed deletes whatever is at the path.
+pub(crate) struct TempPath {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempPath {
+    /// Reserves a temp name in `dir` without creating anything there, for a producer
+    /// that must create the file itself: `fs::copy` clones (APFS) only onto a path that
+    /// does not exist yet, and silently byte-copies otherwise.
+    pub(crate) fn reserve_in(dir: &Path) -> Result<TempPath> {
+        loop {
+            let path = temp_name(dir);
+            match fs::symlink_metadata(&path) {
+                // No other live process uses our pid, so a free name stays free until we use it.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(TempPath { path, armed: true }),
+                // A crashed earlier process with the same pid left this name behind.
+                // Its content is uncommitted; take the next name instead of touching it.
+                Ok(_) => continue,
+                Err(e) => return Err(io_err(&path, e)),
+            }
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Opens the file the producer created at this name, read-only (a copy keeps its
+    /// source's mode, which may forbid writing), and hands the cleanup duty to the
+    /// returned `TempFile`.
+    pub(crate) fn open(mut self) -> Result<TempFile> {
+        let file = File::open(&self.path).map_err(|e| io_err(&self.path, e))?;
+        self.armed = false;
+        Ok(TempFile { name: TempPath { path: self.path.clone(), armed: true }, file })
+    }
+}
+
+impl Drop for TempPath {
+    fn drop(&mut self) {
+        if self.armed {
+            // Error path only: the caller is already returning the error that got us
+            // here. The path may hold nothing (a reservation whose producer failed
+            // first); a temp file we fail to delete is dot-prefixed and skipped by
+            // every scan, so leaving it behind is harmless.
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// A file being written under a temp name. Publish it with `commit`; dropping it
 /// uncommitted deletes it.
 pub(crate) struct TempFile {
-    path: PathBuf,
+    name: TempPath,
     file: File,
-    armed: bool,
 }
 
 impl TempFile {
     pub(crate) fn create_in(dir: &Path) -> Result<TempFile> {
         loop {
-            let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = dir.join(format!("{TEMP_PREFIX}{}-{n}", std::process::id()));
+            let path = temp_name(dir);
             match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(file) => return Ok(TempFile { path, file, armed: true }),
+                Ok(file) => return Ok(TempFile { name: TempPath { path, armed: true }, file }),
                 // A crashed earlier process with the same pid left this name behind.
                 // Its content is uncommitted; take the next name instead of touching it.
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -95,15 +149,15 @@ impl TempFile {
     }
 
     pub(crate) fn path(&self) -> &Path {
-        &self.path
+        self.name.path()
     }
 
     /// fsyncs the content, renames it to `dest` (replacing any existing file), and
     /// fsyncs `dest`'s directory.
     pub(crate) fn commit(mut self, dest: &Path) -> Result<()> {
-        self.file.sync_all().map_err(|e| io_err(&self.path, e))?;
-        fs::rename(&self.path, dest).map_err(|e| io_err(dest, e))?;
-        self.armed = false;
+        self.file.sync_all().map_err(|e| io_err(self.name.path(), e))?;
+        fs::rename(self.name.path(), dest).map_err(|e| io_err(dest, e))?;
+        self.name.armed = false;
         match dest.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => sync_dir(parent),
             _ => sync_dir(Path::new(".")),
@@ -112,20 +166,20 @@ impl TempFile {
 
     /// Deletes the temp file, reporting a failure to do so.
     pub(crate) fn discard(mut self) -> Result<()> {
-        self.armed = false;
-        fs::remove_file(&self.path).map_err(|e| io_err(&self.path, e))
+        self.name.armed = false;
+        fs::remove_file(self.name.path()).map_err(|e| io_err(self.name.path(), e))
     }
 }
 
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        if self.armed {
-            // Error path only: the caller is already returning the error that got us
-            // here. A temp file we fail to delete is dot-prefixed and skipped by every
-            // scan, so leaving it behind is harmless.
-            let _ = fs::remove_file(&self.path);
-        }
-    }
+/// The permissions `TempFile::create_in` gives a new file in `dir`: 0o666 less the
+/// process umask, which std cannot read except by creating a file. Measured, not
+/// assumed, so a file that arrives another way (a copy keeps its source's mode) can be
+/// set to exactly what a streamed file gets.
+pub(crate) fn fresh_file_permissions(dir: &Path) -> Result<Permissions> {
+    let probe = TempFile::create_in(dir)?;
+    let perms = probe.file.metadata().map_err(|e| io_err(probe.path(), e))?.permissions();
+    probe.discard()?;
+    Ok(perms)
 }
 
 /// Atomically replaces `dest` with `bytes` (temp in the same directory + rename).

@@ -8,7 +8,7 @@ use knowa_model::{Error, Id, IdKind, Result};
 use sha2::{Digest, Sha256};
 
 use crate::BLOB_DIR;
-use crate::fsutil::{self, TempFile, io_err};
+use crate::fsutil::{self, TempFile, TempPath, io_err};
 
 const COPY_BUF: usize = 64 * 1024;
 
@@ -104,8 +104,7 @@ pub(crate) fn path(root: &Path, id: &Id) -> Result<PathBuf> {
     Ok(root.join(BLOB_DIR).join(fanout(&id)?).join(id.as_str()))
 }
 
-/// Streams `r` into a temp file inside `blobs/` while hashing, then renames it into
-/// place. An already-present blob is left untouched and the temp file removed.
+/// Streams `r` into a temp file inside `blobs/` while hashing, then publishes it.
 pub(crate) fn put(root: &Path, r: &mut dyn Read) -> Result<(Id, bool, u64)> {
     let dir = root.join(BLOB_DIR);
     fsutil::ensure_dir(&dir)?;
@@ -121,7 +120,72 @@ pub(crate) fn put(root: &Path, r: &mut dyn Read) -> Result<(Id, bool, u64)> {
         },
         &|| "blob input".to_string(),
     )?;
-    let id = hasher.finish();
+    publish(root, tmp, hasher.finish(), size)
+}
+
+/// Stores the file at `src` (DESIGN §5 Blob path): `fs::copy` onto a fresh temp name
+/// inside `blobs/`, which clones where the filesystem supports it (std tries
+/// `fclonefileat` first on Apple targets, and that works only onto a path that does
+/// not exist yet), then hashes the temp file, never `src`, and publishes it. A locked
+/// source is streamed instead (see `has_lock_flags`).
+pub(crate) fn put_file(root: &Path, src: &Path) -> Result<(Id, bool, u64)> {
+    let source_err = |e: io::Error| match e.kind() {
+        io::ErrorKind::NotFound => Error::not_found(format!("blob source not found: {}", src.display())),
+        _ => io_err(src, e),
+    };
+    let meta = fs::metadata(src).map_err(source_err)?;
+    // Checked up front, not left to `fs::copy`: opening a FIFO would block.
+    if !meta.is_file() {
+        return Err(Error::invalid(format!("blob source is not a regular file: {}", src.display())));
+    }
+    if has_lock_flags(&meta) {
+        // Fallback: a locked source (Finder "Locked", `chflags uchg`). macOS copies BSD
+        // file flags onto a clone and onto an `fcopyfile` copy alike, and std cannot
+        // clear them, so the temp file could be neither chmod-ed, renamed nor deleted.
+        // Streaming makes a fresh file without flags: still a byte copy, hashed as it
+        // is written, so the stored bytes match their id. Only the clone is lost.
+        let mut f = File::open(src).map_err(source_err)?;
+        return put(root, &mut f);
+    }
+    let dir = root.join(BLOB_DIR);
+    fsutil::ensure_dir(&dir)?;
+    let perms = fsutil::fresh_file_permissions(&dir)?;
+    let reserved = TempPath::reserve_in(&dir)?;
+    fs::copy(src, reserved.path()).map_err(|e| {
+        Error::internal(format!("io: copy {} to {}: {e}", src.display(), reserved.path().display()))
+    })?;
+    let mut tmp = reserved.open()?;
+    let tmp_path = tmp.path().to_path_buf();
+    // The copy carries the source's mode; a stored blob's mode must not depend on
+    // which entry point stored it.
+    tmp.file().set_permissions(perms).map_err(|e| io_err(&tmp_path, e))?;
+    let (id, size) = hash_reader(tmp.file(), &|| tmp_path.display().to_string())?;
+    publish(root, tmp, id, size)
+}
+
+/// True if `meta` carries a BSD file flag that forbids chmod, rename or unlink of the
+/// file. Values from macOS `<sys/stat.h>` (std has the field but not the constants).
+#[cfg(target_os = "macos")]
+fn has_lock_flags(meta: &fs::Metadata) -> bool {
+    use std::os::macos::fs::MetadataExt;
+    const UF_IMMUTABLE: u32 = 0x0000_0002;
+    const UF_APPEND: u32 = 0x0000_0004;
+    const SF_IMMUTABLE: u32 = 0x0002_0000;
+    const SF_APPEND: u32 = 0x0004_0000;
+    const SF_NOUNLINK: u32 = 0x0010_0000;
+    meta.st_flags() & (UF_IMMUTABLE | UF_APPEND | SF_IMMUTABLE | SF_APPEND | SF_NOUNLINK) != 0
+}
+
+/// Elsewhere std's `fs::copy` creates a fresh destination file and copies no flags.
+#[cfg(not(target_os = "macos"))]
+fn has_lock_flags(_meta: &fs::Metadata) -> bool {
+    false
+}
+
+/// Shared tail of every put: renames the hashed temp file to its id (fsync file,
+/// rename, fsync dir). An already-present blob is left untouched and the temp file
+/// removed, so each byte sequence is stored once per replica.
+fn publish(root: &Path, tmp: TempFile, id: Id, size: u64) -> Result<(Id, bool, u64)> {
     let dest = path(root, &id)?;
     if dest.is_file() {
         tmp.discard()?;

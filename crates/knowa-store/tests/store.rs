@@ -340,16 +340,126 @@ fn blobs_are_deduplicated_and_content_addressed() {
     let mut ids = vec![id, big_id];
     ids.sort();
     assert_eq!(r.blob_ids().unwrap(), ids);
-    let leftovers: Vec<_> = fs::read_dir(s.path("blobs"))
+    assert_no_temp_files(&r);
+
+    let absent = Id::blob_of(b"never stored");
+    assert!(!r.has_blob(&absent));
+    assert_eq!(r.blob_path(&absent).unwrap_err().code, ErrorCode::NotFound);
+}
+
+/// Every put writes its temp file directly under `blobs/`, dot-prefixed.
+fn assert_no_temp_files(r: &Replica) {
+    let leftovers: Vec<_> = fs::read_dir(r.root().join("blobs"))
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .filter(|n| n.starts_with('.'))
         .collect();
     assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+}
 
-    let absent = Id::blob_of(b"never stored");
-    assert!(!r.has_blob(&absent));
-    assert_eq!(r.blob_path(&absent).unwrap_err().code, ErrorCode::NotFound);
+#[test]
+fn put_blob_file_stores_what_put_blob_stores() {
+    let s = Scratch::new("blobfile");
+    let (by_stream, _, _) = new_space(&s.path("stream"));
+    let (by_file, _, _) = new_space(&s.path("file"));
+    // Larger than one copy buffer.
+    let data: Vec<u8> = (0..300_000u32).map(|i| (i % 253) as u8).collect();
+    let src = s.path("source.bin");
+    fs::write(&src, &data).unwrap();
+
+    let streamed = by_stream.put_blob(&mut data.as_slice()).unwrap();
+    let filed = by_file.put_blob_file(&src).unwrap();
+    assert_eq!(filed, streamed);
+    assert_eq!(filed, (Id::blob_of(&data), true, data.len() as u64));
+    assert_eq!(fs::read(by_file.blob_path(&filed.0).unwrap()).unwrap(), data);
+    assert_eq!(fs::read(&src).unwrap(), data, "the source is left as it was");
+    assert_eq!(by_file.verify().unwrap().blobs, 1);
+    assert_no_temp_files(&by_file);
+}
+
+#[cfg(unix)]
+#[test]
+fn put_blob_file_leaves_a_present_blob_untouched() {
+    use std::os::unix::fs::MetadataExt;
+    let s = Scratch::new("blobfile-dup");
+    let (r, _, _) = new_space(&s.path("r"));
+    let src = s.path("source.txt");
+    fs::write(&src, b"same bytes twice").unwrap();
+    let (id, created, size) = r.put_blob_file(&src).unwrap();
+    assert!(created);
+    let stored = r.blob_path(&id).unwrap();
+    let before = fs::metadata(&stored).unwrap();
+
+    assert_eq!(r.put_blob_file(&src).unwrap(), (id.clone(), false, size));
+    let after = fs::metadata(&stored).unwrap();
+    // A rename over it would give the path a new inode.
+    assert_eq!((after.ino(), after.modified().unwrap()), (before.ino(), before.modified().unwrap()));
+    assert_eq!(fs::read(&stored).unwrap(), b"same bytes twice");
+    assert_no_temp_files(&r);
+}
+
+#[test]
+fn put_blob_file_rejects_missing_and_non_regular_sources() {
+    let s = Scratch::new("blobfile-bad");
+    let (r, _, _) = new_space(&s.path("r"));
+    let missing = s.path("no-such-file");
+    let err = r.put_blob_file(&missing).unwrap_err();
+    assert_eq!(err.code, ErrorCode::NotFound);
+    assert!(err.message.contains(&missing.display().to_string()), "{}", err.message);
+    assert_no_temp_files(&r);
+
+    let dir = s.path("a-directory");
+    fs::create_dir(&dir).unwrap();
+    assert_eq!(r.put_blob_file(&dir).unwrap_err().code, ErrorCode::Invalid);
+    assert_no_temp_files(&r);
+    assert!(r.blob_ids().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn put_blob_file_gives_a_read_only_source_the_streamed_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Scratch::new("blobfile-mode");
+    let (r, _, _) = new_space(&s.path("r"));
+    let src = s.path("read-only.txt");
+    fs::write(&src, b"read-only source").unwrap();
+    fs::set_permissions(&src, fs::Permissions::from_mode(0o444)).unwrap();
+
+    let (filed, _, _) = r.put_blob_file(&src).unwrap();
+    let (streamed, _, _) = r.put_blob(&mut &b"streamed bytes"[..]).unwrap();
+    let mode = |id: &Id| fs::metadata(r.blob_path(id).unwrap()).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode(&filed), mode(&streamed));
+    r.verify().unwrap();
+}
+
+/// macOS copies BSD file flags onto a clone and an `fcopyfile` copy alike; a locked
+/// temp file could then be neither renamed nor deleted.
+#[cfg(target_os = "macos")]
+#[test]
+fn put_blob_file_stores_a_locked_source_without_its_lock() {
+    use std::os::macos::fs::MetadataExt;
+    use std::process::Command;
+    const UF_IMMUTABLE: u32 = 0x2;
+    /// Unlocks on drop so `Scratch` can delete the source even after a failed assert.
+    struct Locked(PathBuf);
+    impl Drop for Locked {
+        fn drop(&mut self) {
+            let _ = Command::new("chflags").arg("nouchg").arg(&self.0).status();
+        }
+    }
+    let s = Scratch::new("blobfile-locked");
+    let (r, _, _) = new_space(&s.path("r"));
+    let src = s.path("locked.txt");
+    fs::write(&src, b"locked source").unwrap();
+    let locked = Locked(src.clone());
+    assert!(Command::new("chflags").arg("uchg").arg(&locked.0).status().unwrap().success());
+
+    let (id, created, size) = r.put_blob_file(&src).unwrap();
+    assert_eq!((id.clone(), created, size), (Id::blob_of(b"locked source"), true, 13));
+    assert_eq!(fs::metadata(r.blob_path(&id).unwrap()).unwrap().st_flags() & UF_IMMUTABLE, 0);
+    assert_eq!(r.put_blob_file(&src).unwrap(), (id, false, 13));
+    assert_no_temp_files(&r);
+    r.verify().unwrap();
 }
 
 #[test]
