@@ -23,6 +23,7 @@ use bytes::{Buf, Bytes};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use knowa_model::{Error, Id, IdKind, Result};
+use object_store::ClientConfigKey;
 use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey, S3ConditionalPut};
 use object_store::path::Path as Key;
 use object_store::{GetOptions, GetRange, ListResult, ObjectStore, ObjectStoreExt, PutMode, PutPayload};
@@ -40,6 +41,13 @@ use crate::{BLOB_DIR, GAPS_FILE, GENERATION_FILE, LOG_DIR, MANIFEST_FILE};
 /// part at a time, a failed request resends at most one part, and S3's limit of 10 000
 /// parts is reached only above 80 GiB, where parts grow instead (`part_size`).
 pub(crate) const PART_SIZE: u64 = 8 * 1024 * 1024;
+
+/// The default deadline of one request, body included, unless `AWS_TIMEOUT` sets one
+/// (DESIGN §5.2). `object_store`'s own is 30 s: a GET cut by it resumes with a range
+/// request, but a PUT starts over, so a part of `PART_SIZE` would need about 2.2 Mbit/s
+/// of uplink. Five minutes lowers that to about 220 kbit/s and still ends a request
+/// that hangs.
+const REQUEST_TIMEOUT: &str = "300s";
 
 /// S3's limit on the parts of one multipart upload.
 const MAX_PARTS: u64 = 10_000;
@@ -87,6 +95,14 @@ fn s3_store(builder: AmazonS3Builder, bucket: &str) -> Result<Arc<dyn ObjectStor
     Ok(Arc::new(store))
 }
 
+/// `builder` with `REQUEST_TIMEOUT`, unless the environment set a timeout itself.
+fn with_default_timeout(builder: AmazonS3Builder, set_by_env: bool) -> AmazonS3Builder {
+    if set_by_env {
+        return builder;
+    }
+    builder.with_config(AmazonS3ConfigKey::Client(ClientConfigKey::Timeout), REQUEST_TIMEOUT)
+}
+
 /// One object location: a store, and the URL and key prefix it was opened at.
 #[derive(Clone)]
 pub(crate) struct Remote {
@@ -95,19 +111,25 @@ pub(crate) struct Remote {
     url: String,
     bucket: String,
     prefix: Key,
+    /// No key variables were set, so credentials came from the provider chain
+    /// (DESIGN §5.2): failures name the variables to set.
+    keyless: bool,
 }
 
 impl Remote {
     /// The S3 location `url`, with the client configured from the environment.
     pub(crate) fn s3(url: &str) -> Result<Remote> {
         let (bucket, _) = object_url(url)?;
-        Remote::new(s3_store(AmazonS3Builder::from_env(), &bucket)?, url)
+        let builder = with_default_timeout(AmazonS3Builder::from_env(), std::env::var_os("AWS_TIMEOUT").is_some());
+        let mut remote = Remote::new(s3_store(builder, &bucket)?, url)?;
+        remote.keyless = std::env::var_os("AWS_ACCESS_KEY_ID").is_none();
+        Ok(remote)
     }
 
     /// The location `url` on `store`.
     pub(crate) fn new(store: Arc<dyn ObjectStore>, url: &str) -> Result<Remote> {
         let (bucket, prefix) = object_url(url)?;
-        Ok(Remote { store, url: url.trim_end_matches('/').to_string(), bucket, prefix })
+        Ok(Remote { store, url: url.trim_end_matches('/').to_string(), bucket, prefix, keyless: false })
     }
 
     pub(crate) fn url(&self) -> &str {
@@ -133,19 +155,30 @@ impl Remote {
     }
 
     /// Not found maps as on a directory; refused credentials are the caller's to fix
-    /// (`usage`, DESIGN §5.2); anything else is `internal`, naming the key.
+    /// (`usage`, DESIGN §5.2); anything else is `internal`, naming the key. A request
+    /// that `object_store` reports as `Generic` is classified by its HTTP status.
     fn err(&self, key: &Key, e: object_store::Error) -> Error {
-        match e {
-            object_store::Error::NotFound { .. } => Error::not_found(format!("{} not found", self.name(key))),
-            object_store::Error::Unauthenticated { .. } | object_store::Error::PermissionDenied { .. } => {
-                Error::usage(format!(
-                    "{}: access refused ({e}); set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY to credentials allowed to use {}",
-                    self.name(key),
-                    self.url
-                ))
-            }
-            e => Error::internal(format!("{}: {e}", self.name(key))),
+        use object_store::Error::{NotFound, PermissionDenied, Unauthenticated};
+        let status = generic_status(&e);
+        if matches!(e, NotFound { .. }) || status == Some(404) {
+            return Error::not_found(format!("{} not found", self.name(key)));
         }
+        if matches!(e, Unauthenticated { .. } | PermissionDenied { .. }) || matches!(status, Some(401 | 403)) {
+            return Error::usage(format!(
+                "{}: access refused ({e}); set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY to credentials allowed to use {}",
+                self.name(key),
+                self.url
+            ));
+        }
+        // Without key variables a failure to reach S3 is often the provider chain
+        // failing (no instance metadata on a laptop); the code stays `internal`, since a
+        // network fault looks the same, but the message names the fix.
+        let hint = if self.keyless {
+            "; AWS_ACCESS_KEY_ID is not set, so credentials were sought from web identity, the container endpoint and instance metadata: outside AWS, set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
+        } else {
+            ""
+        };
+        Error::internal(format!("{}: {e}{hint}", self.name(key)))
     }
 
     /// The object at `key`, whole; `None` when absent.
@@ -252,6 +285,29 @@ impl Remote {
         let listed = block_on(self.store.list(Some(prefix)).collect::<Vec<_>>())?;
         listed.into_iter().map(|meta| meta.map(|m| m.location).map_err(|e| self.err(prefix, e))).collect()
     }
+}
+
+/// What `object_store` puts before the status of a request the server refused.
+const STATUS_PREFIX: &str = "Server returned non-2xx status code: ";
+
+/// The HTTP status of a refused S3 request that `object_store` reports as `Generic`.
+/// It maps the status of an object request (GET, HEAD, PUT) to an error variant, but
+/// wraps a refused LIST, and other bucket-level requests, as `Generic`, and the types
+/// that hold the status are private to it. The status survives only in a message of
+/// the error's source chain, `Server returned non-2xx status code: 403 Forbidden: …`,
+/// which `a_refused_list_is_classified_by_its_status` checks against the real client.
+fn generic_status(e: &object_store::Error) -> Option<u16> {
+    let object_store::Error::Generic { source, .. } = e else {
+        return None;
+    };
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&**source);
+    while let Some(c) = cause {
+        if let Some(rest) = c.to_string().strip_prefix(STATUS_PREFIX) {
+            return rest.get(..3)?.parse().ok();
+        }
+        cause = c.source();
+    }
+    None
 }
 
 /// The part size of a multipart upload of `size` bytes: `PART_SIZE`, or larger when

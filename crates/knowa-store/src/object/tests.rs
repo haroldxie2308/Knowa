@@ -13,9 +13,10 @@ use knowa_model::{Claim, ClaimBody, Draft, ErrorCode, Id, Signer, Term, Timestam
 use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::memory::InMemory;
 use object_store::path::Path as Key;
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use object_store::{ClientConfigKey, ObjectStore, ObjectStoreExt, PutPayload};
 
-use super::{PART_SIZE, Remote, block_on, s3_store};
+use super::{PART_SIZE, Remote, block_on, s3_store, with_default_timeout};
+use crate::backend::Logs;
 use crate::dir::{DirBlobs, DirLogs};
 use crate::object::{ObjectBlobs, ObjectLogs};
 use crate::{Location, Replica, Stores, blob};
@@ -421,6 +422,79 @@ fn store_errors_map_to_knowa_codes() {
     let err = remote.err(&key, object_store::Error::Generic { store: "S3", source: source() });
     assert_eq!(err.code, ErrorCode::Internal);
     assert!(err.message.contains("s3://bucket/spaces/notes/knowa.json"), "{}", err.message);
+    assert!(!err.message.contains("AWS_ACCESS_KEY_ID"), "{}", err.message);
+    // Without key variables, the provider chain may be what failed: name the fix.
+    let keyless = Remote { keyless: true, ..remote };
+    let err = keyless.err(&key, object_store::Error::Generic { store: "S3", source: source() });
+    assert_eq!(err.code, ErrorCode::Internal);
+    assert!(err.message.contains("AWS_ACCESS_KEY_ID is not set"), "{}", err.message);
+}
+
+/// A local HTTP endpoint that answers every request with `status` and an S3 error
+/// body: the real S3 client's error paths, without a server. Requests are read up to
+/// the end of their headers only, so it serves bodiless requests (GET, LIST).
+fn refusing_endpoint(status: &'static str) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let (mut seen, mut buf) = (Vec::new(), [0u8; 4096]);
+            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf).unwrap() {
+                    0 => break,
+                    n => seen.extend_from_slice(&buf[..n]),
+                }
+            }
+            let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>Refused</Code></Error>";
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// DESIGN §5.2: refused credentials are `usage` on every kind of request. The S3
+/// client maps the status of a refused GET, but reports a refused LIST (the first
+/// request of `init`, and of every catch-up) as `Generic`; it is classified by the
+/// status in its message, and a missing bucket (LIST 404) is `not_found`.
+#[test]
+fn a_refused_list_is_classified_by_its_status() {
+    for (status, code) in
+        [("403 Forbidden", ErrorCode::Usage), ("401 Unauthorized", ErrorCode::Usage), ("404 Not Found", ErrorCode::NotFound)]
+    {
+        let builder = AmazonS3Builder::new()
+            .with_region("us-east-1")
+            .with_endpoint(refusing_endpoint(status))
+            .with_allow_http(true)
+            .with_access_key_id("key")
+            .with_secret_access_key("secret");
+        let logs = ObjectLogs::new(Remote::new(s3_store(builder, "bucket").unwrap(), URL).unwrap());
+        for (what, err) in [("prepare", logs.prepare().unwrap_err()), ("actors", logs.actors().err().unwrap())] {
+            assert_eq!(err.code, code, "{status}, {what}: {err:?}");
+        }
+        if code == ErrorCode::Usage {
+            let err = logs.read_manifest().unwrap_err();
+            assert_eq!(err.code, code, "{status}, a GET: {err:?}");
+            assert!(err.message.contains("AWS_ACCESS_KEY_ID"), "{}", err.message);
+        }
+    }
+}
+
+/// DESIGN §5.2: requests get five minutes, not `object_store`'s 30 s, so a part of
+/// `PART_SIZE` uploads on a slow link; a timeout from `AWS_TIMEOUT` is kept.
+#[test]
+fn requests_default_to_a_five_minute_timeout() {
+    let timeout = |b: &AmazonS3Builder| b.get_config_value(&AmazonS3ConfigKey::Client(ClientConfigKey::Timeout));
+    let defaulted = with_default_timeout(AmazonS3Builder::new(), false);
+    assert_eq!(timeout(&defaulted).as_deref(), Some("300s"));
+    let from_env = AmazonS3Builder::new().with_config(AmazonS3ConfigKey::Client(ClientConfigKey::Timeout), "120s");
+    assert_eq!(timeout(&with_default_timeout(from_env, true)).as_deref(), Some("120s"));
 }
 
 /// DESIGN §5.2: no silent default region.
