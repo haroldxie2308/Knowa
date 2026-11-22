@@ -232,3 +232,28 @@ fn a_write_gives_up_with_conflict_after_its_attempts() {
     assert_eq!(log[log.len() - rival.len()..], rival[..]);
     space.replica.verify().unwrap();
 }
+
+/// DESIGN §5.3: on one machine, writers of an actor take turns on its machine-local
+/// lock instead of racing: a second `Txn` for alice waits until the first is dropped.
+#[test]
+fn writers_on_one_machine_take_turns() {
+    let s = Scratch::new("local-lock");
+    let (home, alice, store, space) = alice_on_rivals(&s);
+    let first = Txn::begin(&space, &[&alice]).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let replica = Replica::open_on(store.clone(), URL, &blob_cache(&home)).unwrap();
+            let sref = SpaceRef { alias: None, location: URL.into(), blobs: None, readonly: false };
+            let other = Space::new(&home, sref, replica).unwrap();
+            let mut second = Txn::begin(&other, &[&alice]).unwrap();
+            tx.send(()).unwrap();
+            second.write(&alice, vec![label("second")]).unwrap();
+        });
+        let waited = rx.recv_timeout(std::time::Duration::from_millis(300));
+        assert!(waited.is_err(), "the second writer did not wait for the first");
+        drop(first);
+        rx.recv_timeout(std::time::Duration::from_secs(10)).expect("the second writer never got the lock");
+    });
+    space.replica.verify().unwrap();
+}

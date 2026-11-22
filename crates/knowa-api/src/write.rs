@@ -6,6 +6,7 @@
 //! chaining have exactly one implementation.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fs::{self, File};
 
 use knowa_config::Actor;
 use knowa_index::Index;
@@ -39,6 +40,10 @@ enum Attempt {
 
 pub(crate) struct Txn<'a> {
     space: &'a Space,
+    /// Where writers can race (an object store, DESIGN §5.3): this machine's lock of
+    /// each actor, so that its own processes take turns instead of racing; ascending
+    /// by actor id, taken before `locks`. Empty elsewhere.
+    _local: Vec<File>,
     /// ascending by actor id, one per actor
     locks: Vec<ActorLock>,
     index: Index,
@@ -50,7 +55,8 @@ impl<'a> Txn<'a> {
     ///   taken: a rebuild reads every actor's log and may wait for other writers,
     ///   which a writer holding its own actor lock must never do;
     /// - takes the locks of `actors` in ascending id order, the one order every
-    ///   writer uses, so two writers cannot wait for each other.
+    ///   writer uses, so two writers cannot wait for each other. Where writers can
+    ///   race, each actor's machine-local lock is taken first, in the same order.
     ///
     /// Each `write` catches the index up with its actor's log. The locks are held until
     /// the `Txn` is dropped.
@@ -60,8 +66,13 @@ impl<'a> Txn<'a> {
         ids.sort();
         ids.dedup();
         let index = Index::load(&space.replica, &space.index_dir)?;
+        let local = if space.replica.writers_can_race() {
+            ids.iter().map(|id| lock_locally(space, id)).collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
         let locks = ids.iter().map(|id| space.replica.lock_actor(id)).collect::<Result<Vec<_>>>()?;
-        Ok(Txn { space, locks, index })
+        Ok(Txn { space, _local: local, locks, index })
     }
 
     /// All-or-nothing: every draft is validated, resolved and sealed before anything
@@ -302,6 +313,19 @@ pub(crate) fn stamp_worker(d: &mut Draft, worker: &str) -> Result<()> {
 fn at_draft(mut e: Error, i: usize) -> Error {
     e.message = format!("draft {i}: {}", e.message);
     e
+}
+
+/// Holds `actor`'s machine-local write lock, `<index dir>/writers/<actor>.lock`
+/// (DESIGN §5.3), until the file is dropped. Every registration of the location on this
+/// machine shares the index directory, so they share the lock too.
+fn lock_locally(space: &Space, actor: &Id) -> Result<File> {
+    let dir = space.index_dir.join("writers");
+    let path = dir.join(format!("{actor}.lock"));
+    let io = |e: std::io::Error| Error::internal(format!("{}: {e}", path.display()));
+    fs::create_dir_all(&dir).map_err(io)?;
+    let file = File::options().create(true).truncate(false).write(true).open(&path).map_err(io)?;
+    file.lock().map_err(io)?;
+    Ok(file)
 }
 
 #[cfg(test)]
