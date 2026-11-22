@@ -573,7 +573,7 @@ fn bundle_round_trip_is_deterministic_and_idempotent() {
     write_bundle(&a, &s.path("y.knowa"), &meta, &claims, &blobs).unwrap();
     assert_eq!(fs::read(s.path("x.knowa")).unwrap(), fs::read(s.path("y.knowa")).unwrap());
 
-    let (b, got_meta, rep) = import_bundle(&s.path("x.knowa"), &s.path("b")).unwrap();
+    let (b, got_meta, rep) = import_dir(&s.path("x.knowa"), &s.path("b")).unwrap();
     assert_eq!(got_meta, meta);
     assert_eq!(b.manifest(), a.manifest());
     assert_eq!((rep.added, rep.skipped_existing, rep.blobs_added), (4, 0, 2));
@@ -584,7 +584,7 @@ fn bundle_round_trip_is_deterministic_and_idempotent() {
     }
     b.verify().unwrap();
 
-    let (_, _, rep) = import_bundle(&s.path("x.knowa"), &s.path("b")).unwrap();
+    let (_, _, rep) = import_dir(&s.path("x.knowa"), &s.path("b")).unwrap();
     assert_eq!((rep.added, rep.skipped_existing, rep.blobs_added), (0, 4, 0));
 }
 
@@ -594,7 +594,7 @@ fn partial_bundle_imports_with_gaps() {
     let (a, owner, claims, _) = populated(&s.path("a"));
     let subset = [claims[0].clone(), claims[1].clone(), claims[3].clone()];
     write_bundle(&a, &s.path("p.knowa"), &meta_for(&a, "shared", &owner.id), &subset, &[]).unwrap();
-    let (b, meta, rep) = import_bundle(&s.path("p.knowa"), &s.path("b")).unwrap();
+    let (b, meta, rep) = import_dir(&s.path("p.knowa"), &s.path("b")).unwrap();
     assert!(meta.partial);
     assert_eq!(rep.added, 3);
     assert_eq!(rep.gaps, vec![(owner.id.clone(), 3, 3)]);
@@ -610,17 +610,17 @@ fn tampered_bundles_are_rejected_before_writing() {
     let bytes = fs::read(s.path("ok.knowa")).unwrap();
 
     fs::write(s.path("blob.knowa"), replace_once(&bytes, b"BLOB-PAYLOAD-TWO", b"BLOB-PAYLOAD-TW0")).unwrap();
-    assert_eq!(import_bundle(&s.path("blob.knowa"), &s.path("d1")).err().unwrap().code, ErrorCode::Integrity);
+    assert_eq!(import_dir(&s.path("blob.knowa"), &s.path("d1")).err().unwrap().code, ErrorCode::Integrity);
     assert!(!s.path("d1").exists());
 
     fs::write(s.path("claim.knowa"), replace_once(&bytes, b"note-omega", b"note-0mega")).unwrap();
-    assert_eq!(import_bundle(&s.path("claim.knowa"), &s.path("d2")).err().unwrap().code, ErrorCode::Integrity);
+    assert_eq!(import_dir(&s.path("claim.knowa"), &s.path("d2")).err().unwrap().code, ErrorCode::Integrity);
     assert!(!s.path("d2").exists());
 
     // Into an existing replica: nothing changes there either.
-    let (b, _, _) = import_bundle(&s.path("ok.knowa"), &s.path("d3")).unwrap();
+    let (b, _, _) = import_dir(&s.path("ok.knowa"), &s.path("d3")).unwrap();
     let before = log_of(&b, &owner.id, 1);
-    assert_eq!(import_bundle(&s.path("claim.knowa"), &s.path("d3")).err().unwrap().code, ErrorCode::Integrity);
+    assert_eq!(import_dir(&s.path("claim.knowa"), &s.path("d3")).err().unwrap().code, ErrorCode::Integrity);
     assert_eq!(log_of(&b, &owner.id, 1), before);
 }
 
@@ -630,8 +630,8 @@ fn import_into_a_different_space_is_a_conflict() {
     let (a, owner, claims, blobs) = populated(&s.path("a"));
     write_bundle(&a, &s.path("x.knowa"), &meta_for(&a, "private", &owner.id), &claims, &blobs).unwrap();
     new_space(&s.path("other"));
-    assert_eq!(import_bundle(&s.path("x.knowa"), &s.path("other")).err().unwrap().code, ErrorCode::Conflict);
-    assert_eq!(import_bundle(&s.path("missing.knowa"), &s.path("z")).err().unwrap().code, ErrorCode::NotFound);
+    assert_eq!(import_dir(&s.path("x.knowa"), &s.path("other")).err().unwrap().code, ErrorCode::Conflict);
+    assert_eq!(import_dir(&s.path("missing.knowa"), &s.path("z")).err().unwrap().code, ErrorCode::NotFound);
 }
 
 #[test]
@@ -876,14 +876,14 @@ fn import_writes_the_rebuild_generation_for_new_blobs_and_no_gap_generation() {
     write_bundle(&a, &s.path("claims.knowa"), &meta_for(&a, "shared", &owner.id), &claims, &[]).unwrap();
     write_bundle(&a, &s.path("all.knowa"), &meta_for(&a, "private", &owner.id), &claims, &blobs).unwrap();
 
-    let (b, _, rep) = import_bundle(&s.path("claims.knowa"), &s.path("b")).unwrap();
+    let (b, _, rep) = import_dir(&s.path("claims.knowa"), &s.path("b")).unwrap();
     assert_eq!(rep.added, 4);
     assert_eq!((b.generation().unwrap(), b.gaps().unwrap()), (None, None));
-    let (b, _, rep) = import_bundle(&s.path("claims.knowa"), &s.path("b")).unwrap();
+    let (b, _, rep) = import_dir(&s.path("claims.knowa"), &s.path("b")).unwrap();
     assert_eq!(rep.added, 0);
     assert_eq!((b.generation().unwrap(), b.gaps().unwrap()), (None, None));
 
-    let (b, _, rep) = import_bundle(&s.path("all.knowa"), &s.path("b")).unwrap();
+    let (b, _, rep) = import_dir(&s.path("all.knowa"), &s.path("b")).unwrap();
     assert_eq!((rep.added, rep.blobs_added), (0, 2));
     assert!(b.generation().unwrap().is_some());
     assert_eq!(b.gaps().unwrap(), None, "blobs fill no gap");
@@ -926,8 +926,13 @@ fn import_rejects_a_genesis_that_is_not_an_owner_claim() {
         m.merge(std::slice::from_ref(&first)).unwrap();
         let bundle = s.path(&format!("m{i}.knowa"));
         write_bundle(&m, &bundle, &meta_for(&m, "private", &first.body.actor), std::slice::from_ref(&first), &[]).unwrap();
-        let err = import_bundle(&bundle, &s.path(&format!("dest{i}"))).err().unwrap();
+        let err = import_dir(&bundle, &s.path(&format!("dest{i}"))).err().unwrap();
         assert_eq!(err.code, ErrorCode::Integrity, "case {i}: {err:?}");
         assert!(!s.path(&format!("dest{i}")).exists(), "case {i}");
     }
+}
+
+/// `import_bundle` into the directory `dest`, which holds its blobs too.
+fn import_dir(bundle: &Path, dest: &Path) -> knowa_model::Result<(Replica, BundleMeta, knowa_store::ImportReport)> {
+    import_bundle(bundle, &Location::Dir(dest.to_path_buf()), None, &dest.with_extension("cache"))
 }

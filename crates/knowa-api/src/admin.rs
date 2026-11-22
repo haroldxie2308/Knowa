@@ -155,7 +155,13 @@ fn level_name(v: Visibility) -> &'static str {
     }
 }
 
-pub(crate) fn import(home: &Home, bundle: &Path, dir: Option<&Path>, alias: Option<&str>) -> Result<ImportResult> {
+pub(crate) fn import(
+    home: &Home,
+    bundle: &Path,
+    dest: Option<&Location>,
+    blobs: Option<&Location>,
+    alias: Option<&str>,
+) -> Result<ImportResult> {
     fs::metadata(bundle).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => Error::not_found(format!("import: no such bundle: {}", bundle.display())),
         _ => Error::from(e),
@@ -173,20 +179,19 @@ pub(crate) fn import(home: &Home, bundle: &Path, dir: Option<&Path>, alias: Opti
     // Before anything is written. `import_bundle` checks that the genesis claim backs
     // these fields, so a bundle cannot pass this check under someone else's identity.
     check_identity(home, &claimed, "import")?;
-    let dest = match dir {
-        Some(d) => d.to_path_buf(),
-        None => home.root().join("replicas").join(meta.space.as_str()),
+    let dest = match dest {
+        Some(d) => d.clone(),
+        None => Location::Dir(home.root().join("replicas").join(meta.space.as_str())),
     };
     refuse_writable(home, &dest)?;
-    let (replica, imported, report) = import_bundle(bundle, &dest)?;
+    let (replica, imported, report) = import_bundle(bundle, &dest, blobs, &blob_cache(home))?;
     if imported != meta {
         return Err(Error::integrity(format!(
-            "import: bundle {} changed while it was being imported into {}; nothing was registered",
+            "import: bundle {} changed while it was being imported into {dest}; nothing was registered",
             bundle.display(),
-            dest.display()
         )));
     }
-    let location = replica.location().canonical()?;
+    let (location, blobs) = registered_locations(replica.location(), blobs)?;
     // If the merge filled a gap or added a blob it wrote a new rebuild generation, and
     // `Index::open` rebuilds (catch-up never sees claims below an indexed head, nor
     // revisits claims whose text arrives in a blob); otherwise catching up is all there
@@ -196,13 +201,14 @@ pub(crate) fn import(home: &Home, bundle: &Path, dir: Option<&Path>, alias: Opti
         Some(a) => a.to_string(),
         None => default_import_alias(home, &location, &index, &meta.space)?,
     };
-    home.register_space(&alias, &location, None, &meta.space, true).map_err(|mut e| {
+    home.register_space(&alias, &location, blobs.as_deref(), &meta.space, true).map_err(|mut e| {
         e.message = format!("imported into {location}, but registering it failed: {} (re-run with --alias)", e.message);
         e
     })?;
     Ok(ImportResult {
         space: meta.space,
         path: PathBuf::from(location),
+        blobs,
         alias,
         added: report.added,
         skipped_existing: report.skipped_existing,
@@ -238,17 +244,17 @@ fn check_identity(home: &Home, m: &Manifest, op: &str) -> Result<()> {
 
 /// Import registers its destination readonly; refuse a destination registered as a
 /// writable space, which the import would otherwise silently make readonly.
-fn refuse_writable(home: &Home, dir: &Path) -> Result<()> {
-    let canon = match Location::Dir(dir.to_path_buf()).canonical() {
+fn refuse_writable(home: &Home, dest: &Location) -> Result<()> {
+    let canon = match dest.canonical() {
         Ok(c) => c,
-        // Not created yet, so it cannot be registered.
+        // A directory not created yet, so it cannot be registered.
         Err(e) if e.code == ErrorCode::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
     for (alias, entry) in home.load_config()?.spaces {
         if entry.location == canon && !entry.readonly {
             return Err(Error::conflict(format!(
-                "import: {canon} is your writable space '{alias}'; import into another directory"
+                "import: {canon} is your writable space '{alias}'; import into another location"
             )));
         }
     }

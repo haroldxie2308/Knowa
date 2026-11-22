@@ -102,7 +102,7 @@ fn import_and_space_add_refuse_a_second_genesis_for_a_known_space_id() {
     let (k, _, space) = alice(&s);
     let (dir, bundle) = impostor(&s, &space);
 
-    let err = k.import(&bundle, None, None).unwrap_err();
+    let err = k.import(&bundle, None, None, None).unwrap_err();
     assert_eq!(err.code, ErrorCode::Conflict, "{err:?}");
     assert!(!k.home().root().join("replicas").join(space.as_str()).exists(), "import wrote before refusing");
     let err = k.space_add(&Location::Dir(dir), None, Some("fake"), true).unwrap_err();
@@ -776,7 +776,7 @@ fn import_new_blob(s: &Scratch, rel: &str, bytes: &[u8]) -> Id {
     };
     let bundle = s.path("bytes.knowa");
     write_bundle(&holder, &bundle, &meta, &[genesis], std::slice::from_ref(&blob)).unwrap();
-    let (_, _, report) = import_bundle(&bundle, &s.path(rel)).unwrap();
+    let (_, _, report) = import_dir(&bundle, &s.path(rel)).unwrap();
     assert_eq!((report.added, report.blobs_added), (0, 1));
     blob
 }
@@ -876,4 +876,9 @@ fn a_worker_resumes_from_its_stored_cursor() {
     let after = recorded(&log);
     assert_eq!(after.len(), all.len() + 1, "the batch the failed command got comes again");
     assert_eq!(sorted(after), every_claim(&k, &sel));
+}
+
+/// `import_bundle` into the directory `dest`, which holds its blobs too.
+fn import_dir(bundle: &Path, dest: &Path) -> knowa_model::Result<(Replica, BundleMeta, knowa_store::ImportReport)> {
+    import_bundle(bundle, &Location::Dir(dest.to_path_buf()), None, &dest.with_extension("cache"))
 }

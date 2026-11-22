@@ -187,16 +187,6 @@ impl Stores {
         Ok(Stores { location: location.clone(), logs, blobs })
     }
 
-    /// A directory replica, logs and blobs both in `dir`: a bundle import's target,
-    /// which needs no blob cache.
-    pub(crate) fn dir(dir: &Path) -> Stores {
-        Stores {
-            location: Location::Dir(dir.to_path_buf()),
-            logs: Box::new(DirLogs::new(dir)),
-            blobs: Box::new(DirBlobs::new(dir)),
-        }
-    }
-
     /// A replica on `store` at `url`, logs and blobs both there.
     pub(crate) fn object(store: Arc<dyn ObjectStore>, url: &str, cache: &Path) -> Result<Stores> {
         let remote = Remote::new(store, url)?;
@@ -696,7 +686,7 @@ pub fn read_bundle_meta(bundle: &Path) -> Result<BundleMeta> {
     bundle::read_meta(bundle)
 }
 
-/// Imports a bundle into the directory `dest`, a replica whose blobs live in it too
+/// Imports a bundle into the replica at `dest`
 /// (created via `create_replica` if absent; if present its manifest must match the
 /// bundle's space). Verifies all claim signatures and blob hashes,
 /// and that the bundle's genesis is a genesis claim, before writing anything. Merges as
@@ -705,6 +695,14 @@ pub fn read_bundle_meta(bundle: &Path) -> Result<BundleMeta> {
 /// the last, because a text blob arriving for claims that are already indexed changes
 /// their full-text documents, which catch-up never revisits. Blobs alone leave the gap
 /// generation, and so every feed cursor, as it is (DESIGN §5.4).
-pub fn import_bundle(bundle: &Path, dest: &Path) -> Result<(Replica, BundleMeta, ImportReport)> {
-    bundle::import(bundle, dest)
+///
+/// `dest` is any location, with its blobs at `blobs` (default: `dest`); object-store
+/// blobs pass through `cache`, as for `Replica::open` (DESIGN §5.2).
+pub fn import_bundle(
+    bundle: &Path,
+    dest: &Location,
+    blobs: Option<&Location>,
+    cache: &Path,
+) -> Result<(Replica, BundleMeta, ImportReport)> {
+    bundle::import(bundle, Stores::connect(dest, blobs, cache)?)
 }

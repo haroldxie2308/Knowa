@@ -404,7 +404,7 @@ Global flags (each with an env override) are `--home` (`KNOWA_HOME`, default `~/
 | `log [--actor] [--since]` | log |
 | `extract [--all]` | run built-in extractors over blobs missing their output |
 | `worker run <actor-name> --cmd "<exe args>" [--batch N] [--follow]` | feed → external command → write |
-| `export <file.knowa> [--level private\|shared\|public]` · `import <file.knowa> [--alias]` | bundles |
+| `export <file.knowa> [--level private\|shared\|public]` · `import <file.knowa> [--into <location>] [--blobs <location>] [--alias]` | bundles |
 | `verify` · `reindex` · `schema` | admin |
 | `serve [--port N]` | the local web UI (§7.4) |
 
@@ -434,7 +434,7 @@ Text blobs (`text/*`, ≤ 1 MiB) are indexed for full-text search directly from 
 - The bundle is marked `"partial":true` unless the level is `private`, which exports everything.
 - A space is identified by its space id **and** genesis id. `import`, and registering a second replica of a known space id, refuse with `conflict` when the owner or genesis differ. Every query that selects spaces requires replicas sharing a space id to have identical manifests.
 - A bundle is a tar archive containing `bundle.json` (`{format, space, owner, genesis, level, partial, exportedBy, at}`), the `log/…` segments and `blobs/…`.
-- `import` verifies every signature, blob hash and chain run, then merges into a replica directory (creating it if needed), registers it read-only, and reindexes.
+- `import` verifies every signature, blob hash and chain run, then merges into a replica at any location, a directory or an object store (`--into`, default `<home>/replicas/<space-id>`; created if needed, with its blobs at `--blobs` when given), registers it read-only, and reindexes.
 - Readonly replicas refuse local writes. To annotate someone else's content, write in **your** space and refer to their ids.
 
 ### 7.4 Web UI *(experimental)*

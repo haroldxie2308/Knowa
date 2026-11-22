@@ -531,9 +531,12 @@ pub struct ExportArgs {
 pub struct ImportArgs {
     /// Bundle file to read
     pub file: PathBuf,
-    /// Replica directory [default: <home>/replicas/<space-id>]
-    #[arg(long)]
-    pub dir: Option<PathBuf>,
+    /// Replica to import into: a directory or s3://bucket/prefix, created if absent [default: <home>/replicas/<space-id>]
+    #[arg(long, value_name = "LOCATION")]
+    pub into: Option<String>,
+    /// Where its blobs live, a directory or s3://bucket/prefix [default: the replica's location]
+    #[arg(long, value_name = "LOCATION")]
+    pub blobs: Option<String>,
     /// Registry alias [default: the space's label, else its id]
     #[arg(long)]
     pub alias: Option<String>,

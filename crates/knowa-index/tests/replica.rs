@@ -425,7 +425,7 @@ fn a_merge_that_adds_a_text_blob_rebuilds_and_makes_its_text_searchable() {
     write_bundle(&holder, &bundle, &private_meta(r.manifest(), &w.actor(0)), &[genesis], std::slice::from_ref(&txt))
         .unwrap();
     let (generation, gaps) = (r.generation().unwrap(), r.gaps().unwrap());
-    let (_, _, report) = import_bundle(&bundle, &dir.replica()).unwrap();
+    let (_, _, report) = import_dir(&bundle, &dir.replica()).unwrap();
     assert_eq!((report.added, report.blobs_added), (0, 1));
     assert_ne!(r.generation().unwrap(), generation);
     assert_eq!(r.gaps().unwrap(), gaps, "blobs fill no gap");
@@ -501,4 +501,9 @@ fn export_and_extract_selection_consult_the_blob_store() {
     let (shared, shared_blobs) = idx.export_set(&r, Visibility::Shared).unwrap();
     assert_eq!(shared.len(), 1, "only the genesis policy claim");
     assert!(shared_blobs.is_empty());
+}
+
+/// `import_bundle` into the directory `dest`, which holds its blobs too.
+fn import_dir(bundle: &std::path::Path, dest: &std::path::Path) -> knowa_model::Result<(Replica, BundleMeta, knowa_store::ImportReport)> {
+    import_bundle(bundle, &Location::Dir(dest.to_path_buf()), None, &dest.with_extension("cache"))
 }

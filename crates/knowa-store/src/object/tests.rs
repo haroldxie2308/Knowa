@@ -389,6 +389,52 @@ fn large_blobs_are_uploaded_in_parts() {
     assert_eq!(fresh.read_blob(&id).unwrap(), bytes);
 }
 
+/// DESIGN §5.3, §7.3: a bundle imports into an object replica like into a directory:
+/// created on first import with its blobs, re-imported idempotently, and refused when
+/// the location holds another space.
+#[test]
+fn a_bundle_imports_into_an_object_replica() {
+    let s = Scratch::new("import");
+    let source_store = memory();
+    let (src, mut owner) = new_space(&source_store, &s);
+    append(&src, &[owner.note("one"), owner.note("two")]).unwrap();
+    let (blob, _, _) = src.put_blob(&mut &b"bundled bytes"[..]).unwrap();
+    let claims: Vec<Claim> = src.read_log(&owner.id, 1).unwrap().map(|c| c.unwrap()).collect();
+    let m = src.manifest();
+    let meta = crate::BundleMeta {
+        format: m.format,
+        space: m.space.clone(),
+        owner: m.owner.clone(),
+        genesis: m.genesis.clone(),
+        level: "private".into(),
+        partial: false,
+        exported_by: owner.id.clone(),
+        at: Timestamp::now().format(),
+    };
+    fs::create_dir_all(&s.0).unwrap();
+    let bundle = s.path("src.knowa");
+    crate::write_bundle(&src, &bundle, &meta, &claims, std::slice::from_ref(&blob)).unwrap();
+
+    let dest = memory();
+    let into = || Stores::object(Arc::clone(&dest), URL, &s.path("cache-dest")).unwrap();
+    let (r, got, report) = crate::bundle::import(&bundle, into()).unwrap();
+    assert_eq!(got, meta);
+    assert_eq!((report.added, report.skipped_existing, report.blobs_added), (3, 0, 1));
+    assert_eq!(r.manifest(), src.manifest());
+    assert_eq!(seqs(&r, &owner.id), [1, 2, 3]);
+    let fresh = Replica::open_on(Arc::clone(&dest), URL, &s.path("cache-other")).unwrap();
+    assert_eq!(fresh.read_blob(&blob).unwrap(), b"bundled bytes");
+    assert_eq!(fresh.verify().unwrap().claims, 3);
+
+    let (_, _, again) = crate::bundle::import(&bundle, into()).unwrap();
+    assert_eq!((again.added, again.skipped_existing, again.blobs_added), (0, 3, 0));
+
+    let elsewhere = memory();
+    new_space(&elsewhere, &s);
+    let err = crate::bundle::import(&bundle, Stores::object(elsewhere, URL, &s.path("cache-x")).unwrap()).err().unwrap();
+    assert_eq!(err.code, ErrorCode::Conflict, "{err:?}");
+}
+
 /// `last_line` reads a segment's end only, and widens its window for a line longer
 /// than the first one.
 #[test]

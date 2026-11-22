@@ -13,7 +13,7 @@ use knowa_model::{Claim, Error, ErrorCode, Id, IdKind, Result, Timestamp};
 
 use crate::fsutil::{TempFile, io_err};
 use crate::log::{self, Chain, SEGMENT_LIMIT};
-use crate::{BundleMeta, ImportReport, MANIFEST_FILE, Manifest, Replica, Stores, blob, genesis_problem};
+use crate::{BundleMeta, ImportReport, Manifest, Replica, Stores, blob, genesis_problem};
 
 const META_ENTRY: &str = "bundle.json";
 const LEVELS: &[&str] = &["private", "shared", "public"];
@@ -218,7 +218,7 @@ fn read_bundle(bundle: &Path) -> Result<Parsed> {
     Ok(Parsed { meta, claims, blobs })
 }
 
-pub(crate) fn import(bundle: &Path, dest: &Path) -> Result<(Replica, BundleMeta, ImportReport)> {
+pub(crate) fn import(bundle: &Path, dest: Stores) -> Result<(Replica, BundleMeta, ImportReport)> {
     let parsed = read_bundle(bundle)?;
     let space = parsed.meta.space.clone();
     for c in &parsed.claims {
@@ -240,13 +240,12 @@ pub(crate) fn import(bundle: &Path, dest: &Path) -> Result<(Replica, BundleMeta,
         return Err(Error::integrity(format!("bundle {}: {p}", bundle.display())));
     }
     let manifest = manifest_of(&parsed.meta);
-    let manifest_path = dest.join(MANIFEST_FILE);
-    let replica = if manifest_path.try_exists().map_err(|e| io_err(&manifest_path, e))? {
-        let replica = Replica::open_in(Stores::dir(dest))?;
+    let replica = if dest.logs.read_manifest()?.is_some() {
+        let where_ = dest.logs.describe();
+        let replica = Replica::open_in(dest)?;
         if *replica.manifest() != manifest {
             return Err(Error::conflict(format!(
-                "{} holds a different replica (space {}) than bundle {} (space {})",
-                dest.display(),
+                "{where_} holds a different replica (space {}) than bundle {} (space {})",
                 replica.manifest().space,
                 bundle.display(),
                 manifest.space
@@ -254,9 +253,9 @@ pub(crate) fn import(bundle: &Path, dest: &Path) -> Result<(Replica, BundleMeta,
         }
         replica
     } else {
-        // Run the chain checks against an empty replica before anything exists on disk.
+        // Run the chain checks against an empty replica before anything is written.
         log::plan_merge(&parsed.claims, |_| Ok(Chain::new()))?;
-        Replica::create_replica_in(Stores::dir(dest), &manifest)?
+        Replica::create_replica_in(dest, &manifest)?
     };
 
     let mut adds_blobs = false;

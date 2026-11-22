@@ -163,7 +163,11 @@ pub struct ExportResult {
 #[serde(rename_all = "camelCase")]
 pub struct ImportResult {
     pub space: Id,
+    /// The replica's canonical location (DESIGN §5.2), as `InitResult`'s.
     pub path: PathBuf,
+    /// Its separate blob location, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blobs: Option<String>,
     pub alias: String,
     pub added: u64,
     pub skipped_existing: u64,
@@ -324,12 +328,19 @@ impl Knowa {
         admin::export(&self.home, sel, out, level)
     }
 
-    /// Imports into `dir` (default `<home>/replicas/<space-id>`), registers it readonly
-    /// under `alias` (default: the space's label slugified, else the space id). A
-    /// registered replica of the same space id with a different owner or genesis →
-    /// `conflict`, before anything is written (DESIGN §7.3).
-    pub fn import(&self, bundle: &Path, dir: Option<&Path>, alias: Option<&str>) -> Result<ImportResult> {
-        admin::import(&self.home, bundle, dir, alias)
+    /// Imports into the replica at `dest`, any location (default the directory
+    /// `<home>/replicas/<space-id>`), with its blobs at `blobs` (default: `dest`), and
+    /// registers it readonly under `alias` (default: the space's label slugified, else
+    /// the space id). A registered replica of the same space id with a different owner
+    /// or genesis → `conflict`, before anything is written (DESIGN §7.3).
+    pub fn import(
+        &self,
+        bundle: &Path,
+        dest: Option<&Location>,
+        blobs: Option<&Location>,
+        alias: Option<&str>,
+    ) -> Result<ImportResult> {
+        admin::import(&self.home, bundle, dest, blobs, alias)
     }
 
     pub fn verify(&self, sel: &Sel) -> Result<knowa_store::VerifyReport> {

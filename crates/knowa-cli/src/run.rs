@@ -142,7 +142,9 @@ fn dispatch(cmd: Cmd, g: &Globals, out: &mut Out) -> Result<Finished> {
             out.result(|| json_of!(&r), || Ok(render::fields(&json_of!(&r)?)))
         }
         Cmd::Import(a) => {
-            let r = g.knowa()?.import(&a.file, a.dir.as_deref(), a.alias.as_deref())?;
+            let into = a.into.as_deref().map(Location::parse).transpose()?;
+            let blobs = a.blobs.as_deref().map(Location::parse).transpose()?;
+            let r = g.knowa()?.import(&a.file, into.as_ref(), blobs.as_ref(), a.alias.as_deref())?;
             out.result(|| json_of!(&r), || Ok(render::fields(&json_of!(&r)?)))
         }
         Cmd::Verify => {
