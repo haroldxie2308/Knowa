@@ -113,3 +113,11 @@ KNOWA_HOME=$(mktemp -d) cargo run -q -p knowa-cli -- --help
 ```
 
 [`docs/DESIGN.md`](docs/DESIGN.md) is normative: where the code and the design disagree, the code is wrong. The golden vectors in `crates/knowa-model/tests/` are the conformance suite.
+
+## License
+
+Knowa is licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option.
+
+Unless you explicitly state otherwise, any contribution you intentionally submit for inclusion in Knowa, as defined in the Apache-2.0 license, is dual licensed as above, without any additional terms or conditions.
+
+The landing page's Geist fonts are under the [SIL Open Font License 1.1](site/fonts/OFL.txt).
